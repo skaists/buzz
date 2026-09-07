@@ -3,8 +3,7 @@
 
 use super::{
     build_authenticated_relay_request, build_profile_event, classify_intercepted_response,
-    effective_agent_relay_url, extract_retry_in_hint, parse_command_response, relay_http_base_url,
-    MALFORMED_RESPONSE_MESSAGE,
+    effective_agent_relay_url, extract_retry_in_hint, parse_command_response, relay_http_base_url, validate_advertised_origin, MALFORMED_RESPONSE_MESSAGE,
 };
 use serde::Deserialize;
 
@@ -791,4 +790,38 @@ fn profile_event_rejects_invalid_auth_tag() {
         result.unwrap_err().contains("verification failed"),
         "error message should mention verification failure"
     );
+}
+
+#[test]
+fn advertised_origin_accepts_valid_origins_and_constructs_http_base() {
+    assert_eq!(
+        validate_advertised_origin("wss://beehivenature.buzz").as_deref(),
+        Some("https://beehivenature.buzz")
+    );
+    // ports and IPv6 literals are valid origins
+    assert_eq!(
+        validate_advertised_origin("ws://[::1]:3000").as_deref(),
+        Some("http://[::1]:3000")
+    );
+    assert_eq!(
+        validate_advertised_origin("wss://relay.example:8443/").as_deref(),
+        Some("https://relay.example:8443")
+    );
+}
+
+#[test]
+fn advertised_origin_rejects_non_origin_components() {
+    for bad in [
+        "not a url",
+        "ftp://relay.example",
+        "wss://relay.example#section",
+        "wss://relay.example?x=1",
+        "wss://relay.example/nested",
+        "wss://synthetic:synthetic@relay.example",
+    ] {
+        assert!(
+            validate_advertised_origin(bad).is_none(),
+            "{bad:?} must be refused"
+        );
+    }
 }
