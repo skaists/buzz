@@ -163,6 +163,44 @@ pub fn validate_advertised_origin(advertised: &str) -> Option<String> {
 /// what the relay advertises, and silently signing the transport host is the
 /// alias-host auth bug itself. Only a well-formed document with NO
 /// advertisement means "the road IS the identity" (base returned unchanged).
+/// Pure decision function: given a successfully-decoded `/info` JSON value
+/// and the transport base, produce the canonical signing base or refuse.
+/// Only an actually ABSENT key receives the compatibility fallback; an
+/// explicit JSON `null` is malformed and refuses (both `push` and
+/// `push.origin`). Extracted so the decision is unit-testable without HTTP.
+pub fn canonical_decision_from_info(
+    doc: &serde_json::Value,
+    transport_base: &str,
+) -> Result<String, String> {
+    let obj = doc
+        .as_object()
+        .ok_or("relay /info returned a malformed document")?;
+    match obj.get("push") {
+        None => Ok(transport_base.to_string()),
+        Some(serde_json::Value::Null) => {
+            Err("relay /info returned a malformed push descriptor".to_string())
+        }
+        Some(push) => {
+            let push_obj = push
+                .as_object()
+                .ok_or("relay /info returned a malformed push descriptor")?;
+            match push_obj.get("origin") {
+                None => Ok(transport_base.to_string()),
+                Some(serde_json::Value::Null) => {
+                    Err("relay /info advertises a malformed canonical origin".to_string())
+                }
+                Some(origin) => {
+                    let advertised = origin
+                        .as_str()
+                        .ok_or("relay /info advertises a malformed canonical origin")?;
+                    validate_advertised_origin(advertised)
+                        .ok_or("relay /info canonical origin failed URL verification".to_string())
+                }
+            }
+        }
+    }
+}
+
 async fn canonical_signing_base_with_client(
     client: &reqwest::Client,
     transport_base: &str,
@@ -181,7 +219,12 @@ async fn canonical_signing_base_with_client(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|error| format!("relay /info unreachable: {}", classify_request_error(&error)))?;
+        .map_err(|error| {
+            format!(
+                "relay /info unreachable: {}",
+                classify_request_error(&error)
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!("relay /info HTTP {}", response.status().as_u16()));
     }
@@ -191,27 +234,7 @@ async fn canonical_signing_base_with_client(
         .map_err(|_| "relay /info returned a malformed document".to_string())?;
     let doc: serde_json::Value = serde_json::from_str(&text)
         .map_err(|_| "relay /info returned a malformed document".to_string())?;
-    let obj = doc
-        .as_object()
-        .ok_or("relay /info returned a malformed document")?;
-    let decision = match obj.get("push") {
-        None | Some(serde_json::Value::Null) => transport_base.to_string(),
-        Some(push) => {
-            let push_obj = push
-                .as_object()
-                .ok_or("relay /info returned a malformed push descriptor")?;
-            match push_obj.get("origin") {
-                None | Some(serde_json::Value::Null) => transport_base.to_string(),
-                Some(origin) => {
-                    let advertised = origin
-                        .as_str()
-                        .ok_or("relay /info advertises a malformed canonical origin")?;
-                    validate_advertised_origin(advertised)
-                        .ok_or("relay /info canonical origin failed URL verification")?
-                }
-            }
-        }
-    };
+    let decision = canonical_decision_from_info(&doc, transport_base)?;
     if let Ok(mut cache) = CANONICAL_SIGNING_BASES.write() {
         cache.insert(transport_base.to_string(), decision.clone());
     }

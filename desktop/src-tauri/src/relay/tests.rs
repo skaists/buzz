@@ -2,8 +2,10 @@
 //! Extracted from `relay.rs` to keep that module under the file-size ratchet.
 
 use super::{
-    build_authenticated_relay_request, build_profile_event, classify_intercepted_response,
-    effective_agent_relay_url, extract_retry_in_hint, parse_command_response, relay_http_base_url, validate_advertised_origin, MALFORMED_RESPONSE_MESSAGE,
+    build_authenticated_relay_request, build_profile_event, canonical_decision_from_info,
+    classify_intercepted_response, effective_agent_relay_url, extract_retry_in_hint,
+    parse_command_response, relay_http_base_url, validate_advertised_origin,
+    MALFORMED_RESPONSE_MESSAGE,
 };
 use serde::Deserialize;
 
@@ -823,5 +825,80 @@ fn advertised_origin_rejects_non_origin_components() {
             validate_advertised_origin(bad).is_none(),
             "{bad:?} must be refused"
         );
+    }
+}
+
+// ── canonical decision regressions (review round 1) ─────────────────
+
+#[test]
+fn canonical_decision_rejects_explicit_null_push() {
+    let doc = serde_json::json!({"push": null});
+    assert!(
+        canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
+        "explicit null push is a malformed descriptor, not an absent key"
+    );
+}
+
+#[test]
+fn canonical_decision_rejects_explicit_null_origin() {
+    let doc = serde_json::json!({"push": {"origin": null}});
+    assert!(
+        canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
+        "explicit null origin is a malformed advertisement, not an absent key"
+    );
+}
+
+#[test]
+fn canonical_decision_compat_absent_key_is_road_is_identity() {
+    // well-formed object with NO push key — the road IS the identity
+    let doc = serde_json::json!({"name": "Buzz Relay", "version": "0.2.1"});
+    assert_eq!(
+        canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
+        "https://relay.example"
+    );
+    // push present as a valid object with NO origin key
+    let doc = serde_json::json!({"push": {"keys": []}});
+    assert_eq!(
+        canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
+        "https://relay.example"
+    );
+}
+
+#[test]
+fn canonical_decision_valid_origin_signs_canonical() {
+    let doc = serde_json::json!({
+        "push": {"origin": "wss://beehivenature.buzz"}
+    });
+    assert_eq!(
+        canonical_decision_from_info(&doc, "https://relay2.skaists.dev").unwrap(),
+        "https://beehivenature.buzz"
+    );
+}
+
+#[test]
+fn canonical_decision_rejects_non_object_root() {
+    for doc in [
+        serde_json::json!(null),
+        serde_json::json!([1, 2]),
+        serde_json::json!("a string"),
+        serde_json::json!(42),
+    ] {
+        assert!(
+            canonical_decision_from_info(&doc, "https://relay.example").is_err(),
+            "non-object root must be refused"
+        );
+    }
+}
+
+#[test]
+fn canonical_decision_rejects_malformed_push_shape() {
+    let cases = vec![
+        serde_json::json!("not-an-object"),
+        serde_json::json!(42),
+        serde_json::json!([1]),
+    ];
+    for push in cases {
+        let doc = serde_json::json!({"push": push});
+        assert!(canonical_decision_from_info(&doc, "https://relay.example").is_err());
     }
 }
