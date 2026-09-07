@@ -678,11 +678,17 @@ pub(crate) fn spawn_transcription_task(
                     continue;
                 }
             };
-            let url = format!("{relay_base_url}/events");
+            let url = format!("{relay_base_url}/events"); // transport; signing uses the canonical url
+            let sign_url = crate::relay::canonical_sign_url_with_client(&http_client, &url)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("buzz-desktop: STT canonical signing URL: {e}");
+                    url.clone()
+                });
             let auth_header = match crate::relay::build_nip98_auth_header_for_keys(
                 &keys,
                 &reqwest::Method::POST,
-                &url,
+                &sign_url,
                 &body_bytes,
             ) {
                 Ok(h) => h,

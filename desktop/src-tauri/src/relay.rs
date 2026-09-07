@@ -98,6 +98,132 @@ pub fn relay_api_base_url() -> String {
 
 // ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
 
+/// Canonical signing bases resolved from GET /info, keyed by transport base
+/// (the alias road). Caches only successfully resolved decisions — a relay
+/// that later changes its advertisement is picked up on the next app start.
+static CANONICAL_SIGNING_BASES: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Strictly validate an advertised ws/wss ORIGIN and construct its HTTP base
+/// (mirror of the desktop TS law in shared/api/invites.ts): no userinfo,
+/// query, fragment, or non-root path; ports and IPv6 literals are valid; the
+/// HTTP base is constructed from the PARSED url, never the raw string.
+pub fn validate_advertised_origin(advertised: &str) -> Option<String> {
+    let url = url::Url::parse(advertised).ok()?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return None,
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let path = url.path();
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// Resolve the canonical SIGNING base for a transport base: GET /info on the
+/// transport road and honor `push.origin` (the advertised canonical
+/// identity). Fail-closed rules mirror the TS law: an unreadable document
+/// (HTTP error, invalid JSON, non-object root, malformed push descriptor, or
+/// malformed/invalid advertisement) is an ERROR — it proves nothing about
+/// what the relay advertises, and silently signing the transport host is the
+/// alias-host auth bug itself. Only a well-formed document with NO
+/// advertisement means "the road IS the identity" (base returned unchanged).
+async fn canonical_signing_base_with_client(
+    client: &reqwest::Client,
+    transport_base: &str,
+) -> Result<String, String> {
+    let transport_base = transport_base.trim_end_matches('/');
+    if let Some(hit) = CANONICAL_SIGNING_BASES
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(transport_base).cloned())
+    {
+        return Ok(hit);
+    }
+    let info_url = format!("{transport_base}/info");
+    let response = client
+        .get(&info_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| format!("relay /info unreachable: {}", classify_request_error(&error)))?;
+    if !response.status().is_success() {
+        return Err(format!("relay /info HTTP {}", response.status().as_u16()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|_| "relay /info returned a malformed document".to_string())?;
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| "relay /info returned a malformed document".to_string())?;
+    let obj = doc
+        .as_object()
+        .ok_or("relay /info returned a malformed document")?;
+    let decision = match obj.get("push") {
+        None | Some(serde_json::Value::Null) => transport_base.to_string(),
+        Some(push) => {
+            let push_obj = push
+                .as_object()
+                .ok_or("relay /info returned a malformed push descriptor")?;
+            match push_obj.get("origin") {
+                None | Some(serde_json::Value::Null) => transport_base.to_string(),
+                Some(origin) => {
+                    let advertised = origin
+                        .as_str()
+                        .ok_or("relay /info advertises a malformed canonical origin")?;
+                    validate_advertised_origin(advertised)
+                        .ok_or("relay /info canonical origin failed URL verification")?
+                }
+            }
+        }
+    };
+    if let Ok(mut cache) = CANONICAL_SIGNING_BASES.write() {
+        cache.insert(transport_base.to_string(), decision.clone());
+    }
+    Ok(decision)
+}
+
+/// The URL a NIP-98 event must SIGN: the canonical origin (per /info) with
+/// the transport URL's path appended. The HTTP request itself keeps riding
+/// the transport URL — sign the identity, ride the road.
+pub async fn canonical_sign_url(state: &AppState, transport_url: &str) -> Result<String, String> {
+    canonical_sign_url_with_client(&state.http_client, transport_url).await
+}
+
+/// Client-only variant for tasks that own a cloned `reqwest::Client` instead
+/// of the `AppState` reference (e.g. 'static spawned pipelines).
+pub async fn canonical_sign_url_with_client(
+    client: &reqwest::Client,
+    transport_url: &str,
+) -> Result<String, String> {
+    let (scheme, after_scheme) = transport_url
+        .split_once("://")
+        .ok_or("relay transport URL has no scheme")?;
+    let (authority, path) = match after_scheme.find('/') {
+        Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+        None => (after_scheme, ""),
+    };
+    let canonical_base =
+        canonical_signing_base_with_client(client, &format!("{scheme}://{authority}")).await?;
+    Ok(format!("{canonical_base}{path}"))
+}
+
 pub fn build_nip98_auth_header(
     method: &Method,
     url: &str,
@@ -321,7 +447,8 @@ pub async fn query_relay_at(
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header(&Method::POST, &sign_url, &body_bytes, state)?;
 
     let response = state
         .http_client
@@ -351,7 +478,8 @@ pub async fn query_relay_at_with_keys(
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &sign_url, &body_bytes)?;
     let mut request = state
         .http_client
         .post(&url)
@@ -453,7 +581,8 @@ pub async fn sync_managed_agent_profile(
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "agent profile sync")?;
 
     let url = format!("{}/events", relay_http_base_url(relay_url));
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &sign_url, &body_bytes)?;
 
     let mut request = state
         .http_client
@@ -571,7 +700,9 @@ pub async fn submit_signed_event_with_keys(
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
-    let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth_header =
+        build_nip98_auth_header_for_keys(keys, &Method::POST, &sign_url, &body_bytes)?;
 
     let mut request = state
         .http_client
@@ -608,9 +739,43 @@ mod tests {
     use super::{
         build_profile_event, classify_intercepted_response, effective_agent_relay_url,
         extract_retry_in_hint, parse_command_response, relay_http_base_url,
-        MALFORMED_RESPONSE_MESSAGE,
+        validate_advertised_origin, MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
+
+    #[test]
+    fn advertised_origin_accepts_valid_origins_and_constructs_http_base() {
+        assert_eq!(
+            validate_advertised_origin("wss://beehivenature.buzz").as_deref(),
+            Some("https://beehivenature.buzz")
+        );
+        // ports and IPv6 literals are valid origins
+        assert_eq!(
+            validate_advertised_origin("ws://[::1]:3000").as_deref(),
+            Some("http://[::1]:3000")
+        );
+        assert_eq!(
+            validate_advertised_origin("wss://relay.example:8443/").as_deref(),
+            Some("https://relay.example:8443")
+        );
+    }
+
+    #[test]
+    fn advertised_origin_rejects_non_origin_components() {
+        for bad in [
+            "not a url",
+            "ftp://relay.example",
+            "wss://relay.example#section",
+            "wss://relay.example?x=1",
+            "wss://relay.example/nested",
+            "wss://synthetic:synthetic@relay.example",
+        ] {
+            assert!(
+                validate_advertised_origin(bad).is_none(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 
     // ── extract_retry_in_hint ────────────────────────────────────────────────
 

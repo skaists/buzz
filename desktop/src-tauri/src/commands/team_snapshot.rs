@@ -911,7 +911,8 @@ pub(crate) async fn submit_engram_event(
     // gate may hold for up to MAX_HINT_SECONDS (300s). Building auth before the
     // wait produces a stale `created_at` that the relay will reject.
     crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, url, event_json)?;
+    let sign_url = crate::relay::canonical_sign_url(state, url).await?;
+    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &sign_url, event_json)?;
     let mut request = state
         .http_client
         .post(url)
