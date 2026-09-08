@@ -812,62 +812,140 @@ mod nostr_identity_binding_tests {
 #[path = "identity_key_backup_tests.rs"]
 mod identity_key_backup_tests;
 
-/// Caller-level regressions for the NIP-42 AUTH boundary: these tests
-/// invoke the ACTUAL create_auth_event command (the shared signer used by
-/// both relayClientSession.ts and readOnlyRelayClient.ts) with synthetic
-/// keys and an isolated AppState whose HTTP client points at a loopback
-/// /info server. The signed kind-22242 event is decoded to verify the
-/// canonical relay tag while the socket URL stays on the alias.
+/// Actual-caller regressions for the NIP-42 AUTH signing core. These tests
+/// drive `create_auth_event_impl` — the shared implementation behind the
+/// `create_auth_event` command that both relayClientSession.ts and
+/// readOnlyRelayClient.ts invoke — with synthetic keys and a loopback /info
+/// fixture that serves 200 at exactly `/info` and 404 elsewhere. The signed
+/// kind-22242 event is decoded to verify the canonical relay tag while the
+/// supplied transport URL (alias, path, query) is exercised as-is; the
+/// fixture records every request target so the metadata fetch is pinned to
+/// the origin's `/info` root. The session-level wiring (socket stays on the
+/// alias, AUTH frame contents, REQ gating) is covered by the desktop TS
+/// tests in relayClientSession.test.mjs and readOnlyRelayClient.test.mjs.
 #[cfg(test)]
 mod nip42_canonical_auth_tests {
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
 
-    struct SpyServer {
+    /// One served HTTP request: method and the full request target as sent.
+    type RecordedRequest = (String, String);
+
+    struct InfoServer {
         addr: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
     }
 
-    impl SpyServer {
-        fn start(info_body: String) -> Self {
+    impl InfoServer {
+        /// Loopback metadata fixture: serves `body` with 200 for a request
+        /// target of exactly `/info`, 404 for anything else, and records
+        /// the method + target of every request. The body builder receives
+        /// the bound `host:port` so a same-origin advertisement can name
+        /// the real port. A server that answered every path with the same
+        /// JSON would hide request-target regressions; this one does not.
+        fn start(body_for_addr: impl FnOnce(&str) -> String) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
+            let addr_str = format!("{addr}");
+            let body = body_for_addr(&addr_str);
+            let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let mut stream = match stream {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let len = info_body.len();
+                    let Some(head) = read_request_head(&mut stream) else {
+                        continue;
+                    };
+                    let first_line = head.lines().next().unwrap_or_default();
+                    let mut parts = first_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let target = parts.next().unwrap_or_default().to_string();
+                    let served_at_info = target == "/info";
+                    if let Ok(mut log) = thread_requests.lock() {
+                        log.push((method, target));
+                    }
+                    let (status, body) = if served_at_info {
+                        ("200 OK", body.clone())
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let len = body.len();
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{info_body}"
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}"
                     );
                     let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
                 }
             });
-            SpyServer {
-                addr: format!("{addr}"),
+            InfoServer {
+                addr: addr_str,
+                requests,
             }
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
-    /// Decode the relay tag from a signed kind-22242 AUTH event JSON.
-    fn relay_tag(event_json: &str) -> String {
+    /// Read a request head (up to the blank line). GET requests carry no
+    /// body, so end-of-headers is end-of-request; a partial read would make
+    /// the recorded target unreliable.
+    fn read_request_head(stream: &mut std::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Decode a tag value from a signed kind-22242 AUTH event JSON.
+    fn tag_value(event_json: &str, name: &str) -> String {
         let event: serde_json::Value = serde_json::from_str(event_json).expect("valid JSON");
         assert_eq!(event["kind"], 22242, "kind 22242");
         let tags = event["tags"].as_array().expect("tags");
         tags.iter()
-            .find(|t| t[0] == "relay")
+            .find(|t| t[0] == name)
             .and_then(|t| t[1].as_str())
-            .expect("relay tag present")
+            .unwrap_or_else(|| panic!("{name} tag present"))
             .to_string()
+    }
+
+    fn relay_tag(event_json: &str) -> String {
+        tag_value(event_json, "relay")
+    }
+
+    /// The metadata fetch must be exactly one GET to the origin's `/info`
+    /// root — never a transport path or query with `/info` appended.
+    fn assert_single_info_get(requests: &[RecordedRequest]) {
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one metadata request expected, got {requests:?}"
+        );
+        assert_eq!(requests[0].0, "GET", "metadata is a GET");
+        assert_eq!(
+            requests[0].1, "/info",
+            "metadata request target must be /info at the origin root, got {:?}",
+            requests[0].1
+        );
     }
 
     #[tokio::test]
     async fn nip42_alias_signs_canonical_relay_tag() {
         let server =
-            SpyServer::start(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
+            InfoServer::start(|_| r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
         let client = reqwest::Client::new();
         let keys = nostr::Keys::generate();
         let alias_ws_url = format!("ws://{}", server.addr);
@@ -890,11 +968,12 @@ mod nip42_canonical_auth_tests {
             !tag.contains("127.0.0.1"),
             "relay tag must NOT name the transport/alias"
         );
+        assert_single_info_get(&server.requests());
     }
 
     #[tokio::test]
     async fn nip42_no_advertisement_signs_supplied_url() {
-        let server = SpyServer::start(r#"{"name":"Buzz Relay"}"#.to_string());
+        let server = InfoServer::start(|_| r#"{"name":"Buzz Relay"}"#.to_string());
         let client = reqwest::Client::new();
         let keys = nostr::Keys::generate();
         let supplied = format!("ws://{}", server.addr);
@@ -910,13 +989,129 @@ mod nip42_canonical_auth_tests {
 
         let tag = relay_tag(&result.unwrap());
         assert_eq!(tag, supplied, "relay tag keeps the supplied URL");
+        assert_single_info_get(&server.requests());
+    }
+
+    /// The review's exact query repro: a valid transport query must not
+    /// corrupt the metadata request target. The fixture 404s every target
+    /// except `/info`, so the pre-fix `GET /?transport=one/info` request
+    /// fails loudly here instead of silently succeeding.
+    #[tokio::test]
+    async fn nip42_transport_query_fetches_root_info_and_signs_canonical() {
+        let server =
+            InfoServer::start(|_| r#"{"push":{"origin":"wss://canonical.example"}}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let supplied = format!("ws://{}/?transport=one", server.addr);
+
+        let result = super::create_auth_event_impl(
+            "challenge-original-123".to_string(),
+            supplied,
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a transport query must not corrupt the /info fetch, got {result:?}"
+        );
+        let event_json = result.unwrap();
+
+        assert_eq!(
+            relay_tag(&event_json),
+            "wss://canonical.example",
+            "signed relay tag must name the advertised canonical identity"
+        );
+        assert_eq!(
+            tag_value(&event_json, "challenge"),
+            "challenge-original-123",
+            "original challenge must be preserved verbatim"
+        );
+        assert_single_info_get(&server.requests());
+    }
+
+    /// A transport path must not leak into the metadata request target
+    /// either: `/info` is fetched from the origin root, and the signed tag
+    /// is the advertisement, not the path-bearing transport.
+    #[tokio::test]
+    async fn nip42_transport_path_fetches_root_info_and_signs_canonical() {
+        let server =
+            InfoServer::start(|_| r#"{"push":{"origin":"wss://canonical.example"}}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let supplied = format!("ws://{}/relay-road", server.addr);
+
+        let result =
+            super::create_auth_event_impl("test-challenge".to_string(), supplied, &client, &keys)
+                .await;
+        assert!(result.is_ok(), "a transport path must not break signing");
+
+        assert_eq!(
+            relay_tag(&result.unwrap()),
+            "wss://canonical.example",
+            "signed relay tag must name the advertisement, not the path-bearing transport"
+        );
+        assert_single_info_get(&server.requests());
+    }
+
+    /// No advertisement + transport components: the ENTIRE supplied URL
+    /// (path and query intact) is the compatibility signing identity, while
+    /// metadata is still fetched from the bare origin's `/info`.
+    #[tokio::test]
+    async fn nip42_absent_advertisement_preserves_supplied_url_components() {
+        let server =
+            InfoServer::start(|_| r#"{"name":"Buzz Relay","version":"0.2.1"}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let supplied = format!("ws://{}/observer-road?transport=one", server.addr);
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            supplied.clone(),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_ok(), "absent advertisement = compatibility");
+
+        assert_eq!(
+            relay_tag(&result.unwrap()),
+            supplied,
+            "the entire supplied URL (path + query) must be preserved verbatim"
+        );
+        assert_single_info_get(&server.requests());
+    }
+
+    /// An advertisement EQUAL to the transport origin is still an
+    /// advertisement: the signing identity is the advertised origin (clean,
+    /// no transport path/query), distinguishable from a genuinely absent
+    /// advertisement which would return the full supplied URL. Guards
+    /// against repairing query handling with a string-equality fallback.
+    #[tokio::test]
+    async fn nip42_same_origin_advertisement_is_an_advertisement() {
+        let server = InfoServer::start(|addr| format!(r#"{{"push":{{"origin":"ws://{addr}"}}}}"#));
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let supplied = format!("ws://{}/road?transport=one", server.addr);
+
+        let result =
+            super::create_auth_event_impl("test-challenge".to_string(), supplied, &client, &keys)
+                .await;
+        assert!(result.is_ok(), "same-origin advertisement must sign");
+
+        assert_eq!(
+            relay_tag(&result.unwrap()),
+            format!("ws://{}", server.addr),
+            "an explicit same-origin advertisement resolves to the advertised identity, not the supplied URL"
+        );
+        assert_single_info_get(&server.requests());
     }
 
     #[tokio::test]
     async fn nip42_malformed_metadata_refuses_before_signing() {
-        let server = SpyServer::start(
-            r#"{"push":{"origin":"wss://beehivenature.buzz""#.to_string(), // truncated
-        );
+        let server = InfoServer::start(|_| {
+            r#"{"push":{"origin":"wss://beehivenature.buzz""#.to_string() // truncated
+        });
         let client = reqwest::Client::new();
         let keys = nostr::Keys::generate();
 
@@ -933,7 +1128,7 @@ mod nip42_canonical_auth_tests {
 
     #[tokio::test]
     async fn nip42_null_push_refuses_before_signing() {
-        let server = SpyServer::start(r#"{"push":null}"#.to_string());
+        let server = InfoServer::start(|_| r#"{"push":null}"#.to_string());
         let client = reqwest::Client::new();
         let keys = nostr::Keys::generate();
 

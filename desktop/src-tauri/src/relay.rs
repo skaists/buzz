@@ -116,11 +116,16 @@ static CANONICAL_WS_IDENTITIES: std::sync::LazyLock<
 /// connection URL. Behind the Caddy Host rewrite, the relay expects the
 /// canonical community URL (`wss://beehivenature.buzz`) in the AUTH
 /// event's relay tag even when the socket connects to the alias
-/// (`wss://relay2.skaists.dev`). Fetches `/info` on the HTTP equivalent
-/// of the transport, reads `push.origin` (already `wss://` form), and
-/// applies the same strict validation as the HTTP resolver. Fail-closed on
-/// unreadable/malformed metadata. A well-formed document with no
-/// advertised origin retains transport compatibility (the supplied URL).
+/// (`wss://relay2.skaists.dev`). The supplied URL is parsed structurally:
+/// `/info` is fetched from the origin (scheme + host + port) only, so a
+/// transport path or query can never leak into the metadata request
+/// target. The decision reuses the same strict validation as the HTTP
+/// resolver: fail-closed on unreadable/malformed metadata; a well-formed
+/// document with no advertised origin retains transport compatibility
+/// (the ENTIRE supplied URL, components intact); an advertised origin —
+/// including one equal to the transport origin, which is an advertisement,
+/// not an absence — is validated and returned as the WS-form signing
+/// identity. The WebSocket transport itself is never rewritten.
 pub async fn canonical_ws_signing_url(
     client: &reqwest::Client,
     ws_url: &str,
@@ -133,38 +138,55 @@ pub async fn canonical_ws_signing_url(
         return Ok(hit);
     }
 
-    // Convert the WS URL to its HTTP equivalent for the /info fetch.
-    let http_base = if let Some(rest) = ws_url.trim().strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else if let Some(rest) = ws_url.trim().strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else {
-        return Err(format!("supplied relay URL is not ws/wss: {ws_url}"));
+    // Structural parse of the supplied URL: the metadata road is derived
+    // from the parsed origin, never from prefix surgery on the raw string
+    // (text concatenation let a query consume the `/info` suffix).
+    let parsed = url::Url::parse(ws_url.trim())
+        .map_err(|_| format!("supplied relay URL is not a valid ws/wss URL: {ws_url}"))?;
+    let http_scheme = match parsed.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return Err(format!("supplied relay URL is not ws/wss: {ws_url}")),
     };
-    let http_base = http_base.trim_end_matches('/').to_string();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("supplied relay URL has no host: {ws_url}"))?;
+    // Metadata origin base: path/query/fragment of the transport are
+    // deliberately excluded — `/info` lives at the origin root.
+    let metadata_base = match parsed.port() {
+        Some(port) => format!("{http_scheme}://{host}:{port}"),
+        None => format!("{http_scheme}://{host}"),
+    };
 
-    // Reuse the existing /info fetch + strict validation (HTTP form).
-    let canonical_http = canonical_signing_base_with_client(client, &http_base).await?;
+    let doc = fetch_info_document(client, &metadata_base).await?;
 
-    // If the resolver returned the transport unchanged (no advertisement),
-    // the WS identity is the supplied URL. Otherwise convert the canonical
-    // HTTP base back to WS form (https→wss, http→ws).
-    let canonical_ws = if canonical_http == http_base {
-        ws_url.to_string()
-    } else if let Some(rest) = canonical_http.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = canonical_http.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        return Err(format!(
-            "canonical resolver returned a non-HTTP base: {canonical_http}"
-        ));
+    // Advertised vs absent must be decided by key presence, never by
+    // comparing the resolved base to the transport origin — an explicit
+    // advertisement equal to the transport origin is still an advertisement.
+    let canonical_ws = match advertised_origin_from_info(&doc)? {
+        Some(advertised_http_base) => http_base_to_ws_form(&advertised_http_base)?,
+        None => ws_url.to_string(),
     };
 
     if let Ok(mut cache) = CANONICAL_WS_IDENTITIES.write() {
         cache.insert(ws_url.to_string(), canonical_ws.clone());
     }
     Ok(canonical_ws)
+}
+
+/// Convert a validated canonical HTTP base (`http(s)://host[:port]`) back to
+/// its WS form (`ws(s)://host[:port]`). The inverse of the scheme mapping
+/// `validate_advertised_origin` applies.
+fn http_base_to_ws_form(http_base: &str) -> Result<String, String> {
+    if let Some(rest) = http_base.strip_prefix("https://") {
+        Ok(format!("wss://{rest}"))
+    } else if let Some(rest) = http_base.strip_prefix("http://") {
+        Ok(format!("ws://{rest}"))
+    } else {
+        Err(format!(
+            "canonical resolver returned a non-HTTP base: {http_base}"
+        ))
+    }
 }
 
 /// Strictly validate an advertised ws/wss ORIGIN and construct its HTTP base
@@ -215,11 +237,26 @@ pub fn canonical_decision_from_info(
     doc: &serde_json::Value,
     transport_base: &str,
 ) -> Result<String, String> {
+    match advertised_origin_from_info(doc)? {
+        Some(advertised) => Ok(advertised),
+        None => Ok(transport_base.to_string()),
+    }
+}
+
+/// The advertisement-existence core of [`canonical_decision_from_info`]:
+/// `Ok(Some(validated_http_base))` when `/info` explicitly advertises a
+/// canonical origin, `Ok(None)` when the well-formed document carries no
+/// advertisement at all, `Err` on every malformed shape. The WS resolver
+/// needs the three-way distinction — an advertisement EQUAL to the
+/// transport origin must resolve to the advertised identity, not fall
+/// through to transport compatibility — which a base-string equality
+/// against the transport cannot express.
+pub fn advertised_origin_from_info(doc: &serde_json::Value) -> Result<Option<String>, String> {
     let obj = doc
         .as_object()
         .ok_or("relay /info returned a malformed document")?;
     match obj.get("push") {
-        None => Ok(transport_base.to_string()),
+        None => Ok(None),
         Some(serde_json::Value::Null) => {
             Err("relay /info returned a malformed push descriptor".to_string())
         }
@@ -228,7 +265,7 @@ pub fn canonical_decision_from_info(
                 .as_object()
                 .ok_or("relay /info returned a malformed push descriptor")?;
             match push_obj.get("origin") {
-                None => Ok(transport_base.to_string()),
+                None => Ok(None),
                 Some(serde_json::Value::Null) => {
                     Err("relay /info advertises a malformed canonical origin".to_string())
                 }
@@ -237,6 +274,7 @@ pub fn canonical_decision_from_info(
                         .as_str()
                         .ok_or("relay /info advertises a malformed canonical origin")?;
                     validate_advertised_origin(advertised)
+                        .map(Some)
                         .ok_or("relay /info canonical origin failed URL verification".to_string())
                 }
             }
@@ -244,19 +282,17 @@ pub fn canonical_decision_from_info(
     }
 }
 
-async fn canonical_signing_base_with_client(
+/// GET `{origin_base}/info` and decode the body as JSON. `origin_base` is a
+/// bare scheme + authority (no path/query): both the HTTP resolver and the
+/// WS resolver construct it structurally, so the metadata request target is
+/// always exactly `/info` at the origin root regardless of the transport
+/// URL's own path or query. Fail-closed on transport errors, non-2xx
+/// statuses, and bodies that are not valid JSON.
+async fn fetch_info_document(
     client: &reqwest::Client,
-    transport_base: &str,
-) -> Result<String, String> {
-    let transport_base = transport_base.trim_end_matches('/');
-    if let Some(hit) = CANONICAL_SIGNING_BASES
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(transport_base).cloned())
-    {
-        return Ok(hit);
-    }
-    let info_url = format!("{transport_base}/info");
+    origin_base: &str,
+) -> Result<serde_json::Value, String> {
+    let info_url = format!("{origin_base}/info");
     let response = client
         .get(&info_url)
         .timeout(std::time::Duration::from_secs(10))
@@ -275,8 +311,22 @@ async fn canonical_signing_base_with_client(
         .text()
         .await
         .map_err(|_| "relay /info returned a malformed document".to_string())?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| "relay /info returned a malformed document".to_string())?;
+    serde_json::from_str(&text).map_err(|_| "relay /info returned a malformed document".to_string())
+}
+
+async fn canonical_signing_base_with_client(
+    client: &reqwest::Client,
+    transport_base: &str,
+) -> Result<String, String> {
+    let transport_base = transport_base.trim_end_matches('/');
+    if let Some(hit) = CANONICAL_SIGNING_BASES
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(transport_base).cloned())
+    {
+        return Ok(hit);
+    }
+    let doc = fetch_info_document(client, transport_base).await?;
     let decision = canonical_decision_from_info(&doc, transport_base)?;
     if let Ok(mut cache) = CANONICAL_SIGNING_BASES.write() {
         cache.insert(transport_base.to_string(), decision.clone());
