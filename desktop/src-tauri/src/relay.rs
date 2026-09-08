@@ -105,6 +105,68 @@ static CANONICAL_SIGNING_BASES: std::sync::LazyLock<
     std::sync::RwLock<std::collections::HashMap<String, String>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
+/// Canonical NIP-42 WebSocket signing identities resolved from GET /info.
+/// Keyed by the supplied WS connection URL (the transport). The value is
+/// the canonical `wss://` identity to put in the AUTH event's relay tag.
+static CANONICAL_WS_IDENTITIES: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Resolve the canonical NIP-42 WebSocket signing identity for a supplied
+/// connection URL. Behind the Caddy Host rewrite, the relay expects the
+/// canonical community URL (`wss://beehivenature.buzz`) in the AUTH
+/// event's relay tag even when the socket connects to the alias
+/// (`wss://relay2.skaists.dev`). Fetches `/info` on the HTTP equivalent
+/// of the transport, reads `push.origin` (already `wss://` form), and
+/// applies the same strict validation as the HTTP resolver. Fail-closed on
+/// unreadable/malformed metadata. A well-formed document with no
+/// advertised origin retains transport compatibility (the supplied URL).
+pub async fn canonical_ws_signing_url(
+    client: &reqwest::Client,
+    ws_url: &str,
+) -> Result<String, String> {
+    let cached = CANONICAL_WS_IDENTITIES
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(ws_url).cloned());
+    if let Some(hit) = cached {
+        return Ok(hit);
+    }
+
+    // Convert the WS URL to its HTTP equivalent for the /info fetch.
+    let http_base = if let Some(rest) = ws_url.trim().strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = ws_url.trim().strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        return Err(format!("supplied relay URL is not ws/wss: {ws_url}"));
+    };
+    let http_base = http_base.trim_end_matches('/').to_string();
+
+    // Reuse the existing /info fetch + strict validation (HTTP form).
+    let canonical_http = canonical_signing_base_with_client(client, &http_base).await?;
+
+    // If the resolver returned the transport unchanged (no advertisement),
+    // the WS identity is the supplied URL. Otherwise convert the canonical
+    // HTTP base back to WS form (https→wss, http→ws).
+    let canonical_ws = if canonical_http == http_base {
+        ws_url.to_string()
+    } else if let Some(rest) = canonical_http.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = canonical_http.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return Err(format!(
+            "canonical resolver returned a non-HTTP base: {canonical_http}"
+        ));
+    };
+
+    if let Ok(mut cache) = CANONICAL_WS_IDENTITIES.write() {
+        cache.insert(ws_url.to_string(), canonical_ws.clone());
+    }
+    Ok(canonical_ws)
+}
+
 /// Strictly validate an advertised ws/wss ORIGIN and construct its HTTP base
 /// (mirror of the desktop TS law in shared/api/invites.ts): no userinfo,
 /// query, fragment, or non-root path; ports and IPv6 literals are valid; the

@@ -638,17 +638,30 @@ pub async fn sign_nostr_identity_binding(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-#[tauri::command]
-pub async fn create_auth_event(
+/// Core NIP-42 AUTH event creation — testable without Tauri's State wrapper.
+/// Takes the HTTP client and signing keys directly so tests can supply
+/// synthetic keys and a plain reqwest client. The canonical WS signing
+/// identity is resolved from /info BEFORE any signing; malformed metadata
+/// refuses (fail-closed).
+pub async fn create_auth_event_impl(
     challenge: String,
     relay_url: String,
-    state: State<'_, AppState>,
+    http_client: &reqwest::Client,
+    keys: &nostr::Keys,
 ) -> Result<String, String> {
-    let keys = state.signing_keys()?;
+    // NIP-42 canonical signing identity: behind the Caddy Host rewrite,
+    // the relay expects the canonical community URL in the AUTH event's
+    // relay tag even when the socket connects to the alias. Resolve from
+    // /info with the same strict fail-closed law as the HTTP path. A
+    // well-formed document with no advertised origin keeps the supplied
+    // URL (transport compatibility). Malformed metadata refuses BEFORE
+    // any signing — never silently sign the transport instead.
+    let canonical_ws_url = crate::relay::canonical_ws_signing_url(http_client, &relay_url).await?;
 
+    let keys = keys.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let tags = vec![
-            Tag::parse(vec!["relay", &relay_url])
+            Tag::parse(vec!["relay", &canonical_ws_url])
                 .map_err(|error| format!("relay tag failed: {error}"))?,
             Tag::parse(vec!["challenge", &challenge])
                 .map_err(|error| format!("challenge tag failed: {error}"))?,
@@ -663,6 +676,16 @@ pub async fn create_auth_event(
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn create_auth_event(
+    challenge: String,
+    relay_url: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let keys = state.signing_keys()?;
+    create_auth_event_impl(challenge, relay_url, &state.http_client, &keys).await
 }
 
 #[tauri::command]
@@ -788,3 +811,157 @@ mod nostr_identity_binding_tests {
 #[cfg(test)]
 #[path = "identity_key_backup_tests.rs"]
 mod identity_key_backup_tests;
+
+/// Caller-level regressions for the NIP-42 AUTH boundary: these tests
+/// invoke the ACTUAL create_auth_event command (the shared signer used by
+/// both relayClientSession.ts and readOnlyRelayClient.ts) with synthetic
+/// keys and an isolated AppState whose HTTP client points at a loopback
+/// /info server. The signed kind-22242 event is decoded to verify the
+/// canonical relay tag while the socket URL stays on the alias.
+#[cfg(test)]
+mod nip42_canonical_auth_tests {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    struct SpyServer {
+        addr: String,
+    }
+
+    impl SpyServer {
+        fn start(info_body: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let len = info_body.len();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{info_body}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            SpyServer {
+                addr: format!("{addr}"),
+            }
+        }
+    }
+
+    /// Decode the relay tag from a signed kind-22242 AUTH event JSON.
+    fn relay_tag(event_json: &str) -> String {
+        let event: serde_json::Value = serde_json::from_str(event_json).expect("valid JSON");
+        assert_eq!(event["kind"], 22242, "kind 22242");
+        let tags = event["tags"].as_array().expect("tags");
+        tags.iter()
+            .find(|t| t[0] == "relay")
+            .and_then(|t| t[1].as_str())
+            .expect("relay tag present")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn nip42_alias_signs_canonical_relay_tag() {
+        let server =
+            SpyServer::start(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let alias_ws_url = format!("ws://{}", server.addr);
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            alias_ws_url.clone(),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_ok(), "valid metadata must sign, got {result:?}");
+
+        let tag = relay_tag(&result.unwrap());
+        assert_eq!(
+            tag, "wss://beehivenature.buzz",
+            "relay tag must name the canonical identity, got {tag}"
+        );
+        assert!(
+            !tag.contains("127.0.0.1"),
+            "relay tag must NOT name the transport/alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip42_no_advertisement_signs_supplied_url() {
+        let server = SpyServer::start(r#"{"name":"Buzz Relay"}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let supplied = format!("ws://{}", server.addr);
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            supplied.clone(),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_ok(), "no advertisement = transport compatibility");
+
+        let tag = relay_tag(&result.unwrap());
+        assert_eq!(tag, supplied, "relay tag keeps the supplied URL");
+    }
+
+    #[tokio::test]
+    async fn nip42_malformed_metadata_refuses_before_signing() {
+        let server = SpyServer::start(
+            r#"{"push":{"origin":"wss://beehivenature.buzz""#.to_string(), // truncated
+        );
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            format!("ws://{}", server.addr),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_err(), "malformed /info must refuse");
+        assert!(result.unwrap_err().contains("malformed"));
+    }
+
+    #[tokio::test]
+    async fn nip42_null_push_refuses_before_signing() {
+        let server = SpyServer::start(r#"{"push":null}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            format!("ws://{}", server.addr),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_err(), "null push must refuse");
+    }
+
+    #[tokio::test]
+    async fn nip42_unreachable_relay_refuses_before_signing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+
+        let result = super::create_auth_event_impl(
+            "test-challenge".to_string(),
+            format!("ws://{addr}"),
+            &client,
+            &keys,
+        )
+        .await;
+        assert!(result.is_err(), "transport failure must refuse");
+    }
+}
