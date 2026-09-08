@@ -1002,62 +1002,155 @@ mod import_avatar_tests {
 /// boundary (review request): submit_engram_event calls
 /// canonical_sign_url BEFORE building its NIP-98 header, keeping the POST
 /// on the original transport. These tests exercise the exact resolver the
-/// caller uses against real loopback servers with synthetic keys.
+
+/// Caller-level regressions for the persona-import publish boundary: these
+/// tests invoke the ACTUAL submit_engram_event function with synthetic
+/// keys and an isolated AppState whose HTTP client points at a loopback
+/// server that captures the incoming request. The NIP-98 event is decoded
+/// to verify the canonical `u` tag while the POST rides the alias.
 #[cfg(test)]
-mod canonical_signing_import_tests {
-    use crate::relay::canonical_sign_url_with_client;
+mod import_publish_boundary_tests {
+    use crate::app_state::build_app_state;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
 
-    fn serve_once(body: String, status: &'static str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                use std::io::{Read, Write};
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let len = body.len();
-                let response =
-                    format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}");
-                let _ = stream.write_all(response.as_bytes());
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+    }
+
+    struct SpyServer {
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        addr: String,
+    }
+
+    impl SpyServer {
+        fn start(info_body: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let req_clone = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut buf = [0u8; 16384];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (head, _body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                    let mut lines = head.lines();
+                    let request_line = lines.next().unwrap_or_default();
+                    let auth = lines.find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        if lower.starts_with("authorization: ") {
+                            Some(l[15..].to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    let parts: Vec<&str> = request_line.split_whitespace().collect();
+                    let method = parts.first().copied().unwrap_or_default().to_string();
+                    let path = parts.get(1).copied().unwrap_or_default().to_string();
+                    let is_info = path.ends_with("/info");
+                    req_clone.lock().unwrap().push(CapturedRequest {
+                        method,
+                        path,
+                        authorization: auth,
+                    });
+                    let (status, resp_body) = if is_info {
+                        ("200 OK", info_body.clone())
+                    } else {
+                        ("200 OK", r#"{"accepted":true}"#.to_string())
+                    };
+                    let len = resp_body.len();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{resp_body}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            SpyServer {
+                requests,
+                addr: format!("http://{addr}"),
             }
-        });
-        format!("http://{addr}")
+        }
+
+        fn post_requests(&self) -> Vec<CapturedRequest> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .cloned()
+                .collect()
+        }
     }
 
     #[tokio::test]
-    async fn import_boundary_alias_transport_signs_canonical_origin() {
-        // Alias transport (the loopback server), advertised canonical
-        // origin (beehivenature.buzz) — the importer's sign URL must be
-        // the canonical origin, while the POST destination stays on the
-        // transport (the caller passes the transport URL separately).
-        let transport = serve_once(
-            "{\"push\":{\"origin\":\"wss://beehivenature.buzz\"}}".to_string(),
-            "200 OK",
+    async fn import_valid_metadata_signs_canonical_posts_alias() {
+        let server =
+            SpyServer::start(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
+        let state = Arc::new(build_app_state());
+        let agent_keys = nostr::Keys::generate();
+        let event_json = br#"{"kind":9,"content":"test"}"#;
+        let transport_url = format!("{}/events", server.addr);
+
+        // Invoke the ACTUAL submit_engram_event — the same function the
+        // persona-import caller uses for memory events.
+        let result =
+            super::submit_engram_event(&state, &agent_keys, event_json, &transport_url, None).await;
+        assert!(result.is_ok(), "valid metadata must submit, got {result:?}");
+
+        let posts = server.post_requests();
+        assert_eq!(posts.len(), 1, "exactly one POST to the transport");
+
+        // Decode the NIP-98 event from the Authorization header
+        let auth = posts[0]
+            .authorization
+            .as_ref()
+            .expect("Authorization header present");
+        assert!(auth.starts_with("Nostr "), "NIP-98 scheme");
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let event_json = auth.strip_prefix("Nostr ").unwrap();
+        let decoded = B64.decode(event_json).expect("valid base64");
+        let event: serde_json::Value = serde_json::from_slice(&decoded).expect("valid JSON");
+        let tags = event["tags"].as_array().expect("tags array");
+        let u_tag = tags
+            .iter()
+            .find(|t| t[0] == "u")
+            .and_then(|t| t[1].as_str())
+            .expect("u tag present");
+        assert!(
+            u_tag.starts_with("https://beehivenature.buzz/"),
+            "u tag must name the canonical origin, got {u_tag}"
         );
-        let client = reqwest::Client::new();
-        let sign_url = canonical_sign_url_with_client(&client, &format!("{transport}/events"))
-            .await
-            .expect("valid metadata must resolve");
+        assert!(
+            !u_tag.contains("127.0.0.1"),
+            "u tag must NOT name the transport/alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_invalid_metadata_no_signing_no_post() {
+        let server = SpyServer::start(r#"{"push":{"origin":null}}"#.to_string());
+        let state = Arc::new(build_app_state());
+        let agent_keys = nostr::Keys::generate();
+        let event_json = br#"{"kind":9,"content":"test"}"#;
+        let transport_url = format!("{}/events", server.addr);
+
+        let result =
+            super::submit_engram_event(&state, &agent_keys, event_json, &transport_url, None).await;
+        assert!(result.is_err(), "null origin must refuse before signing");
+
+        let posts = server.post_requests();
         assert_eq!(
-            sign_url, "https://beehivenature.buzz/events",
-            "the NIP-98 u tag must name the canonical identity"
+            posts.len(),
+            0,
+            "ZERO POST requests — no signing/POST on invalid metadata"
         );
-        // The caller's transport URL (what it POSTs to) is unchanged:
-        assert_ne!(
-            sign_url,
-            format!("{transport}/events"),
-            "the canonical sign URL must differ from the alias transport"
-        );
-    }
-
-    #[tokio::test]
-    async fn import_boundary_invalid_metadata_refuses_before_signing() {
-        // Invalid metadata (null origin) — the importer must receive Err
-        // before any NIP-98 header construction or POST.
-        let transport = serve_once("{\"push\":{\"origin\":null}}".to_string(), "200 OK");
-        let client = reqwest::Client::new();
-        let result = canonical_sign_url_with_client(&client, &format!("{transport}/events")).await;
-        assert!(result.is_err(), "null origin must refuse");
-        assert!(result.unwrap_err().contains("malformed canonical origin"));
     }
 }
