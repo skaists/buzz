@@ -997,3 +997,67 @@ mod import_avatar_tests {
         assert_eq!(result.unwrap_err(), "Snapshot avatar data is malformed.");
     }
 }
+
+/// Caller-level regressions for the persona-import canonical-signing
+/// boundary (review request): submit_engram_event calls
+/// canonical_sign_url BEFORE building its NIP-98 header, keeping the POST
+/// on the original transport. These tests exercise the exact resolver the
+/// caller uses against real loopback servers with synthetic keys.
+#[cfg(test)]
+mod canonical_signing_import_tests {
+    use crate::relay::canonical_sign_url_with_client;
+
+    fn serve_once(body: String, status: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let len = body.len();
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}");
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn import_boundary_alias_transport_signs_canonical_origin() {
+        // Alias transport (the loopback server), advertised canonical
+        // origin (beehivenature.buzz) — the importer's sign URL must be
+        // the canonical origin, while the POST destination stays on the
+        // transport (the caller passes the transport URL separately).
+        let transport = serve_once(
+            "{\"push\":{\"origin\":\"wss://beehivenature.buzz\"}}".to_string(),
+            "200 OK",
+        );
+        let client = reqwest::Client::new();
+        let sign_url = canonical_sign_url_with_client(&client, &format!("{transport}/events"))
+            .await
+            .expect("valid metadata must resolve");
+        assert_eq!(
+            sign_url, "https://beehivenature.buzz/events",
+            "the NIP-98 u tag must name the canonical identity"
+        );
+        // The caller's transport URL (what it POSTs to) is unchanged:
+        assert_ne!(
+            sign_url,
+            format!("{transport}/events"),
+            "the canonical sign URL must differ from the alias transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_boundary_invalid_metadata_refuses_before_signing() {
+        // Invalid metadata (null origin) — the importer must receive Err
+        // before any NIP-98 header construction or POST.
+        let transport = serve_once("{\"push\":{\"origin\":null}}".to_string(), "200 OK");
+        let client = reqwest::Client::new();
+        let result = canonical_sign_url_with_client(&client, &format!("{transport}/events")).await;
+        assert!(result.is_err(), "null origin must refuse");
+        assert!(result.unwrap_err().contains("malformed canonical origin"));
+    }
+}

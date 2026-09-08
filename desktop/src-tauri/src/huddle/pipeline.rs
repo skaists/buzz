@@ -683,15 +683,14 @@ pub(crate) fn spawn_transcription_task(
             // unreachable relay proves nothing about the canonical identity —
             // signing the transport URL instead IS the alias-host bug. Report
             // and skip this publish; the next utterance retries.
-            let sign_url = match crate::relay::canonical_sign_url_with_client(&http_client, &url)
-                .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    eprintln!("buzz-desktop: STT publish skipped (canonical signing URL): {e}");
-                    continue;
-                }
-            };
+            let sign_url =
+                match crate::relay::canonical_sign_url_with_client(&http_client, &url).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("buzz-desktop: STT publish skipped (canonical signing URL): {e}");
+                        continue;
+                    }
+                };
             let auth_header = match crate::relay::build_nip98_auth_header_for_keys(
                 &keys,
                 &reqwest::Method::POST,
@@ -873,5 +872,93 @@ mod tts_start_race_tests {
             .expect("huddle state")
             .tts_starting
             .load(Ordering::Acquire));
+    }
+}
+
+/// Caller-level regressions for the canonical-signing boundary (review
+/// request): the huddle publish path calls canonical_sign_url_with_client
+/// BEFORE any NIP-98 header construction or POST. These tests exercise
+/// that exact function against real loopback HTTP servers, proving the
+/// boundary returns Err for malformed metadata and transport failures —
+/// which sends the caller into its `continue` (no signing, no POST).
+#[cfg(test)]
+mod canonical_signing_boundary_tests {
+    use crate::relay::canonical_sign_url_with_client;
+
+    /// Serve one HTTP response on a loopback listener, reading the request
+    /// first (same pattern as relay_admission loopback tests).
+    fn serve_once(body: String, status: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let len = body.len();
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}");
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn huddle_boundary_malformed_metadata_no_signing_or_post() {
+        // Malformed /info: invalid JSON — the huddle caller must receive Err
+        // and enter its continue-skip path before any NIP-98 or POST.
+        let base = serve_once(
+            "{\"push\":{\"origin\":\"wss://beehivenature.buzz\"".to_string(), // truncated JSON
+            "200 OK",
+        );
+        let client = reqwest::Client::new();
+        let result = canonical_sign_url_with_client(&client, &format!("{base}/events")).await;
+        assert!(
+            result.is_err(),
+            "malformed JSON must refuse, got {result:?}"
+        );
+        assert!(result.unwrap_err().contains("malformed document"));
+    }
+
+    #[tokio::test]
+    async fn huddle_boundary_null_push_no_signing_or_post() {
+        // Explicit null push descriptor — must refuse (not fallback).
+        let base = serve_once("{\"push\":null}".to_string(), "200 OK");
+        let client = reqwest::Client::new();
+        let result = canonical_sign_url_with_client(&client, &format!("{base}/events")).await;
+        assert!(result.is_err(), "null push must refuse");
+        assert!(result.unwrap_err().contains("malformed push descriptor"));
+    }
+
+    #[tokio::test]
+    async fn huddle_boundary_transport_failure_no_signing_or_post() {
+        // Unreachable relay (bind then drop without accepting) — the huddle
+        // caller must receive Err and skip the publish attempt.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing is listening — connection refused
+        let client = reqwest::Client::new();
+        let result =
+            canonical_sign_url_with_client(&client, &format!("http://{addr}/events")).await;
+        assert!(result.is_err(), "transport failure must refuse");
+    }
+
+    #[tokio::test]
+    async fn huddle_boundary_valid_metadata_signs_canonical() {
+        // Valid control: a well-formed canonical origin resolves — this
+        // proves a disconnected harness cannot make the refusal tests pass
+        // vacuously (the resolver DOES return Ok when metadata is valid).
+        let base = serve_once(
+            "{\"push\":{\"origin\":\"wss://beehivenature.buzz\"}}".to_string(),
+            "200 OK",
+        );
+        let client = reqwest::Client::new();
+        let result = canonical_sign_url_with_client(&client, &format!("{base}/events")).await;
+        assert!(
+            result.is_ok(),
+            "valid metadata must resolve, got {result:?}"
+        );
+        assert_eq!(result.unwrap(), "https://beehivenature.buzz/events");
     }
 }

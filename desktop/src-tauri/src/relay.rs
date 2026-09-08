@@ -200,7 +200,12 @@ async fn canonical_signing_base_with_client(
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|error| format!("relay /info unreachable: {}", classify_request_error(&error)))?;
+        .map_err(|error| {
+            format!(
+                "relay /info unreachable: {}",
+                classify_request_error(&error)
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!("relay /info HTTP {}", response.status().as_u16()));
     }
@@ -801,8 +806,7 @@ mod tests {
     fn canonical_decision_rejects_explicit_null_push() {
         let doc = serde_json::json!({"push": null});
         assert!(
-            canonical_decision_from_info(&doc, "https://relay2.skaists.dev")
-                .is_err(),
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
             "explicit null push is a malformed descriptor, not an absent key"
         );
     }
@@ -811,8 +815,7 @@ mod tests {
     fn canonical_decision_rejects_explicit_null_origin() {
         let doc = serde_json::json!({"push": {"origin": null}});
         assert!(
-            canonical_decision_from_info(&doc, "https://relay2.skaists.dev")
-                .is_err(),
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
             "explicit null origin is a malformed advertisement, not an absent key"
         );
     }
@@ -822,15 +825,13 @@ mod tests {
         // well-formed object with NO push key — the road IS the identity
         let doc = serde_json::json!({"name": "Buzz Relay", "version": "0.2.1"});
         assert_eq!(
-            canonical_decision_from_info(&doc, "https://relay.example")
-                .unwrap(),
+            canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
             "https://relay.example"
         );
         // push present as a valid object with NO origin key
         let doc = serde_json::json!({"push": {"keys": []}});
         assert_eq!(
-            canonical_decision_from_info(&doc, "https://relay.example")
-                .unwrap(),
+            canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
             "https://relay.example"
         );
     }
@@ -841,8 +842,7 @@ mod tests {
             "push": {"origin": "wss://beehivenature.buzz"}
         });
         assert_eq!(
-            canonical_decision_from_info(&doc, "https://relay2.skaists.dev")
-                .unwrap(),
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").unwrap(),
             "https://beehivenature.buzz"
         );
     }
@@ -856,8 +856,7 @@ mod tests {
             serde_json::json!(42),
         ] {
             assert!(
-                canonical_decision_from_info(&doc, "https://relay.example")
-                    .is_err(),
+                canonical_decision_from_info(&doc, "https://relay.example").is_err(),
                 "non-object root must be refused"
             );
         }
@@ -872,10 +871,7 @@ mod tests {
         ];
         for push in cases {
             let doc = serde_json::json!({"push": push});
-            assert!(
-                canonical_decision_from_info(&doc, "https://relay.example")
-                    .is_err()
-            );
+            assert!(canonical_decision_from_info(&doc, "https://relay.example").is_err());
         }
     }
 
