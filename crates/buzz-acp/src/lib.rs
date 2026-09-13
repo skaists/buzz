@@ -5309,6 +5309,7 @@ mod author_gate_tests {
         relay::RestClient {
             http: reqwest::Client::new(),
             base_url: "http://localhost:0".into(),
+            signing_base_url: "http://localhost:0".into(),
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
         }
@@ -5609,7 +5610,8 @@ mod author_gate_tests {
         });
         let rest = relay::RestClient {
             http: reqwest::Client::new(),
-            base_url,
+            base_url: base_url.clone(),
+            signing_base_url: base_url,
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
         };

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -7,6 +9,102 @@ use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
 use crate::error::CliError;
+
+/// Cache of transport HTTP base → canonical HTTP signing base, resolved once
+/// per relay per process. Bounded by the number of distinct relays used.
+static CANONICAL_HTTP_SIGNING_BASES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// The cached canonical signing base for `relay_base`, if this process has
+/// already resolved it (see [`canonical_http_signing_base_probe`]).
+fn cached_canonical_base(relay_base: &str) -> Option<String> {
+    let cache = CANONICAL_HTTP_SIGNING_BASES.get()?;
+    cache.lock().ok()?.get(relay_base).cloned()
+}
+
+/// Probe `{relay_base}/info` and cache the canonical HTTP base that NIP-98
+/// `u` tags must name for a relay reached at `relay_base` (e.g.
+/// `https://relay2.skaists.dev`).
+///
+/// Some roads are transport aliases serving a canonical community origin
+/// (advertised as `push.origin`, e.g. `wss://beehivenature.buzz`). The relay
+/// verifies the `u` tag against the canonical origin, so signing the
+/// transport alias fails with 401 "URL mismatch". Law: sign the identity,
+/// ride the road. Resolution is REACTIVE — it runs once, after a first 401 —
+/// so canonical roads and roads without `/info` never pay a probe.
+///
+/// FAIL-OPEN: an unreadable `/info`, a missing `push.origin`, or an invalid
+/// advertisement caches and returns `relay_base` verbatim — identical to the
+/// previous behavior, so those roads never regress or re-probe.
+async fn canonical_http_signing_base_probe(relay_base: &str) -> String {
+    let cache_cell = CANONICAL_HTTP_SIGNING_BASES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache_cell.lock() {
+        if let Some(hit) = map.get(relay_base) {
+            return hit.clone();
+        }
+    }
+
+    let resolved = match fetch_advertised_origin(relay_base).await {
+        Ok(Some(origin)) => {
+            ws_origin_to_http_base(&origin).unwrap_or_else(|| relay_base.to_string())
+        }
+        _ => relay_base.to_string(),
+    };
+    if let Ok(mut map) = cache_cell.lock() {
+        map.insert(relay_base.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+/// Fetch `{relay_base}/info` and extract `push.origin` as a string.
+/// `Err` on network failure, non-success status, unparseable body, or a
+/// non-string `push.origin` (e.g. explicit `null`); `Ok(None)` when the key
+/// is absent.
+async fn fetch_advertised_origin(relay_base: &str) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let resp = client
+        .get(format!("{relay_base}/info"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let doc: serde_json::Value = resp.json().await.map_err(|e| format!("body: {e}"))?;
+    match doc.pointer("/push/origin") {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("push.origin is not a string: {other}")),
+    }
+}
+
+/// Strictly validate an advertised ws/wss origin and return its HTTP base:
+/// scheme must be ws/wss; no userinfo, query, fragment, or non-root path; a
+/// host must be present. Ports and IPv6 literals are valid.
+fn ws_origin_to_http_base(origin: &str) -> Option<String> {
+    let url = url::Url::parse(origin).ok()?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return None,
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    match url.path() {
+        "" | "/" => {}
+        _ => return None,
+    }
+    let host = url.host_str()?;
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}"))
+}
 
 /// Descriptor returned by the relay after a successful upload.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -569,6 +667,27 @@ impl BuzzClient {
         &self.relay_url
     }
 
+    /// The URL a NIP-98 `u` tag must name for a request riding `url`: the
+    /// canonical origin when this relay has been identified as a transport
+    /// alias (cached; populated reactively after a 401 — see
+    /// [`Self::canonical_flip_after_401`]), else `url` itself. The request
+    /// still travels to the original `url` — sign the identity, ride the road.
+    async fn signing_url(&self, url: &str) -> String {
+        if let Some(canonical) = cached_canonical_base(&self.relay_url) {
+            if canonical != self.relay_url {
+                return url.replacen(&self.relay_url, &canonical, 1);
+            }
+        }
+        url.to_string()
+    }
+
+    /// After a 401, resolve the canonical signing base once per process.
+    /// Returns `true` when it differs from the transport base — the caller
+    /// should retry immediately; re-signing picks up the cached canonical.
+    async fn canonical_flip_after_401(&self) -> bool {
+        canonical_http_signing_base_probe(&self.relay_url).await != self.relay_url
+    }
+
     /// Return the owner pubkey carried by the NIP-OA auth tag, if any.
     ///
     /// The auth tag is `["auth", owner_pubkey, conditions, sig]`; the
@@ -646,6 +765,17 @@ impl BuzzClient {
             match op().await {
                 Ok(value) => return Ok(value),
                 Err(e) => {
+                    // Alias roads: a 401 URL-mismatch is not a credential
+                    // problem — resolve the canonical origin once and retry
+                    // immediately with canonical signing.
+                    if let CliError::Relay { status: 401, .. } = &e {
+                        if !is_last
+                            && cached_canonical_base(&self.relay_url).is_none()
+                            && self.canonical_flip_after_401().await
+                        {
+                            continue;
+                        }
+                    }
                     if !is_last {
                         let delay = match &e {
                             CliError::Network(net_err)
@@ -780,7 +910,12 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let auth = sign_nip98(
+                    &self.keys,
+                    "POST",
+                    &self.signing_url(&url).await,
+                    Some(&body),
+                )?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -810,7 +945,12 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let auth = sign_nip98(
+                    &self.keys,
+                    "POST",
+                    &self.signing_url(&url).await,
+                    Some(&body),
+                )?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -838,7 +978,7 @@ impl BuzzClient {
         self.with_retry_body(|| {
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "GET", &url, None)?;
+                let auth = sign_nip98(&self.keys, "GET", &self.signing_url(&url).await, None)?;
                 let resp = self
                     .with_auth_tag(self.http.get(&url).header("Authorization", auth))
                     .send()
@@ -882,7 +1022,12 @@ impl BuzzClient {
 
             // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
             // event ID, keeping retries safe against the relay's replay guard.
-            let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+            let auth = sign_nip98(
+                &self.keys,
+                "POST",
+                &self.signing_url(&url).await,
+                Some(&body),
+            )?;
             let send_result: Result<reqwest::Response, CliError> = self
                 .with_auth_tag(
                     self.http
@@ -897,6 +1042,17 @@ impl BuzzClient {
 
             match send_result {
                 Err(e) => {
+                    // Alias roads: a 401 URL-mismatch is resolved once and the
+                    // re-sign retried — safe here because a 401 means the relay
+                    // rejected the auth event BEFORE executing anything.
+                    if let CliError::Relay { status: 401, .. } = &e {
+                        if !is_last
+                            && cached_canonical_base(&self.relay_url).is_none()
+                            && self.canonical_flip_after_401().await
+                        {
+                            continue;
+                        }
+                    }
                     if let CliError::Network(ref net_err) = e {
                         // Only connect-failure is safe to retry: the relay never saw
                         // the request. Timeout and mid-request errors are ambiguous.
@@ -1034,7 +1190,12 @@ impl BuzzClient {
                 async move {
                     // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
                     // event ID, keeping retries safe against the relay's replay guard.
-                    let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                    let auth = sign_nip98(
+                        &self.keys,
+                        "POST",
+                        &self.signing_url(&url).await,
+                        Some(&body),
+                    )?;
                     let resp = self
                         .with_auth_tag(
                             self.http
@@ -1880,6 +2041,39 @@ mod retry_policy_tests {
         (format!("http://{addr}"), counter)
     }
 
+    /// Alias road, end to end: the first request signs the transport URL and
+    /// 401s with a URL mismatch; the client probes `/info`, discovers the
+    /// canonical origin, and the immediate retry succeeds — riding the
+    /// transport, signing the identity. Exactly three requests: failed call,
+    /// probe, retried call.
+    #[tokio::test]
+    async fn alias_road_401_flips_to_canonical_signing() {
+        let (url, attempts) = get_server(|n| match n {
+            1 => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"auth_error","message":"NIP-98 HTTP Auth verification failed: URL mismatch"}"#
+                    .to_string(),
+            ),
+            2 => (
+                StatusCode::OK,
+                r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string(),
+            ),
+            _ => (StatusCode::OK, r#"{"ok":true}"#.to_string()),
+        })
+        .await;
+        let client = test_client(&url);
+        let result = client.get_authed("/query").await;
+        assert!(
+            result.is_ok(),
+            "expected success after canonical flip, got {result:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "exactly one failed call + one probe + one retried call"
+        );
+    }
+
     /// `with_retry_body` retries transient HTTP 502 on a read path (`get_authed`)
     /// and succeeds on the next attempt.
     #[tokio::test]
@@ -2495,5 +2689,95 @@ mod tests {
             built.headers().get("x-auth-tag").is_none(),
             "x-auth-tag header must not be present when no auth tag is configured"
         );
+    }
+
+    // ---- canonical signing base (alias roads) ----
+
+    #[test]
+    fn ws_origin_to_http_base_validates_strictly() {
+        assert_eq!(
+            super::ws_origin_to_http_base("wss://beehivenature.buzz").as_deref(),
+            Some("https://beehivenature.buzz")
+        );
+        assert_eq!(
+            super::ws_origin_to_http_base("ws://127.0.0.1:3000").as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert_eq!(
+            super::ws_origin_to_http_base("wss://relay.example:8080/").as_deref(),
+            Some("https://relay.example:8080")
+        );
+        assert!(super::ws_origin_to_http_base("https://not-ws.example").is_none());
+        assert!(super::ws_origin_to_http_base("wss://user:pass@relay.example").is_none());
+        assert!(super::ws_origin_to_http_base("wss://relay.example?q=1").is_none());
+        assert!(super::ws_origin_to_http_base("wss://relay.example/path").is_none());
+        assert!(super::ws_origin_to_http_base("garbage").is_none());
+    }
+
+    /// Serve exactly `GET /info` with `body` (200) on a fresh ephemeral port.
+    async fn spawn_info_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind info server");
+        let addr = listener.local_addr().expect("info server address");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp = if req.starts_with("GET /info ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn canonical_probe_uses_advertised_origin() {
+        let base = spawn_info_server(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#).await;
+        assert_eq!(
+            super::canonical_http_signing_base_probe(&base).await,
+            "https://beehivenature.buzz"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_probe_falls_back_open() {
+        // Absent push.origin.
+        let base = spawn_info_server(r#"{"name":"Buzz Relay"}"#).await;
+        assert_eq!(super::canonical_http_signing_base_probe(&base).await, base);
+
+        // Explicit null.
+        let base = spawn_info_server(r#"{"push":{"origin":null}}"#).await;
+        assert_eq!(super::canonical_http_signing_base_probe(&base).await, base);
+
+        // Invalid advertisement.
+        let base = spawn_info_server(r#"{"push":{"origin":"not a url"}}"#).await;
+        assert_eq!(super::canonical_http_signing_base_probe(&base).await, base);
+
+        // Unreachable /info (port reserved then dropped).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reserved");
+        let addr = listener.local_addr().expect("reserved addr");
+        drop(listener);
+        let base = format!("http://{addr}");
+        assert_eq!(super::canonical_http_signing_base_probe(&base).await, base);
     }
 }

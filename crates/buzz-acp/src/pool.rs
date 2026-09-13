@@ -5944,7 +5944,8 @@ done"#
             )]),
             RestClient {
                 http: reqwest::Client::new(),
-                base_url,
+                base_url: base_url.clone(),
+                signing_base_url: base_url,
                 keys: ctx.agent_keys.clone(),
                 auth_tag_json: None,
             },
@@ -6106,7 +6107,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             )]),
             RestClient {
                 http: reqwest::Client::new(),
-                base_url,
+                base_url: base_url.clone(),
+                signing_base_url: base_url,
                 keys: ctx.agent_keys.clone(),
                 auth_tag_json: None,
             },
@@ -7580,6 +7582,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),
+                signing_base_url: "http://127.0.0.1:0".to_string(),
                 keys: agent_keys.clone(),
                 auth_tag_json: None,
             },
@@ -7588,6 +7591,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 RestClient {
                     http: reqwest::Client::new(),
                     base_url: "http://127.0.0.1:0".to_string(),
+                    signing_base_url: "http://127.0.0.1:0".to_string(),
                     keys: agent_keys.clone(),
                     auth_tag_json: None,
                 },
@@ -8002,7 +8006,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         });
         let rest = crate::relay::RestClient {
             http: reqwest::Client::new(),
-            base_url,
+            base_url: base_url.clone(),
+            signing_base_url: base_url,
             keys: nostr::Keys::generate(),
             auth_tag_json: None,
         };

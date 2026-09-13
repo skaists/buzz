@@ -22,6 +22,7 @@
 //! channel. `next_event()` reads from the event receiver.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Default capacity of the event channel from background task to harness.
@@ -250,7 +251,13 @@ pub(crate) fn merge_discovered_channels(
 #[derive(Debug, Clone)]
 pub struct RestClient {
     pub http: reqwest::Client,
+    /// Transport base the requests ride (may be an alias road).
     pub base_url: String,
+    /// Canonical base used for NIP-98 `u` tags. Relays behind transport aliases
+    /// verify auth events against the canonical origin advertised in
+    /// `/info` (`push.origin`), so signing the transport URL fails with 401
+    /// URL mismatch. Equals `base_url` when the road is its own identity.
+    pub signing_base_url: String,
     pub keys: Keys,
     /// Optional NIP-OA auth tag JSON for `x-auth-tag` header (relay membership delegation).
     pub auth_tag_json: Option<String>,
@@ -389,13 +396,16 @@ impl RestClient {
         body_bytes: &[u8],
     ) -> Result<reqwest::Response, RelayError> {
         let url = format!("{}{}", self.base_url, path);
+        // Sign the identity, ride the road: the `u` tag must name the canonical
+        // origin while the request itself goes to the transport base.
+        let signing_url = format!("{}{}", self.signing_base_url, path);
         let body_owned = body_bytes.to_vec();
         let auth_tag_header = self.auth_tag_json.clone();
         self.request_with_retry("POST", path, || {
             // NIP-98 is re-signed each attempt (fresh created_at).
             // sign_nip98 is infallible in practice (key is always valid).
             let auth = self
-                .nip98_header("POST", &url, Some(&body_owned))
+                .nip98_header("POST", &signing_url, Some(&body_owned))
                 .unwrap_or_default();
             let mut req = self
                 .http
@@ -571,8 +581,13 @@ pub struct HarnessRelay {
     cmd_tx: mpsc::Sender<RelayCommand>,
     /// HTTP client for HTTP bridge calls.
     http: reqwest::Client,
-    /// WebSocket URL of the relay.
+    /// WebSocket URL of the relay (transport road; may be an alias).
     relay_url: String,
+    /// Canonical WS identity this relay's signed events must name
+    /// (`push.origin` from `/info`; equals `relay_url` when the road is its
+    /// own identity). Used for NIP-98 `u` tags via [`RestClient`]; NIP-42
+    /// AUTH resolves the same value through the shared cache.
+    signing_ws_url: String,
     /// Keys used for NIP-42 signing and NIP-98 HTTP auth.
     keys: Keys,
     /// Optional NIP-OA auth tag for relay membership delegation.
@@ -638,6 +653,10 @@ impl HarnessRelay {
         let (ws, handshake_buffer) =
             retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?;
 
+        // The AUTH handshake above has already warmed the canonical cache for
+        // this road; reuse it for the REST signing base.
+        let signing_ws_url = canonical_ws_signing_url(relay_url).await;
+
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
             mpsc::channel::<Event>(event_channel_capacity());
@@ -673,6 +692,7 @@ impl HarnessRelay {
                 .build()
                 .map_err(|e| RelayError::Http(format!("failed to build HTTP client: {e}")))?,
             relay_url: relay_url.to_string(),
+            signing_ws_url,
             keys: keys.clone(),
             auth_tag,
             bg_handle: Some(bg_handle),
@@ -751,6 +771,7 @@ impl HarnessRelay {
         RestClient {
             http: self.http.clone(),
             base_url: relay_ws_to_http(&self.relay_url),
+            signing_base_url: relay_ws_to_http(&self.signing_ws_url),
             keys: self.keys.clone(),
             auth_tag_json: self
                 .auth_tag
@@ -3461,6 +3482,10 @@ fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
 ///
 /// If `auth_tag` is provided (NIP-OA owner attestation), it is included in the
 /// AUTH event so the relay can use it for membership delegation fallback.
+///
+/// The `relay` tag is signed with the CANONICAL identity resolved from the
+/// relay's `/info` (`push.origin`), not the transport URL — see
+/// [`canonical_ws_signing_url`].
 async fn send_auth_response(
     ws: &mut WsStream,
     challenge: &str,
@@ -3468,13 +3493,14 @@ async fn send_auth_response(
     keys: &Keys,
     auth_tag: Option<&nostr::Tag>,
 ) -> Result<(), RelayError> {
-    let relay_nostr_url = RelayUrl::parse(relay_url)
+    let signing_url = canonical_ws_signing_url(relay_url).await;
+    let relay_nostr_url = RelayUrl::parse(&signing_url)
         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
 
     let auth_event = if let Some(tag) = auth_tag {
         // Cannot use EventBuilder::auth() shortcut — it doesn't accept extra tags.
         let tags = vec![
-            nostr::Tag::parse(["relay", relay_url])
+            nostr::Tag::parse(["relay", signing_url.as_str()])
                 .map_err(|e| RelayError::Http(format!("tag parse error: {e}")))?,
             nostr::Tag::parse(["challenge", challenge])
                 .map_err(|e| RelayError::Http(format!("tag parse error: {e}")))?,
@@ -3491,6 +3517,134 @@ async fn send_auth_response(
     ws_send_timeout(ws, Message::Text(auth_msg.into()), WS_SEND_TIMEOUT_SECS).await?;
     debug!("sent AUTH response for challenge");
     Ok(())
+}
+
+/// Cache of transport WS URL → canonical signing URL, resolved once per road
+/// per process. Bounded by the number of distinct relays the harness pools.
+static CANONICAL_WS_IDENTITIES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Resolve the URL that NIP-42 AUTH and NIP-98 `u` tags must name.
+///
+/// Some roads are transport aliases (e.g. `wss://relay2.skaists.dev`) serving a
+/// canonical community origin (advertised in the NIP-11 `/info` document as
+/// `push.origin`, e.g. `wss://beehivenature.buzz`). The relay verifies signed
+/// events against the canonical origin, so signing the transport alias fails
+/// with "auth-required: verification failed" / "NIP-98 URL mismatch". Law:
+/// sign the identity, ride the road.
+///
+/// Semantics are FAIL-OPEN (supervisor-grade): an unreadable `/info`, a missing
+/// `push.origin`, or an invalid advertisement keeps the supplied URL verbatim —
+/// identical to the pre-canonical behavior, so roads without metadata (local
+/// dev relays, hosted tenants without `/info`) never regress. Only a valid
+/// advertisement overrides the transport URL. Results are cached per road.
+pub(crate) async fn canonical_ws_signing_url(ws_url: &str) -> String {
+    let cache_cell = CANONICAL_WS_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache_cell.lock() {
+        if let Some(hit) = map.get(ws_url) {
+            return hit.clone();
+        }
+    }
+
+    let resolved = resolve_canonical_ws_signing_url(ws_url).await;
+    debug!("canonical signing URL for {ws_url}: {resolved}");
+
+    if let Ok(mut map) = cache_cell.lock() {
+        map.insert(ws_url.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+async fn resolve_canonical_ws_signing_url(ws_url: &str) -> String {
+    let Some(http_base) = ws_to_http_base(ws_url) else {
+        return ws_url.to_string();
+    };
+    let advertised = match fetch_advertised_origin(&http_base).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            // Unreadable metadata must not take down a road that works today.
+            debug!("relay {ws_url} /info unreadable ({e}); signing the transport URL");
+            return ws_url.to_string();
+        }
+    };
+    let Some(origin) = advertised else {
+        // No advertisement: the road is its own identity.
+        return ws_url.to_string();
+    };
+    match validate_advertised_origin(&origin) {
+        Some(canonical) => canonical,
+        None => {
+            warn!(
+                "relay {ws_url} advertised an invalid push.origin {origin:?}; signing the transport URL"
+            );
+            ws_url.to_string()
+        }
+    }
+}
+
+/// Map a ws/wss URL to its HTTP origin (scheme+host+port only, root path).
+/// Non-WS schemes return `None` (caller keeps the URL verbatim).
+fn ws_to_http_base(ws_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(ws_url).ok()?;
+    match url.scheme() {
+        "wss" => url.set_scheme("https").ok()?,
+        "ws" => url.set_scheme("http").ok()?,
+        _ => return None,
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Strict structural validation of an advertised ws/wss origin (mirrors the
+/// desktop canonical-signing law): scheme must be ws/wss; no userinfo, query,
+/// fragment, or non-root path; a host must be present. Ports and IPv6
+/// literals are valid. Returns the normalized origin string.
+fn validate_advertised_origin(advertised: &str) -> Option<String> {
+    let url = url::Url::parse(advertised).ok()?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    match url.path() {
+        "" | "/" => {}
+        _ => return None,
+    }
+    url.host_str()?;
+    Some(advertised.trim_end_matches('/').to_string())
+}
+
+/// Fetch `{http_base}/info` and extract `push.origin`.
+///
+/// `Ok(None)` — the document is readable but carries no `push.origin` key.
+/// `Ok(Some(origin))` — a string advertisement (still needs validation).
+/// `Err` — network failure, non-success status, unparseable body, or a
+/// `push.origin` that is present but not a string (e.g. explicit `null`).
+async fn fetch_advertised_origin(http_base: &str) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let resp = client
+        .get(format!("{http_base}/info"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status()));
+    }
+    let doc: Value = resp.json().await.map_err(|e| format!("body: {e}"))?;
+    match doc.pointer("/push/origin") {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("push.origin is not a string: {other}")),
+    }
 }
 
 /// Convert a WebSocket URL to its HTTP equivalent.
@@ -6300,5 +6454,226 @@ mod tests {
             !state.channel_dropped_since.contains_key(&channel_id),
             "channel_dropped_since must be cleared on successful drain"
         );
+    }
+
+    // ---- canonical signing URL resolution (alias roads) ----
+
+    #[test]
+    fn validate_advertised_origin_accepts_only_clean_ws_origins() {
+        assert_eq!(
+            validate_advertised_origin("wss://beehivenature.buzz").as_deref(),
+            Some("wss://beehivenature.buzz")
+        );
+        assert_eq!(
+            validate_advertised_origin("ws://127.0.0.1:3000/").as_deref(),
+            Some("ws://127.0.0.1:3000")
+        );
+        // Ports and IPv6 literals are valid.
+        assert!(validate_advertised_origin("wss://relay.example:8080").is_some());
+        assert!(validate_advertised_origin("ws://[::1]:3000").is_some());
+        // Wrong scheme, userinfo, query, fragment, non-root path, garbage: rejected.
+        assert!(validate_advertised_origin("https://beehivenature.buzz").is_none());
+        assert!(validate_advertised_origin("wss://user:pass@relay.example").is_none());
+        assert!(validate_advertised_origin("wss://relay.example?x=1").is_none());
+        assert!(validate_advertised_origin("wss://relay.example#frag").is_none());
+        assert!(validate_advertised_origin("wss://relay.example/path").is_none());
+        assert!(validate_advertised_origin("not a url").is_none());
+        assert!(validate_advertised_origin("").is_none());
+    }
+
+    #[test]
+    fn ws_to_http_base_maps_scheme_and_strips_to_origin() {
+        assert_eq!(
+            ws_to_http_base("wss://relay2.skaists.dev").as_deref(),
+            Some("https://relay2.skaists.dev")
+        );
+        assert_eq!(
+            ws_to_http_base("ws://127.0.0.1:3000").as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        // Path/query/fragment never leak into the /info fetch target.
+        assert_eq!(
+            ws_to_http_base("wss://relay.example/prefix?q=1").as_deref(),
+            Some("https://relay.example")
+        );
+        assert!(ws_to_http_base("https://not-ws.example").is_none());
+        assert!(ws_to_http_base("garbage").is_none());
+    }
+
+    /// Serve exactly `GET /info` with `body` (200) and 404 everything else.
+    /// Returns the bound address. Unique ports keep the global canonical
+    /// cache collision-free across tests.
+    async fn spawn_info_server(body: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind info server");
+        let addr = listener.local_addr().expect("info server address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let is_info = req.starts_with("GET /info ");
+                    let resp = if is_info {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn canonical_url_uses_advertised_origin() {
+        let addr = spawn_info_server(
+            r#"{"name":"Buzz Relay","push":{"origin":"wss://beehivenature.buzz"}}"#,
+        )
+        .await;
+        let transport = format!("ws://{addr}");
+        assert_eq!(
+            canonical_ws_signing_url(&transport).await,
+            "wss://beehivenature.buzz"
+        );
+        // Cached: a second resolution makes no further HTTP requests.
+        assert_eq!(
+            canonical_ws_signing_url(&transport).await,
+            "wss://beehivenature.buzz"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_url_keeps_transport_when_origin_absent() {
+        let addr = spawn_info_server(r#"{"name":"Buzz Relay"}"#).await;
+        let transport = format!("ws://{addr}");
+        assert_eq!(canonical_ws_signing_url(&transport).await, transport);
+    }
+
+    #[tokio::test]
+    async fn canonical_url_falls_back_when_origin_invalid_or_null() {
+        let addr = spawn_info_server(r#"{"push":{"origin":"not a url"}}"#).await;
+        let transport = format!("ws://{addr}");
+        assert_eq!(canonical_ws_signing_url(&transport).await, transport);
+
+        let addr = spawn_info_server(r#"{"push":{"origin":null}}"#).await;
+        let transport = format!("ws://{addr}");
+        assert_eq!(canonical_ws_signing_url(&transport).await, transport);
+    }
+
+    #[tokio::test]
+    async fn canonical_url_falls_back_when_info_unreachable() {
+        // Reserve a port, then drop the listener so /info is connection-refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reserved port");
+        let addr = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let transport = format!("ws://{addr}");
+        assert_eq!(canonical_ws_signing_url(&transport).await, transport);
+    }
+
+    #[tokio::test]
+    async fn send_auth_response_signs_canonical_origin_on_alias_road() {
+        // Production order: the WebSocket connects FIRST and receives the
+        // challenge; send_auth_response then probes /info over plain HTTP
+        // before signing — so the fixture must serve the probe while the
+        // AUTH frame is still pending (per-connection spawned handler).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let info_body: &'static str = r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#;
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+            let mut auth_tx = Some(auth_tx);
+            let mut served_info = false;
+
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut peek = [0u8; 64];
+                let n = stream.peek(&mut peek).await.expect("peek");
+                let is_info = String::from_utf8_lossy(&peek[..n]).starts_with("GET /info ");
+
+                if is_info {
+                    let mut stream = stream;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        info_body.len(),
+                        info_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    served_info = true;
+                } else {
+                    let tx = auth_tx.take().expect("only one websocket connection");
+                    tokio::spawn(async move {
+                        let mut ws = tokio_tungstenite::accept_async(stream)
+                            .await
+                            .expect("ws handshake");
+                        ws.send(Message::Text(
+                            r#"["AUTH","challenge-abc"]"#.to_string().into(),
+                        ))
+                        .await
+                        .expect("send challenge");
+                        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                            .await
+                            .expect("timeout waiting for AUTH frame")
+                            .expect("stream closed")
+                            .expect("ws error");
+                        let value: serde_json::Value =
+                            serde_json::from_str(frame.to_text().expect("text frame"))
+                                .expect("parse frame");
+                        let _ = tx.send(value);
+                    });
+                }
+            }
+
+            assert!(served_info, "the /info probe must have been served");
+            auth_rx.await.expect("auth frame delivered")
+        });
+
+        let transport = format!("ws://{address}");
+        let (mut client, _) = connect_async(transport.clone())
+            .await
+            .expect("connect as harness");
+        let keys = Keys::generate();
+        send_auth_response(&mut client, "challenge-abc", &transport, &keys, None)
+            .await
+            .expect("auth response");
+
+        let auth_frame = server.await.expect("join server");
+        assert_eq!(auth_frame[0], "AUTH", "frame must be an AUTH push");
+        let event = &auth_frame[1];
+        let relay_tag = event["tags"]
+            .as_array()
+            .expect("tags array")
+            .iter()
+            .find(|t| t[0] == "relay")
+            .expect("relay tag present");
+        assert_eq!(
+            relay_tag[1], "wss://beehivenature.buzz",
+            "AUTH must sign the advertised canonical origin, not the transport alias"
+        );
+        let challenge_tag = event["tags"]
+            .as_array()
+            .expect("tags array")
+            .iter()
+            .find(|t| t[0] == "challenge")
+            .expect("challenge tag present");
+        assert_eq!(challenge_tag[1], "challenge-abc");
     }
 }
