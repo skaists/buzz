@@ -6676,4 +6676,27 @@ mod tests {
             .expect("challenge tag present");
         assert_eq!(challenge_tag[1], "challenge-abc");
     }
+
+    /// LIVE proof against the real alias road: `wss://relay2.skaists.dev`
+    /// (canonical `wss://beehivenature.buzz`). Requires `BUZZ_LIVE_NSEC`
+    /// (a member key; never printed) and optionally `BUZZ_LIVE_AUTH_TAG`
+    /// (the seat's NIP-OA tag JSON array, for membership delegation).
+    /// Verifies the full production path — connect, AUTH challenge, canonical
+    /// resolution over `/info`, signed AUTH accepted (`OK true`) — which fails
+    /// with "verification failed" on the pre-fix binary.
+    #[tokio::test]
+    #[ignore = "live network: set BUZZ_LIVE_NSEC to a member nsec"]
+    async fn live_alias_road_auth_succeeds_with_canonical_signing() {
+        // wss:// needs a rustls provider; production installs one in main.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let nsec = std::env::var("BUZZ_LIVE_NSEC").expect("BUZZ_LIVE_NSEC required");
+        let keys = nostr::Keys::parse(&nsec).expect("valid key");
+        let auth_tag = std::env::var("BUZZ_LIVE_AUTH_TAG")
+            .ok()
+            .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+        let (ws, _buffer) = do_connect("wss://relay2.skaists.dev", &keys, auth_tag.as_ref())
+            .await
+            .expect("AUTH must succeed on the alias road with canonical signing");
+        drop(ws);
+    }
 }
