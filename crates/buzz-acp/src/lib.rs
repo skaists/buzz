@@ -8660,6 +8660,51 @@ mod observer_payload_trim_tests {
     }
 
     #[test]
+    fn test_in_window_frame_fits_and_encrypts_within_nip44_bound() {
+        // RED for the observed 1/411 live escape: nostr 0.44's nip44 v2 rejects
+        // plaintext over `65_536 - 128` = 65_408 bytes (v2.rs
+        // MAX_SUPPORTED_PLAINTEXT_SIZE), while OBSERVER_MAX_PLAINTEXT_LEN admitted
+        // 65_535 — a 127-byte window where fit's under-budget short-circuit left
+        // the frame byte-identical, the pre-check passed, and nip44::encrypt
+        // failed with `message too long`. Build a frame inside that window and
+        // require the full fitted path to encrypt cleanly.
+        let nip44_v2_max_plaintext = 65_536 - 128usize;
+        let old_admitted_bound = 65_535usize;
+        let mut n = 65_600usize;
+        let mut event = loop {
+            n -= 1;
+            let candidate = event_with_payload(
+                "acp_read",
+                serde_json::json!({ "blob": "A".repeat(n) }),
+            );
+            let len = serialized(&candidate).len();
+            assert!(n > 60_000, "sizing search ran away");
+            if len > nip44_v2_max_plaintext && len <= old_admitted_bound {
+                break candidate;
+            }
+        };
+        let before = serialized(&event).len();
+        assert!(
+            before > nip44_v2_max_plaintext && before <= old_admitted_bound,
+            "precondition: frame inside the kill window (len {before})"
+        );
+
+        fit_observer_event_to_budget(&mut event);
+        let fitted = serialized(&event).len();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let encrypted = buzz_core::observer::encrypt_observer_payload(
+            &agent,
+            &owner.public_key(),
+            &event,
+        );
+        assert!(
+            encrypted.is_ok(),
+            "fitted frame (before {before}, after {fitted}) must encrypt within the nip44 v2 bound"
+        );
+    }
+
+    #[test]
     fn test_utf8_multibyte_leaf_elides_on_char_boundary() {
         // A leaf of 3-byte chars (… = U+2026) — eliding must land on char
         // boundaries and never panic or produce invalid UTF-8.

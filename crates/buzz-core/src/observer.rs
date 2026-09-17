@@ -21,8 +21,12 @@ pub const OBSERVER_FRAME_CONTROL: &str = "control";
 pub const NIP44_MIN_CONTENT_LEN: usize = 132;
 /// Maximum NIP-44 v2 ciphertext length.
 pub const NIP44_MAX_CONTENT_LEN: usize = 87_472;
-/// Maximum observer plaintext JSON size accepted by helpers.
-pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_535;
+/// Maximum observer plaintext JSON size accepted by helpers. Must match the
+/// encryptor's true bound: nostr 0.44 nip44 v2 rejects plaintext over
+/// MAX_SUPPORTED_PLAINTEXT_SIZE = 65_536 - 128 (v2.rs) with MessageTooLong —
+/// the old 65_535 left a 127-byte window where fitted frames passed every
+/// pre-check and still died inside nip44::encrypt (observed 1/411 live).
+pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_536 - 128;
 
 /// Errors returned by observer payload encryption/decryption helpers.
 #[derive(Debug, Error)]
