@@ -195,6 +195,7 @@ pub async fn cmd_approve_step(
     approval_token: &str,
     approved: bool,
     note: Option<&str>,
+    binding: buzz_sdk::ApprovalBinding<'_>,
 ) -> Result<(), CliError> {
     validate_uuid(approval_token)?;
 
@@ -202,8 +203,8 @@ pub async fn cmd_approve_step(
 
     // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
     let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
-    let builder =
-        buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
+    let builder = buzz_sdk::build_workflow_approval_bound(&token_hash, approved, content, &binding)
+        .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
@@ -235,9 +236,17 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             token,
             approved,
             note,
+            candidate,
+            run,
+            step,
         } => {
             // approved is already a bool — no parse_bool_flag needed
-            cmd_approve_step(client, &token, approved, note.as_deref()).await
+            let binding = buzz_sdk::ApprovalBinding {
+                run_id: run.as_deref(),
+                step_id: step.as_deref(),
+                candidate: candidate.as_deref(),
+            };
+            cmd_approve_step(client, &token, approved, note.as_deref(), binding).await
         }
     }
 }

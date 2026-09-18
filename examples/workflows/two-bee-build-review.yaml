@@ -1,0 +1,46 @@
+# Two-bee build/review run (WF-08 pilot) — SHIPPED DISABLED.
+#
+# bounded task -> builder candidate -> designated-reviewer gate -> evidence-linked result.
+#
+# Manual-only by construction: the trigger is `webhook`, so no channel event
+# (including this workflow's own kind:9 output) can match it; runs start only
+# when the workflow OWNER submits a kind:46020 trigger:
+#
+#   buzz workflows trigger --workflow <UUID> --inputs \
+#     '{"task":"WF-08 slice 1","candidate_commit":"<sha>","branch":"bfable/wf08-approval-gate","repro":"cargo test -p buzz-workflow -p buzz-relay --lib"}'
+#
+# The relay dedupes the trigger event by id, so a re-sent trigger never
+# creates a second run (T5). The `review` step mints one durable approval
+# bound to (run, step, reviewer pubkey, candidate_commit) and publishes a
+# kind:46010 to the channel. Only the designated reviewer's kind:46030 grant
+# naming the identical candidate resumes the run (T1–T4); a kind:9 "looks
+# good" from anyone advances nothing (T7). Enable only after the trigger and
+# action behaviour has been proven on an isolated relay.
+name: "Two-bee build/review (pilot)"
+description: "Manual, project-linked build/review run with a designated-reviewer approval gate."
+enabled: false
+trigger:
+  on: webhook
+steps:
+  - id: announce
+    name: "Announce candidate"
+    action: send_message
+    text: >-
+      REVIEW REQUESTED · task={{trigger.task}} · candidate={{trigger.candidate_commit}}
+      · branch={{trigger.branch}} · repro=`{{trigger.repro}}`
+      — waiting on the designated reviewer's signed decision (kind:46010 carries the token).
+  - id: review
+    name: "Designated review gate"
+    action: request_approval
+    # bFUzZ — the only signer whose grant/deny the relay honours for this gate.
+    from: "755029663fee78e734a217867246e22933a4683dda19dd8435488688a29f9541"
+    message: "Review candidate {{trigger.candidate_commit}} for task {{trigger.task}} (repro: {{trigger.repro}})"
+    candidate: "{{trigger.candidate_commit}}"
+    timeout: "48h"
+  - id: result
+    name: "Evidence-linked result"
+    action: send_message
+    text: >-
+      REVIEW RESULT · task={{trigger.task}} · candidate={{steps.review.output.candidate_ref}}
+      · decision={{steps.review.output.decision}} · reviewer={{steps.review.output.approver | npub}}
+      · evidence-event={{steps.review.output.decision_event_id}} · note={{steps.review.output.note}}

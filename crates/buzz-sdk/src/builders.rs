@@ -1655,6 +1655,35 @@ pub fn build_workflow_approval(
     approved: bool,
     note: &str,
 ) -> Result<EventBuilder, SdkError> {
+    build_workflow_approval_bound(token_hash, approved, note, &ApprovalBinding::default())
+}
+
+/// The run/step/candidate binding a workflow approval decision asserts
+/// (WF-08). Every field is optional on the wire; the relay rejects a decision
+/// whose asserted binding disagrees with the pending record, and requires
+/// `candidate` whenever the record was minted for one.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApprovalBinding<'a> {
+    /// Run id the signer is deciding (`run` tag).
+    pub run_id: Option<&'a str>,
+    /// Step id the signer is deciding (`step` tag).
+    pub step_id: Option<&'a str>,
+    /// Exact candidate the signer reviewed, e.g. a commit sha (`candidate` tag).
+    pub candidate: Option<&'a str>,
+}
+
+/// Build a workflow approval event bound to a specific run/step/candidate.
+///
+/// Same as [`build_workflow_approval`], plus `run`, `step` and `candidate`
+/// tags for whichever binding fields are supplied. Empty strings are
+/// rejected rather than silently dropped: a caller that passes a binding
+/// means to assert it.
+pub fn build_workflow_approval_bound(
+    token_hash: &str,
+    approved: bool,
+    note: &str,
+    binding: &ApprovalBinding<'_>,
+) -> Result<EventBuilder, SdkError> {
     if token_hash.len() != 64 || !token_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(SdkError::InvalidInput(
             "token_hash must be a 64-character hex SHA-256 digest".into(),
@@ -1665,7 +1694,22 @@ pub fn build_workflow_approval(
     } else {
         KIND_APPROVAL_DENY
     };
-    let tags = vec![tag(&["d", token_hash])?];
+    let mut tags = vec![tag(&["d", token_hash])?];
+    for (name, value) in [
+        ("run", binding.run_id),
+        ("step", binding.step_id),
+        ("candidate", binding.candidate),
+    ] {
+        if let Some(v) = value {
+            let v = v.trim();
+            if v.is_empty() {
+                return Err(SdkError::InvalidInput(format!(
+                    "approval binding `{name}` must not be empty"
+                )));
+            }
+            tags.push(tag(&[name, v])?);
+        }
+    }
     Ok(EventBuilder::new(Kind::Custom(kind as u16), note).tags(tags))
 }
 
@@ -4009,6 +4053,48 @@ mod tests {
         let ev = sign(build_workflow_trigger(wid).unwrap());
         assert_eq!(ev.kind.as_u16(), 46020);
         assert!(has_tag(&ev, "d", &wid.to_string()));
+    }
+
+    #[test]
+    fn workflow_approval_bound_carries_run_step_candidate_tags() {
+        let hash = "ab".repeat(32);
+        let binding = ApprovalBinding {
+            run_id: Some("11111111-2222-3333-4444-555555555555"),
+            step_id: Some("review"),
+            candidate: Some(" 0123abcd "),
+        };
+        let ev = sign(build_workflow_approval_bound(&hash, true, "ok", &binding).unwrap());
+        let tag_value = |name: &str| {
+            ev.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                (s[0] == name).then(|| s[1].clone())
+            })
+        };
+        assert_eq!(ev.kind.as_u16() as u32, KIND_APPROVAL_GRANT);
+        assert_eq!(tag_value("d").as_deref(), Some(hash.as_str()));
+        assert_eq!(
+            tag_value("run").as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(tag_value("step").as_deref(), Some("review"));
+        assert_eq!(
+            tag_value("candidate").as_deref(),
+            Some("0123abcd"),
+            "trimmed"
+        );
+    }
+
+    #[test]
+    fn workflow_approval_bound_rejects_empty_binding_value() {
+        let hash = "ab".repeat(32);
+        let binding = ApprovalBinding {
+            candidate: Some("   "),
+            ..Default::default()
+        };
+        assert!(build_workflow_approval_bound(&hash, true, "", &binding).is_err());
+        // Unbound form is unchanged: exactly one `d` tag.
+        let ev = sign(build_workflow_approval(&hash, true, "").unwrap());
+        assert_eq!(ev.tags.len(), 1);
     }
 
     #[test]

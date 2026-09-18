@@ -625,8 +625,16 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
+        // 0032 (WF-08 candidate binding): additive nullable column, its own
+        // version, never folded into 0001.
+        assert_eq!(migrations[31].version, 32);
+        assert!(migrations[31]
+            .sql
+            .as_str()
+            .contains("ALTER TABLE workflow_approvals ADD COLUMN candidate_ref TEXT"));
+        assert!(!migrations[0].sql.as_str().contains("candidate_ref"));
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
             .sql
