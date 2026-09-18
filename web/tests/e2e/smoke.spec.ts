@@ -30,50 +30,7 @@ test("invite requires age and legal consent before opening Buzz", async ({
       }),
     });
   });
-  await page.route("https://api.github.com/**", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      headers: { "Access-Control-Allow-Origin": "*" },
-      body: JSON.stringify([
-        { draft: false, prerelease: false, assets: [] },
-        {
-          draft: false,
-          prerelease: false,
-          assets: [
-            {
-              name: "Buzz_0.4.9_aarch64.dmg",
-              browser_download_url:
-                "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_aarch64.dmg",
-            },
-            {
-              name: "Buzz_0.4.9_x64.dmg",
-              browser_download_url:
-                "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64.dmg",
-            },
-            {
-              name: "Buzz_0.4.9_amd64.AppImage",
-              browser_download_url:
-                "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_amd64.AppImage",
-            },
-            {
-              name: "Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
-              browser_download_url:
-                "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
-            },
-          ],
-        },
-      ]),
-    });
-  });
   await page.goto("/invite/demo-code");
-
-  await expect(
-    page.getByRole("link", { name: "Download it now" }),
-  ).toHaveAttribute(
-    "href",
-    "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
-  );
 
   const ageConfirmation = page.getByLabel("I am 18 years of age or older.");
   const agreementConfirmation = page.getByLabel(
@@ -201,21 +158,10 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
   expect(claimObserved).toBe(true);
 });
 
-test("invite asks Safari users to choose their Mac download", async ({
-  browser,
+test("invite download sends new visitors to the Buzz releases page", async ({
+  page,
 }) => {
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/26.5 Safari/605.1.15",
-  });
-  await context.addInitScript(() => {
-    Object.defineProperties(navigator, {
-      platform: { configurable: true, value: "MacIntel" },
-      maxTouchPoints: { configurable: true, value: 0 },
-      userAgentData: { configurable: true, value: undefined },
-    });
-  });
-  const page = await context.newPage();
+  let githubApiCalled = false;
   await page.route("**/api/join-policy", async (route) => {
     await route.fulfill({
       status: 200,
@@ -224,126 +170,42 @@ test("invite asks Safari users to choose their Mac download", async ({
     });
   });
   await page.route("https://api.github.com/**", async (route) => {
-    await route.fulfill({ status: 500 });
+    githubApiCalled = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify([
+        {
+          draft: false,
+          prerelease: false,
+          assets: [
+            {
+              name: "Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
+              browser_download_url:
+                "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64-setup_alpha-unsigned.exe",
+            },
+          ],
+        },
+      ]),
+    });
   });
 
   await page.goto("/invite/demo-code");
-  const download = page.getByRole("link", { name: "Download it now" });
-  await expect(download).toHaveAttribute("aria-haspopup", "dialog");
-  await download.click();
 
-  const chooser = page.getByRole("dialog", {
-    name: "Which Mac do you have?",
-  });
-  await expect(chooser).toBeVisible();
-  await expect(chooser.getByRole("link", { name: /Newer Mac/ })).toContainText(
-    "2021 or later, or a late-2020 Mac with an Apple M1 chip",
+  // The one download link on the page leads to the releases page, never
+  // straight to an installer asset.
+  await expect(page.getByRole("link", { name: /^Download/ })).toHaveAttribute(
+    "href",
+    "https://github.com/block/buzz/releases",
   );
-  await expect(chooser.getByRole("link", { name: /Older Mac/ })).toContainText(
-    "2019 or earlier, or a 2020 Mac with an Intel processor",
-  );
-  await expect(chooser.getByText("About This Mac")).toBeVisible();
-
-  const openedPagePromise = context.waitForEvent("page");
-  await chooser.getByRole("link", { name: /Newer Mac/ }).click();
-  const openedPage = await openedPagePromise;
-  await expect(chooser).toBeHidden();
-  await expect(openedPage).toHaveURL("https://github.com/block/buzz/releases");
-  await expect(page).toHaveURL(/\/invite\/demo-code$/);
-  await openedPage.close();
-
-  await download.click();
-  await expect(chooser).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(chooser).toBeHidden();
-  await expect(download).toBeFocused();
-  await context.close();
-});
-
-test("invite download falls back for mobile and non-desktop devices", async ({
-  browser,
-}) => {
-  const unsupportedDevices = [
-    {
-      name: "iPhone Safari",
-      platform: "iPhone",
-      userAgent:
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15",
-      maxTouchPoints: 5,
-    },
-    {
-      name: "iPadOS desktop mode",
-      platform: "MacIntel",
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15",
-      maxTouchPoints: 5,
-    },
-    {
-      name: "Android phone",
-      platform: "Linux armv8l",
-      userAgent:
-        "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 Mobile",
-      maxTouchPoints: 5,
-    },
-    {
-      name: "ChromeOS",
-      platform: "Linux x86_64",
-      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0) AppleWebKit/537.36",
-      maxTouchPoints: 0,
-    },
-  ];
-
-  for (const device of unsupportedDevices) {
-    const context = await browser.newContext({ userAgent: device.userAgent });
-    await context.addInitScript(({ platform, maxTouchPoints }) => {
-      Object.defineProperties(navigator, {
-        platform: { configurable: true, value: platform },
-        maxTouchPoints: { configurable: true, value: maxTouchPoints },
-        userAgentData: {
-          configurable: true,
-          value: { platform, mobile: maxTouchPoints > 0 },
-        },
-      });
-    }, device);
-    const page = await context.newPage();
-    await page.route("**/api/join-policy", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ policy: null }),
-      });
-    });
-    await page.route("https://api.github.com/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        headers: { "Access-Control-Allow-Origin": "*" },
-        body: JSON.stringify([
-          {
-            draft: false,
-            prerelease: false,
-            assets: [
-              {
-                name: "Buzz_0.4.9_x64.dmg",
-                browser_download_url:
-                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64.dmg",
-              },
-              {
-                name: "Buzz_0.4.9_amd64.AppImage",
-                browser_download_url:
-                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_amd64.AppImage",
-              },
-            ],
-          },
-        ]),
-      });
-    });
-
-    await page.goto("/invite/demo-code");
-    await expect(
-      page.getByRole("link", { name: "Download it now" }),
-      device.name,
-    ).toHaveAttribute("href", "https://github.com/block/buzz/releases");
-    await context.close();
-  }
+  const download = page.getByTestId("invite-download");
+  await expect(download).toContainText("Buzz is a chat app");
+  await expect(
+    download.getByRole("link", { name: "Download Buzz" }),
+  ).toHaveAttribute("href", "https://github.com/block/buzz/releases");
+  await expect(download).toContainText("not yet code-signed");
+  await expect(download.getByText("skaists buzz")).toHaveCount(0);
+  await expect(page.getByText("Download it now")).toHaveCount(0);
+  expect(githubApiCalled).toBe(false);
 });
