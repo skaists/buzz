@@ -415,19 +415,46 @@ impl WorkflowEngine {
         if !notify.contains(&owner_hex) {
             notify.push(owner_hex.clone());
         }
-        let sink = self
-            .action_sink()
-            .map_err(|e| GateError::new("approval_notify_failed", e.to_string()))?;
-        let event_id = sink
-            .emit_workflow_event(
-                community_id,
-                &channel_id.to_string(),
-                KIND_WORKFLOW_APPROVAL_REQUESTED,
-                &content.to_string(),
-                &notify,
-            )
-            .await
-            .map_err(|e| GateError::new("approval_notify_failed", e.to_string()))?;
+        let notified: Result<String, String> = match self.action_sink() {
+            Ok(sink) => sink
+                .emit_workflow_event(
+                    community_id,
+                    &channel_id.to_string(),
+                    KIND_WORKFLOW_APPROVAL_REQUESTED,
+                    &content.to_string(),
+                    &notify,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let event_id = match notified {
+            Ok(id) => id,
+            Err(e) => {
+                // F-B: the run is about to be marked failed, so the pending
+                // record must not outlive it — otherwise a later grant would
+                // publish kind:46011 for a dead run. Expire it in place; the
+                // hash-only trace entry stays as the audit of what was minted.
+                let token_hash = buzz_db::workflow::hash_approval_token(token);
+                if let Err(db_err) = self
+                    .db
+                    .update_approval_by_stored_hash(
+                        community_id,
+                        &token_hash,
+                        buzz_db::workflow::ApprovalStatus::Expired,
+                        None,
+                        Some("expired: run failed before the approver was notified (approval_notify_failed)"),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        run_id = %run_id,
+                        "approval_notify_failed and the pending record could not be expired: {db_err}"
+                    );
+                }
+                return Err(GateError::new("approval_notify_failed", e));
+            }
+        };
         tracing::info!(
             run_id = %run_id,
             step = %request.step_id,

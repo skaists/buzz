@@ -1201,6 +1201,13 @@ fn record_approval_evidence(
             .unwrap_or_else(|| serde_json::json!({}));
         if let (Some(dst), Some(src)) = (output.as_object_mut(), evidence.as_object()) {
             for (k, v) in src {
+                // First terminal decision wins: a re-asserted (duplicate)
+                // decision may complete an interrupted apply, but it never
+                // rewrites which event decided or when.
+                let immutable_once_set = matches!(k.as_str(), "decision_event_id" | "decided_at");
+                if immutable_once_set && dst.get(k).is_some_and(|old| !old.is_null()) {
+                    continue;
+                }
                 dst.insert(k.clone(), v.clone());
             }
         }
@@ -1218,6 +1225,174 @@ fn record_approval_evidence(
         "completed_at": completed_at,
     }));
     false
+}
+
+/// Duplicate-decision path (F-A): persist the retry event (dedupe-safe), then
+/// re-run the post-commit apply for the already-recorded decision. Returns
+/// the `duplicate:` acceptance the record semantics demand; the apply itself
+/// is a no-op unless the run is still `waiting_approval`.
+async fn reassert_decision(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    event: &Event,
+    approval: buzz_db::workflow::ApprovalRecord,
+    dup: IngestResult,
+) -> Result<IngestResult, IngestError> {
+    if let PersistResult::Inserted(tx) = persist_command_event(state, tenant, event, None).await? {
+        tx.commit()
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
+    }
+    let evidence = reassert_evidence_from_record(&approval, &event.id.to_hex(), Utc::now());
+    let community_id = tenant.community();
+    let state_for_apply = Arc::clone(state);
+    tokio::spawn(async move {
+        apply_terminal_decision(state_for_apply, community_id, approval, evidence).await;
+    });
+    Ok(dup)
+}
+
+/// Evidence for re-asserting an already-recorded terminal decision (F-A).
+///
+/// Built from the durable record, not from the retry event's claims: the
+/// approver is the stored signer and the note is the stored note. The retry
+/// event id is carried as `decision_event_id` only if the trace has none yet
+/// (see `record_approval_evidence`), and `reasserted` marks the replay.
+fn reassert_evidence_from_record(
+    approval: &buzz_db::workflow::ApprovalRecord,
+    retry_event_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> serde_json::Value {
+    let approver_hex = approval
+        .approver_pubkey
+        .as_ref()
+        .map(hex::encode)
+        .unwrap_or_default();
+    let mut ev = approval_decision_evidence(
+        approval,
+        approval.status.clone(),
+        &approver_hex,
+        approval.note.as_deref().unwrap_or(""),
+        retry_event_id,
+        now,
+    );
+    ev["reasserted"] = serde_json::Value::Bool(true);
+    ev
+}
+
+/// Apply a terminal decision to its run: publish kind:46011/46012, then
+/// resume (granted) or cancel (denied). Runs post-commit in a spawned task.
+///
+/// Idempotent by construction (F-A): the run is read first and nothing
+/// happens unless it is still `waiting_approval`. So a crash between the
+/// decision commit and this apply is recoverable — the designated reviewer
+/// re-sends the identical decision, the handler's duplicate branch calls this
+/// again, and the interrupted apply completes exactly once. If the apply
+/// already ran, the re-assert is a true no-op (no second event, no second
+/// resume).
+async fn apply_terminal_decision(
+    state: Arc<AppState>,
+    community_id: CommunityId,
+    approval: buzz_db::workflow::ApprovalRecord,
+    evidence: serde_json::Value,
+) {
+    let run_id = approval.run_id;
+    let run = match state.db.get_workflow_run(community_id, run_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("apply_decision: failed to fetch run {run_id}: {e}");
+            return;
+        }
+    };
+    if run.status != RunStatus::WaitingApproval {
+        tracing::info!(
+            run_id = %run_id,
+            status = %run.status,
+            "apply_decision: run no longer waiting — decision already applied, nothing to do"
+        );
+        return;
+    }
+
+    let kind = match approval.status {
+        ApprovalStatus::Granted => KIND_WORKFLOW_APPROVAL_GRANTED,
+        ApprovalStatus::Denied => KIND_WORKFLOW_APPROVAL_DENIED,
+        ref other => {
+            tracing::error!(run_id = %run_id, status = %other, "apply_decision: not terminal");
+            return;
+        }
+    };
+    publish_approval_decision(
+        &state,
+        community_id,
+        approval.workflow_id,
+        kind,
+        &evidence,
+        &approval.approver_spec,
+    )
+    .await;
+
+    match approval.status {
+        ApprovalStatus::Granted => {
+            let engine = Arc::clone(&state.workflow_engine);
+            let db = state.db.clone();
+            resume_workflow_after_approval(engine, db, community_id, approval, evidence).await;
+        }
+        _ => cancel_run_after_denial(state.db.clone(), community_id, approval, evidence).await,
+    }
+}
+
+/// Denied gate: the denial is evidence too — it completes the gate entry in
+/// the trace (status `denied`) so a restarted or re-read run shows who
+/// rejected which candidate and why. The run then closes as cancelled with
+/// the stable `approval_denied` code; a corrected candidate is a new run,
+/// never a mutation of this one.
+async fn cancel_run_after_denial(
+    db: buzz_db::Db,
+    community_id: CommunityId,
+    approval: buzz_db::workflow::ApprovalRecord,
+    evidence: serde_json::Value,
+) {
+    let run_id = approval.run_id;
+    let run = match db.get_workflow_run(community_id, run_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("approval_deny: failed to fetch run {run_id}: {e}");
+            return;
+        }
+    };
+    if run.status != RunStatus::WaitingApproval {
+        tracing::warn!(
+            "approval_deny: run {run_id} has status '{}', expected 'waiting_approval'",
+            run.status
+        );
+        return;
+    }
+
+    let mut trace_vec = run.execution_trace.as_array().cloned().unwrap_or_default();
+    record_approval_evidence(&mut trace_vec, &approval.step_id, &evidence);
+    let trace_json = serde_json::Value::Array(trace_vec);
+
+    let approver_hex = evidence
+        .get("approver")
+        .and_then(|a| a.as_str())
+        .unwrap_or("unknown");
+    let cancel_msg = format!("workflow cancelled: approval denied by {approver_hex}");
+    if let Err(e) = db
+        .update_workflow_run(
+            community_id,
+            run_id,
+            RunStatus::Cancelled,
+            run.current_step,
+            &trace_json,
+            Some(buzz_db::workflow::WorkflowRunFailure {
+                code: "approval_denied",
+                message: &cancel_msg,
+            }),
+        )
+        .await
+    {
+        tracing::error!("approval_deny: failed to cancel run {run_id}: {e}");
+    }
 }
 
 /// Publish the kind:46011/46012 decision event into the workflow's channel.
@@ -1332,7 +1507,12 @@ async fn handle_approval_grant(
     let binding = GrantBinding::from_event(event);
     verify_grant_binding(&binding, &approval).map_err(IngestError::Rejected)?;
     if let Some(dup) = duplicate_decision(&approval, ApprovalStatus::Granted, &self_bytes, event) {
-        return Ok(dup);
+        // F-A: an identical, already-applied decision is a no-op for the
+        // record — but it also re-asserts the post-commit apply, so a crash
+        // between the original commit and its spawned resume is recoverable
+        // by simply re-sending the grant. `apply_terminal_decision` is a
+        // true no-op when the run already moved on.
+        return reassert_decision(state, tenant, event, approval, dup).await;
     }
     ensure_pending_and_live(&approval, Utc::now())?;
 
@@ -1391,21 +1571,15 @@ async fn handle_approval_grant(
         &event.id.to_hex(),
         Utc::now(),
     );
-    let engine = Arc::clone(&state.workflow_engine);
-    let db = state.db.clone();
-    let state_for_sink = Arc::clone(state);
-
+    let state_for_apply = Arc::clone(state);
+    let applied = buzz_db::workflow::ApprovalRecord {
+        status: ApprovalStatus::Granted,
+        approver_pubkey: Some(self_bytes.clone()),
+        note: (!event.content.is_empty()).then(|| event.content.clone()),
+        ..approval
+    };
     tokio::spawn(async move {
-        publish_approval_decision(
-            &state_for_sink,
-            community_id,
-            approval.workflow_id,
-            KIND_WORKFLOW_APPROVAL_GRANTED,
-            &evidence,
-            &approval.approver_spec,
-        )
-        .await;
-        resume_workflow_after_approval(engine, db, community_id, approval, evidence).await;
+        apply_terminal_decision(state_for_apply, community_id, applied, evidence).await;
     });
 
     // 7. Return response
@@ -1453,7 +1627,8 @@ async fn handle_approval_deny(
     let binding = GrantBinding::from_event(event);
     verify_grant_binding(&binding, &approval).map_err(IngestError::Rejected)?;
     if let Some(dup) = duplicate_decision(&approval, ApprovalStatus::Denied, &self_bytes, event) {
-        return Ok(dup);
+        // F-A (deny side): re-assert the interrupted cancel; no-op if applied.
+        return reassert_decision(state, tenant, event, approval, dup).await;
     }
     ensure_pending_and_live(&approval, Utc::now())?;
 
@@ -1502,7 +1677,6 @@ async fn handle_approval_deny(
     // 6. Cancel the workflow run (post-commit, async)
     let community_id = tenant.community();
     let run_id = approval.run_id;
-    let pubkey_hex = self_hex.clone();
     let evidence = approval_decision_evidence(
         &approval,
         ApprovalStatus::Denied,
@@ -1511,62 +1685,15 @@ async fn handle_approval_deny(
         &event.id.to_hex(),
         Utc::now(),
     );
-    let db = state.db.clone();
-    let state_for_sink = Arc::clone(state);
-
+    let state_for_apply = Arc::clone(state);
+    let applied = buzz_db::workflow::ApprovalRecord {
+        status: ApprovalStatus::Denied,
+        approver_pubkey: Some(self_bytes.clone()),
+        note: (!event.content.is_empty()).then(|| event.content.clone()),
+        ..approval
+    };
     tokio::spawn(async move {
-        publish_approval_decision(
-            &state_for_sink,
-            community_id,
-            approval.workflow_id,
-            KIND_WORKFLOW_APPROVAL_DENIED,
-            &evidence,
-            &approval.approver_spec,
-        )
-        .await;
-
-        let run = match db.get_workflow_run(community_id, run_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("approval_deny: failed to fetch run {run_id}: {e}");
-                return;
-            }
-        };
-
-        if run.status != RunStatus::WaitingApproval {
-            tracing::warn!(
-                "approval_deny: run {run_id} has status '{}', expected 'waiting_approval'",
-                run.status
-            );
-            return;
-        }
-
-        // WF-08: the denial is evidence too — it completes the gate entry in
-        // the trace (status `denied`) so a restarted or re-read run shows who
-        // rejected which candidate and why. The run then closes as cancelled
-        // with the stable `approval_denied` code; a corrected candidate is a
-        // new run, never a mutation of this one.
-        let mut trace_vec = run.execution_trace.as_array().cloned().unwrap_or_default();
-        record_approval_evidence(&mut trace_vec, &approval.step_id, &evidence);
-        let trace_json = serde_json::Value::Array(trace_vec);
-
-        let cancel_msg = format!("workflow cancelled: approval denied by {pubkey_hex}");
-        if let Err(e) = db
-            .update_workflow_run(
-                community_id,
-                run_id,
-                RunStatus::Cancelled,
-                run.current_step,
-                &trace_json,
-                Some(buzz_db::workflow::WorkflowRunFailure {
-                    code: "approval_denied",
-                    message: &cancel_msg,
-                }),
-            )
-            .await
-        {
-            tracing::error!("approval_deny: failed to cancel run {run_id}: {e}");
-        }
+        apply_terminal_decision(state_for_apply, community_id, applied, evidence).await;
     });
 
     // 7. Return response
@@ -1936,5 +2063,117 @@ mod wf08_tests {
         );
         assert_eq!(trace[0]["status"], "denied");
         assert!(trace[0]["output"]["note"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod wf08_round1_tests {
+    //! Correction round 1 (bFUzZ F-A / F-B): crash-consistency of the
+    //! post-commit apply. `apply_terminal_decision` itself needs a relay, but
+    //! the two properties it rests on are pure and pinned here:
+    //! (1) re-assert evidence is derived from the durable record, not from
+    //!     the retry event's claims, and is marked `reasserted`;
+    //! (2) replaying evidence into a trace never rewrites which event decided
+    //!     or when — first terminal decision wins.
+    use super::*;
+    use buzz_db::workflow::{ApprovalRecord, ApprovalStatus};
+
+    const REVIEWER: &str = "755029663fee78e734a217867246e22933a4683dda19dd8435488688a29f9541";
+
+    fn granted_record() -> ApprovalRecord {
+        ApprovalRecord {
+            token: vec![0xcd; 32],
+            workflow_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            step_id: "review".to_owned(),
+            step_index: 1,
+            approver_spec: REVIEWER.to_owned(),
+            status: ApprovalStatus::Granted,
+            approver_pubkey: Some(hex::decode(REVIEWER).unwrap()),
+            note: Some("tests green at abc".to_owned()),
+            candidate_ref: Some("abc".to_owned()),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn f_a_reassert_evidence_comes_from_the_record_and_is_marked() {
+        let rec = granted_record();
+        let ev = reassert_evidence_from_record(&rec, "retry-event", Utc::now());
+        assert_eq!(ev["decision"], "granted");
+        assert_eq!(ev["approver"], REVIEWER, "approver is the stored signer");
+        assert_eq!(ev["note"], "tests green at abc", "note is the stored note");
+        assert_eq!(ev["candidate_ref"], "abc");
+        assert_eq!(ev["decision_event_id"], "retry-event");
+        assert_eq!(ev["reasserted"], true);
+        assert!(!ev.to_string().contains("\"token\""));
+    }
+
+    #[test]
+    fn f_a_replay_never_rewrites_the_first_decision_event_or_time() {
+        let rec = granted_record();
+        let first = approval_decision_evidence(
+            &rec,
+            ApprovalStatus::Granted,
+            REVIEWER,
+            "tests green at abc",
+            "first-event",
+            chrono::DateTime::parse_from_rfc3339("2026-09-18T03:00:00+00:00")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let mut trace = vec![serde_json::json!({
+            "step_id": "review",
+            "status": "waiting_approval",
+            "output": {"approval_ref": "cd", "requested_at": "2026-09-18T02:00:00+00:00"}
+        })];
+        assert!(record_approval_evidence(&mut trace, "review", &first));
+        let replay = reassert_evidence_from_record(
+            &rec,
+            "retry-event",
+            chrono::DateTime::parse_from_rfc3339("2026-09-18T03:05:00+00:00")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert!(record_approval_evidence(&mut trace, "review", &replay));
+        let out = &trace[0]["output"];
+        assert_eq!(
+            out["decision_event_id"], "first-event",
+            "first decision wins"
+        );
+        assert_eq!(out["decided_at"], "2026-09-18T03:00:00+00:00");
+        assert_eq!(
+            out["reasserted"], true,
+            "the replay itself is still visible"
+        );
+        assert_eq!(out["requested_at"], "2026-09-18T02:00:00+00:00");
+        assert_eq!(trace.len(), 1);
+    }
+
+    #[test]
+    fn f_a_replay_into_an_interrupted_trace_records_the_retry_as_decider() {
+        // Crash before the first evidence write: the trace still says
+        // waiting_approval, so the re-assert legitimately becomes the decider.
+        let rec = granted_record();
+        let mut trace = vec![serde_json::json!({
+            "step_id": "review",
+            "status": "waiting_approval",
+            "output": {"approval_ref": "cd"}
+        })];
+        let replay = reassert_evidence_from_record(&rec, "retry-event", Utc::now());
+        assert!(record_approval_evidence(&mut trace, "review", &replay));
+        assert_eq!(trace[0]["status"], "completed");
+        assert_eq!(trace[0]["output"]["decision_event_id"], "retry-event");
+    }
+
+    #[test]
+    fn f_a_denied_record_reasserts_as_denied() {
+        let mut rec = granted_record();
+        rec.status = ApprovalStatus::Denied;
+        rec.note = None;
+        let ev = reassert_evidence_from_record(&rec, "retry", Utc::now());
+        assert_eq!(ev["decision"], "denied");
+        assert!(ev["note"].is_null());
     }
 }
