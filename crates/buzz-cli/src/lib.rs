@@ -952,7 +952,7 @@ pub enum WorkflowsCmd {
     },
     /// Approve or deny a workflow step
     #[command(
-        after_help = "Examples:\n  buzz workflows approve --token <UUID>\n  buzz workflows approve --token <UUID> --approved false --note \"needs revision\""
+        after_help = "Examples:\n  buzz workflows approve --token <UUID>\n  buzz workflows approve --token <UUID> --candidate 0123abcd --note \"tests green at 0123abcd\"\n  buzz workflows approve --token <UUID> --approved false --note \"needs revision\"\n\nA gate minted for a candidate (see `candidate_ref` in the kind:46010 request)\nrequires --candidate with the identical value; the relay rejects a decision for\nany other candidate, so a stale approval can never approve a corrected commit."
     )]
     Approve {
         /// The approval token UUID (from the approval request)
@@ -964,6 +964,16 @@ pub enum WorkflowsCmd {
         /// Optional note to include with the approval/denial
         #[arg(long)]
         note: Option<String>,
+        /// Exact candidate reviewed (e.g. commit sha). Required when the
+        /// approval request carries a `candidate_ref`.
+        #[arg(long)]
+        candidate: Option<String>,
+        /// Run id being decided (optional cross-check against the record)
+        #[arg(long)]
+        run: Option<String>,
+        /// Step id being decided (optional cross-check against the record)
+        #[arg(long)]
+        step: Option<String>,
     },
 }
 

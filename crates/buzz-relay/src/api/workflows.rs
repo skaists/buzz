@@ -221,6 +221,7 @@ fn approval_json(approval: &buzz_db::workflow::ApprovalRecord) -> Value {
         "status": approval.status,
         "approver_pubkey": approval.approver_pubkey.as_ref().map(hex::encode),
         "note": approval.note,
+        "candidate_ref": approval.candidate_ref,
         "expires_at": approval.expires_at,
         "created_at": approval.created_at.timestamp(),
     })
@@ -254,10 +255,12 @@ mod tests {
             status: buzz_db::workflow::ApprovalStatus::Pending,
             approver_pubkey: None,
             note: None,
+            candidate_ref: Some("0123abcd".to_string()),
             expires_at: Utc::now(),
             created_at: Utc::now(),
         };
         let wire = approval_json(&approval);
+        assert_eq!(wire["candidate_ref"], "0123abcd");
         assert!(wire.get("token").is_none());
         assert_eq!(wire["approval_ref"], hex::encode([0xab; 32]));
     }

@@ -1,5 +1,10 @@
 import * as React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
 import {
@@ -153,6 +158,30 @@ export function useWorkflowRunsQuery(workflowId: string | null) {
     },
     ...workflowRunsFocusRefetchPolicy,
   });
+}
+
+/**
+ * Runs for many workflows at once, keyed by workflow id. Shares the
+ * per-workflow query key with `useWorkflowRunsQuery`, so the detail panel
+ * and the hive-wide instances list read and refresh the same cache. No poll
+ * of its own: the selected workflow already polls while a run is active, and
+ * foreground return refreshes the rest.
+ */
+export function useWorkflowsRunsQueries(
+  workflowIds: string[],
+): Record<string, WorkflowRun[] | undefined> {
+  const results = useQueries({
+    queries: workflowIds.map((workflowId) => ({
+      queryKey: workflowRunsQueryKey(workflowId),
+      queryFn: () => getWorkflowRuns(workflowId),
+      ...workflowRunsFocusRefetchPolicy,
+    })),
+  });
+  const runsByWorkflowId: Record<string, WorkflowRun[] | undefined> = {};
+  workflowIds.forEach((workflowId, index) => {
+    runsByWorkflowId[workflowId] = results[index]?.data;
+  });
+  return runsByWorkflowId;
 }
 
 export function useRunApprovalsQuery(

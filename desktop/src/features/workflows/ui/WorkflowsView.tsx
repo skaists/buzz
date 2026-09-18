@@ -9,6 +9,7 @@ import {
 import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
 import { WorkflowDeleteDialog } from "@/features/workflows/ui/WorkflowDeleteDialog";
 import { WorkflowDetailPanel } from "@/features/workflows/ui/WorkflowDetailPanel";
+import { WorkflowInstances } from "@/features/workflows/ui/WorkflowInstances";
 import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
 import type { Channel, Workflow } from "@/shared/api/types";
 import {
@@ -77,6 +78,7 @@ export function WorkflowsView({
     mode: "closed",
   });
   const [deleteTarget, setDeleteTarget] = React.useState<Workflow | null>(null);
+  const [focusRunId, setFocusRunId] = React.useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const memberChannels = channels.filter((c) => c.isMember);
@@ -226,6 +228,14 @@ export function WorkflowsView({
           </div>
         ) : (
           <div className="space-y-2">
+            <WorkflowInstances
+              onSelectInstance={(workflowId, runId) => {
+                setFocusRunId(runId);
+                onSelectWorkflow(workflowId);
+              }}
+              selectedRunId={selectedWorkflowId ? focusRunId : null}
+              workflows={allWorkflows}
+            />
             {allWorkflows.map(({ workflow, channelName }) => (
               <WorkflowCard
                 channelName={channelName}
@@ -234,7 +244,10 @@ export function WorkflowsView({
                 onDelete={handleDelete}
                 onDuplicate={handleDuplicate}
                 onEdit={handleEdit}
-                onSelect={onSelectWorkflow}
+                onSelect={(workflowId) => {
+                  setFocusRunId(null);
+                  onSelectWorkflow(workflowId);
+                }}
                 onTrigger={handleTrigger}
                 workflow={workflow}
               />
@@ -246,7 +259,8 @@ export function WorkflowsView({
       {selectedWorkflowId ? (
         <div className="w-[400px] shrink-0">
           <WorkflowDetailPanel
-            key={selectedWorkflowId}
+            initialRunId={focusRunId}
+            key={`${selectedWorkflowId}:${focusRunId ?? ""}`}
             onClose={onCloseWorkflow}
             onEdit={handleEdit}
             workflowId={selectedWorkflowId}
