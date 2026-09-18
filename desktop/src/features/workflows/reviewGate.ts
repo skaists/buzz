@@ -124,6 +124,8 @@ export function describeReviewGate(
  * Short, human label for a reviewer spec or pubkey. A 64-hex pubkey goes
  * through the one canonical compact form (`truncatePubkey`); specs pass through.
  */
+export function shortPubkey(value: string): string;
+export function shortPubkey(value: string | null): string | null;
 export function shortPubkey(value: string | null): string | null {
   if (value === null) return null;
   if (value === "any") return "any member";
@@ -173,7 +175,7 @@ export function describeRunBlocker(
 
 /** One-line, human label for a run row. */
 export function runBlockerLabel(blocker: RunBlocker): string {
-  const reviewer = shortPubkey(blocker.reviewerSpec) ?? blocker.reviewerSpec;
+  const reviewer = shortPubkey(blocker.reviewerSpec);
   const candidate =
     blocker.candidateRef === null ? "" : ` · candidate ${blocker.candidateRef}`;
   return blocker.kind === "review_expired"

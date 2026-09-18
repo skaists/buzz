@@ -101,9 +101,7 @@ export function describeRunTransitions(
       kind: "review_requested",
       at: isoToMs(gate.requestedAt) ?? secondsToMs(step.startedAt),
       stepId: step.stepId,
-      label: `Review requested from ${
-        shortPubkey(gate.reviewerSpec) ?? gate.reviewerSpec
-      }${candidate}`,
+      label: `Review requested from ${shortPubkey(gate.reviewerSpec)}${candidate}`,
       evidenceEventId: null,
     });
 

@@ -25,19 +25,24 @@ import {
 
 type WorkflowDetailPanelProps = {
   workflowId: string;
+  /** Run to open on mount, for example one picked from the instances list. */
+  initialRunId?: string | null;
   onClose: () => void;
   onEdit: (workflow: Workflow) => void;
 };
 
 export function WorkflowDetailPanel({
   workflowId,
+  initialRunId = null,
   onClose,
   onEdit,
 }: WorkflowDetailPanelProps) {
   const workflowQuery = useWorkflowQuery(workflowId);
   const runsQuery = useWorkflowRunsQuery(workflowId);
   const triggerMutation = useTriggerWorkflowMutation(workflowId);
-  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(
+    initialRunId,
+  );
 
   const workflow = workflowQuery.data;
   const runs = runsQuery.data ?? [];
