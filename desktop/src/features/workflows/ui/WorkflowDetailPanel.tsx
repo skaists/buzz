@@ -11,6 +11,7 @@ import {
   describeRunBlocker,
   runBlockerLabel,
 } from "@/features/workflows/reviewGate";
+import { WorkflowRunHistory } from "@/features/workflows/ui/WorkflowRunHistory";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
 import type { Workflow } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
@@ -284,6 +285,15 @@ export function WorkflowDetailPanel({
 
                         {isSelected ? (
                           <div className="border-t border-border/60 bg-background/60 px-4 py-4">
+                            <div className="mb-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+                              History
+                            </div>
+                            <div className="mb-4">
+                              <WorkflowRunHistory
+                                approvals={approvalsQuery.data}
+                                run={run}
+                              />
+                            </div>
                             <div className="mb-3 flex items-center gap-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                               <span>Execution Trace</span>
                               {approvalsQuery.isFetching ? (

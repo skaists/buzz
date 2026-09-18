@@ -121,3 +121,22 @@ test("no blocker is invented for runs that are not waiting or have no gate in th
   );
   assert.equal(describeRunBlocker(run({ executionTrace: [] }), NOW), null);
 });
+
+test("a granted gate on a run still marked waiting shows no blocker (decision already durable)", () => {
+  const blocker = describeRunBlocker(
+    run({
+      executionTrace: [
+        gateStep({
+          status: "completed",
+          output: {
+            approval_ref: "ab".repeat(32),
+            approver_spec: REVIEWER,
+            decision: "granted",
+          },
+        }),
+      ],
+    }),
+    NOW,
+  );
+  assert.equal(blocker, null);
+});
