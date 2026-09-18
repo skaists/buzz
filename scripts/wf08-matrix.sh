@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # wf08-matrix.sh — wire-level acceptance matrix for the WF-08 approval gate
-# (T1–T7, T9) against an ISOLATED relay. Never touches a production relay.
+# against an ISOLATED relay. Never touches a production relay.
+#
+# Runs T1 (suspend, 46010, grant, resume, evidence, 46011, result), T2 (wrong
+# signer), T3 (stale / missing candidate), T4 (idempotent duplicate grant),
+# T5 (one trigger → one run), T7 (chat advances nothing), T9 (deny).
+# NOT run here: T6 (restart preserves the obligation) and T8 (loop guard,
+# unit-tested in buzz-workflow).
 #
 # Prerequisites (one terminal):
 #   docker compose -p buzz-harness -f docker-compose.harness.yml up -d
@@ -11,9 +17,13 @@
 #   cargo build --release -p buzz-relay -p buzz-cli
 #   BUZZ_BIN=target/release/buzz ./scripts/wf08-matrix.sh
 #
+# CI runs it against the relay from scripts/start-relay-for-tests.sh with
+# BUZZ_E2E_RELAY_URL=http://localhost:3000.
+#
 # Identities are synthetic and generated per run. Every step prints the raw
 # relay response; a "PASS"/"FAIL" line follows each assertion. Exit code is
-# the number of failed assertions.
+# the number of failed assertions; 90/91 mean the matrix never started
+# (missing tool / setup failed).
 #
 # On base 191a577 the run stops at T1: the run is marked `failed` with
 # error_code `approval_not_supported` and no approval is ever minted, so
@@ -29,10 +39,10 @@ FAILS=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILS=$((FAILS + 1)); }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1" >&2; exit 90; }; }
+setup_failed() { echo "SETUP FAILED  $*" >&2; exit 91; }
 need jq; need openssl
 
 newkey() { openssl rand -hex 32; }
-pub_of() { "$BUZZ" --relay "$RELAY" --private-key "$1" users get 2>/dev/null | jq -r 'if type=="array" then .[0].pubkey else .pubkey end'; }
 
 OWNER_SK="$(newkey)"      # builder / workflow owner (bFaBLe5.1 stand-in)
 REVIEWER_SK="$(newkey)"   # designated reviewer (bFUzZ stand-in)
@@ -42,12 +52,23 @@ as_owner()    { "$BUZZ" --relay "$RELAY" --private-key "$OWNER_SK"    "$@"; }
 as_reviewer() { "$BUZZ" --relay "$RELAY" --private-key "$REVIEWER_SK" "$@"; }
 as_stranger() { "$BUZZ" --relay "$RELAY" --private-key "$STRANGER_SK" "$@"; }
 
-REVIEWER_PK="$(as_reviewer users get | jq -r 'if type=="array" then .[0].pubkey else .pubkey end')"
-STRANGER_PK="$(as_stranger users get | jq -r 'if type=="array" then .[0].pubkey else .pubkey end')"
+# `users get` reads kind:0 and a fresh key has none, so publish a profile first.
+pub_of() {  # $1 = as_* function, $2 = display name
+  "$1" users set-profile --name "$2" >/dev/null
+  "$1" users get | jq -r '.[0].pubkey // empty'
+}
+is_hex64() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+is_uuid()  { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; }
+
+REVIEWER_PK="$(pub_of as_reviewer wf08-reviewer)"
+STRANGER_PK="$(pub_of as_stranger wf08-stranger)"
 echo "reviewer=$REVIEWER_PK stranger=$STRANGER_PK"
+is_hex64 "$REVIEWER_PK" || setup_failed "reviewer pubkey did not resolve"
+is_hex64 "$STRANGER_PK" || setup_failed "stranger pubkey did not resolve"
 
 # --- channel with all three members ------------------------------------------
 CHANNEL="$(as_owner channels create --name "wf08-matrix-$(date +%s)" --type stream --visibility open | jq -r .channel_id)"
+is_uuid "$CHANNEL" || setup_failed "channel was not created"
 as_reviewer channels join --channel "$CHANNEL" >/dev/null
 as_stranger channels join --channel "$CHANNEL" >/dev/null
 echo "channel=$CHANNEL"
@@ -57,6 +78,7 @@ YAML="$(sed -e 's/^enabled: false/enabled: true/' \
             -e "s/from: \".*\"/from: \"$REVIEWER_PK\"/" \
             examples/workflows/two-bee-build-review.yaml)"
 WF="$(as_owner workflows create --channel "$CHANNEL" --yaml "$YAML" | jq -r .workflow_id)"
+is_uuid "$WF" || setup_failed "workflow was not created"
 echo "workflow=$WF"
 
 trigger() {  # $1 = candidate

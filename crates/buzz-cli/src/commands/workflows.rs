@@ -57,39 +57,37 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     Ok(())
 }
 
-/// Get workflow run history — query kinds [46001, 46002, 46003].
+/// Fetch workflow run history from `GET /workflows/{workflow_id}/runs` (NIP-98).
 ///
-/// NOTE: The relay does not currently emit workflow execution events (46001-46003).
-/// Run history is stored in the workflow_runs DB table, not as Nostr events.
-/// This command will return an empty array until the relay adds event emission
-/// or a dedicated REST endpoint for run history.
+/// Run history lives in the relay's `workflow_runs` table, not in Nostr events:
+/// the relay emits no 46001–46003 lifecycle events, so an event query can never
+/// return a run. Returns the newest-first `runs` array of one page.
+async fn fetch_workflow_runs(
+    client: &BuzzClient,
+    workflow_id: &str,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, CliError> {
+    validate_uuid(workflow_id)?;
+    let limit = limit.unwrap_or(20).clamp(1, 100);
+    let resp = client
+        .get_authed(&format!("/workflows/{workflow_id}/runs?limit={limit}"))
+        .await?;
+    let body: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| CliError::Other(format!("workflow runs response is not JSON: {e}")))?;
+    body.get("runs")
+        .and_then(|runs| runs.as_array())
+        .cloned()
+        .ok_or_else(|| CliError::Other("workflow runs response has no `runs` array".into()))
+}
+
+/// Get workflow run history — one page of runs, newest first.
 pub async fn cmd_get_workflow_runs(
     client: &BuzzClient,
     workflow_id: &str,
     limit: Option<u32>,
 ) -> Result<(), CliError> {
-    validate_uuid(workflow_id)?;
-    let limit = limit.unwrap_or(20).min(100);
-    let filter = serde_json::json!({
-        "kinds": [46001, 46002, 46003],
-        "#d": [workflow_id],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let normalized: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "event_id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
-        })
-        .collect();
-    let output = serde_json::to_string(&normalized).unwrap_or_default();
+    let runs = fetch_workflow_runs(client, workflow_id, limit).await?;
+    let output = serde_json::to_string(&runs).unwrap_or_default();
     println!("{output}");
     Ok(())
 }
@@ -248,5 +246,103 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             };
             cmd_approve_step(client, &token, approved, note.as_deref(), binding).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, Uri};
+    use axum::Router;
+    use nostr::Keys;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    const WORKFLOW_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Serve `body` for every request and record `METHOD path?query auth-scheme`.
+    async fn recording_server(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let app = Router::new().fallback(
+            move |method: axum::http::Method, uri: Uri, headers: HeaderMap| {
+                let log = log.clone();
+                async move {
+                    let scheme = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.split(' ').next())
+                        .unwrap_or("-")
+                        .to_string();
+                    log.lock().unwrap().push(format!("{method} {uri} {scheme}"));
+                    ([("content-type", "application/json")], body)
+                }
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn test_client(base_url: &str) -> BuzzClient {
+        BuzzClient::new(base_url.to_string(), Keys::generate(), None, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn runs_are_read_from_the_relay_run_history_endpoint() {
+        let (url, seen) = recording_server(
+            r#"{"runs":[{"id":"r2","status":"waiting_approval"},{"id":"r1","status":"completed"}],"next":null}"#,
+        )
+        .await;
+        let runs = fetch_workflow_runs(&test_client(&url), WORKFLOW_ID, Some(5))
+            .await
+            .unwrap();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["id"], "r2");
+        assert_eq!(runs[0]["status"], "waiting_approval");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![format!("GET /workflows/{WORKFLOW_ID}/runs?limit=5 Nostr")],
+            "exactly one NIP-98 GET to the run-history endpoint, and no event query"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_limit_defaults_to_20_and_stays_inside_the_relay_bounds() {
+        let (url, seen) = recording_server(r#"{"runs":[],"next":null}"#).await;
+        let client = test_client(&url);
+        for limit in [None, Some(0), Some(500)] {
+            assert!(fetch_workflow_runs(&client, WORKFLOW_ID, limit)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        let limits: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| line.split("limit=").nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(limits, ["20 Nostr", "1 Nostr", "100 Nostr"]);
+    }
+
+    #[tokio::test]
+    async fn runs_response_without_a_runs_array_is_an_error_not_an_empty_list() {
+        let (url, _) = recording_server(r#"{"error":"nope"}"#).await;
+        let err = fetch_workflow_runs(&test_client(&url), WORKFLOW_ID, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no `runs` array"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runs_rejects_a_malformed_workflow_id_before_any_request() {
+        let (url, seen) = recording_server(r#"{"runs":[]}"#).await;
+        assert!(fetch_workflow_runs(&test_client(&url), "not-a-uuid", None)
+            .await
+            .is_err());
+        assert!(seen.lock().unwrap().is_empty());
     }
 }
