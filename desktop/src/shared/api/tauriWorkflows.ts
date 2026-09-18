@@ -68,6 +68,8 @@ type RawWorkflowApproval = {
   status: WorkflowApproval["status"];
   approver_pubkey: string | null;
   note: string | null;
+  /** Present on relays with WF-08; absent on older relays — treated as unbound. */
+  candidate_ref?: string | null;
   expires_at: string;
   created_at: number;
 };
@@ -148,6 +150,7 @@ export function fromRawApproval(raw: RawWorkflowApproval): WorkflowApproval {
     status: raw.status,
     approverPubkey: raw.approver_pubkey,
     note: raw.note,
+    candidateRef: raw.candidate_ref ?? null,
     expiresAt: raw.expires_at,
     createdAt: raw.created_at,
   };
