@@ -50,6 +50,8 @@ jobs:
             desktop:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
+              - 'scripts/check-pubkey-truncation-core.mjs'
+              - 'scripts/check-pubkey-truncation-core.test.mjs'
               - 'desktop/**'
               - '!desktop/src-tauri/**'
               - 'pnpm-lock.yaml'
@@ -58,6 +60,8 @@ jobs:
             web:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
+              - 'scripts/check-pubkey-truncation-core.mjs'
+              - 'scripts/check-pubkey-truncation-core.test.mjs'
               - 'web/**'
               - 'pnpm-lock.yaml'
             mobile:
@@ -90,6 +94,8 @@ jobs:
         run: scripts/test-mobile-worktree-overrides.sh
       - name: File size ratchet unit tests
         run: node --test scripts/check-file-sizes-core.test.mjs
+      - name: Pubkey truncation guard unit tests
+        run: node --test scripts/check-pubkey-truncation-core.test.mjs
 
   rust-lint:
     name: Rust Lint
