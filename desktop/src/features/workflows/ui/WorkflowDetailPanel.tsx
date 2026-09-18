@@ -7,6 +7,10 @@ import {
   useWorkflowQuery,
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
+import {
+  describeRunBlocker,
+  runBlockerLabel,
+} from "@/features/workflows/reviewGate";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
 import type { Workflow } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
@@ -202,6 +206,7 @@ export function WorkflowDetailPanel({
                       run.errorCode,
                       run.errorMessage,
                     );
+                    const blocker = describeRunBlocker(run);
 
                     return (
                       <div
@@ -258,6 +263,19 @@ export function WorkflowDetailPanel({
                               {failureReason ? (
                                 <p className="mt-2 break-words pl-6 text-xs text-destructive">
                                   {failureReason}
+                                </p>
+                              ) : null}
+                              {blocker ? (
+                                <p
+                                  className={`mt-2 break-words pl-6 text-xs ${
+                                    blocker.kind === "review_expired"
+                                      ? "text-destructive"
+                                      : "text-muted-foreground"
+                                  }`}
+                                  data-blocker-kind={blocker.kind}
+                                  data-testid="workflow-run-blocker"
+                                >
+                                  {runBlockerLabel(blocker)}
                                 </p>
                               ) : null}
                             </div>

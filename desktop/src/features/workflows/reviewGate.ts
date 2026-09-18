@@ -1,4 +1,8 @@
-import type { TraceEntry, WorkflowApproval } from "@/shared/api/types";
+import type {
+  TraceEntry,
+  WorkflowApproval,
+  WorkflowRun,
+} from "@/shared/api/types";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
 /**
@@ -127,4 +131,52 @@ export function shortPubkey(value: string | null): string | null {
     return truncatePubkey(value);
   }
   return value;
+}
+
+/**
+ * What a run is blocked on, derived only from durable run state (status +
+ * trace). Today the one typed dependency a run can wait on is a review gate.
+ */
+export type RunBlocker = {
+  kind: "awaiting_review" | "review_expired";
+  stepId: string;
+  reviewerSpec: string;
+  candidateRef: string | null;
+  expiresAt: string | null;
+};
+
+/**
+ * The blocker for a run row, or `null` when the run is not waiting or its
+ * trace carries no undecided gate (older relays): nothing is invented.
+ * The most recent undecided gate wins.
+ */
+export function describeRunBlocker(
+  run: Pick<WorkflowRun, "status" | "executionTrace">,
+  now: Date = new Date(),
+): RunBlocker | null {
+  if (run.status !== "waiting_approval") return null;
+  for (let i = run.executionTrace.length - 1; i >= 0; i -= 1) {
+    const step = run.executionTrace[i];
+    const gate = describeReviewGate(step, null, now);
+    if (gate === null) continue;
+    if (gate.state !== "waiting" && gate.state !== "expired") continue;
+    return {
+      kind: gate.state === "expired" ? "review_expired" : "awaiting_review",
+      stepId: step.stepId,
+      reviewerSpec: gate.reviewerSpec,
+      candidateRef: gate.candidateRef,
+      expiresAt: gate.expiresAt,
+    };
+  }
+  return null;
+}
+
+/** One-line, human label for a run row. */
+export function runBlockerLabel(blocker: RunBlocker): string {
+  const reviewer = shortPubkey(blocker.reviewerSpec) ?? blocker.reviewerSpec;
+  const candidate =
+    blocker.candidateRef === null ? "" : ` · candidate ${blocker.candidateRef}`;
+  return blocker.kind === "review_expired"
+    ? `Review gate expired · reviewer ${reviewer}${candidate}`
+    : `Waiting on review by ${reviewer}${candidate}`;
 }
