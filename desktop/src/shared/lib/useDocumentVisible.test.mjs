@@ -287,9 +287,16 @@ describe("visibility-gated hooks", () => {
     focused = true;
     await act(async () => window.dispatchEvent(new window.Event("focus")));
     assert.deepEqual(observed, [1_000, false]);
-    await act(
-      async () => new Promise((resolve) => window.setTimeout(resolve, 10)),
-    );
+    // Resume runs after task -> frame -> task (scheduleAfterForegroundReady).
+    // Those are chained timers here, and timer granularity is coarse on
+    // Windows, so wait for the resume itself rather than a fixed delay. The
+    // deadline only bounds a genuine failure to resume.
+    const deadline = Date.now() + 2_000;
+    while (observed.length < 3 && Date.now() < deadline) {
+      await act(
+        async () => new Promise((resolve) => window.setTimeout(resolve, 5)),
+      );
+    }
     assert.deepEqual(observed, [1_000, false, 1_000]);
 
     await act(async () => root.unmount());
