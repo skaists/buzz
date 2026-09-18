@@ -1,7 +1,26 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 
-import { skaistsBuildUrl } from "./buzz-download.ts";
+import {
+  BUZZ_RELEASES_URL,
+  resolveBuzzDownloadUrlForPlatform,
+  skaistsBuildUrl,
+} from "./buzz-download.ts";
+
+test("every platform, phones included, resolves to the releases page", async () => {
+  for (const operatingSystem of ["linux", "macos", "windows", "unknown"]) {
+    for (const architecture of ["arm64", "x64", "unknown"]) {
+      assert.equal(
+        await resolveBuzzDownloadUrlForPlatform({
+          operatingSystem,
+          architecture,
+        }),
+        BUZZ_RELEASES_URL,
+        `${operatingSystem}/${architecture}`,
+      );
+    }
+  }
+});
 
 test("no configured skaists build means no edition link", () => {
   assert.equal(skaistsBuildUrl(undefined), undefined);

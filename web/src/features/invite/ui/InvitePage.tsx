@@ -2,6 +2,8 @@ import buzzAppIcon from "@/assets/app-icon@3x.png";
 import { claimInviteInBrowser } from "@/features/invite/invite-api";
 import {
   BUZZ_RELEASES_URL,
+  detectBuzzDownloadPlatform,
+  resolveBuzzDownloadUrlForPlatform,
   SKAISTS_EDITION_LABEL,
   skaistsBuildUrl,
 } from "@/shared/lib/buzz-download";
@@ -56,6 +58,20 @@ export function InvitePage({ code }: { code: string }) {
   const [browserJoinError, setBrowserJoinError] = React.useState<string | null>(
     null,
   );
+  const [downloadUrl, setDownloadUrl] = React.useState(BUZZ_RELEASES_URL);
+
+  React.useEffect(() => {
+    let active = true;
+    detectBuzzDownloadPlatform(navigator).then(async (platform) => {
+      if (!active) return;
+      const url = await resolveBuzzDownloadUrlForPlatform(platform);
+      if (active) setDownloadUrl(url);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   React.useEffect(() => {
     fetch("/api/join-policy")
       .then(async (response) => {
@@ -225,7 +241,7 @@ export function InvitePage({ code }: { code: string }) {
           </p>
           <a
             className="mt-3 inline-block font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
-            href={BUZZ_RELEASES_URL}
+            href={downloadUrl}
             rel="noreferrer"
             target="_blank"
           >

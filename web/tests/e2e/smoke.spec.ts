@@ -209,3 +209,91 @@ test("invite download sends new visitors to the Buzz releases page", async ({
   await expect(page.getByText("Download it now")).toHaveCount(0);
   expect(githubApiCalled).toBe(false);
 });
+
+test("invite download falls back for mobile and non-desktop devices", async ({
+  browser,
+}) => {
+  const unsupportedDevices = [
+    {
+      name: "iPhone Safari",
+      platform: "iPhone",
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15",
+      maxTouchPoints: 5,
+    },
+    {
+      name: "iPadOS desktop mode",
+      platform: "MacIntel",
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15",
+      maxTouchPoints: 5,
+    },
+    {
+      name: "Android phone",
+      platform: "Linux armv8l",
+      userAgent:
+        "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 Mobile",
+      maxTouchPoints: 5,
+    },
+    {
+      name: "ChromeOS",
+      platform: "Linux x86_64",
+      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0) AppleWebKit/537.36",
+      maxTouchPoints: 0,
+    },
+  ];
+
+  for (const device of unsupportedDevices) {
+    const context = await browser.newContext({ userAgent: device.userAgent });
+    await context.addInitScript(({ platform, maxTouchPoints }) => {
+      Object.defineProperties(navigator, {
+        platform: { configurable: true, value: platform },
+        maxTouchPoints: { configurable: true, value: maxTouchPoints },
+        userAgentData: {
+          configurable: true,
+          value: { platform, mobile: maxTouchPoints > 0 },
+        },
+      });
+    }, device);
+    const page = await context.newPage();
+    await page.route("**/api/join-policy", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ policy: null }),
+      });
+    });
+    await page.route("https://api.github.com/**", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify([
+          {
+            draft: false,
+            prerelease: false,
+            assets: [
+              {
+                name: "Buzz_0.4.9_x64.dmg",
+                browser_download_url:
+                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_x64.dmg",
+              },
+              {
+                name: "Buzz_0.4.9_amd64.AppImage",
+                browser_download_url:
+                  "https://github.com/block/buzz/releases/download/v0.4.9/Buzz_0.4.9_amd64.AppImage",
+              },
+            ],
+          },
+        ]),
+      });
+    });
+
+    await page.goto("/invite/demo-code");
+    await expect(
+      page.getByRole("link", { name: "Download Buzz" }),
+      device.name,
+    ).toHaveAttribute("href", "https://github.com/block/buzz/releases");
+    await context.close();
+  }
+});
