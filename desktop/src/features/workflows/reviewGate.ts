@@ -1,4 +1,5 @@
 import type { TraceEntry, WorkflowApproval } from "@/shared/api/types";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 
 /**
  * A `request_approval` gate as the run trace + approvals API describe it
@@ -115,12 +116,15 @@ export function describeReviewGate(
   };
 }
 
-/** Short, human label for a reviewer spec or pubkey (hex → first/last 4). */
+/**
+ * Short, human label for a reviewer spec or pubkey. A 64-hex pubkey goes
+ * through the one canonical compact form (`truncatePubkey`); specs pass through.
+ */
 export function shortPubkey(value: string | null): string | null {
   if (value === null) return null;
   if (value === "any") return "any member";
   if (/^[0-9a-f]{64}$/i.test(value)) {
-    return `${value.slice(0, 8)}…${value.slice(-4)}`;
+    return truncatePubkey(value);
   }
   return value;
 }
