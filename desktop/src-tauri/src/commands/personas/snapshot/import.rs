@@ -902,11 +902,6 @@ mod egress_guard_tests {
 #[path = "import_avatar_tests.rs"]
 mod import_avatar_tests;
 
-/// Caller-level regressions for the persona-import canonical-signing
-/// boundary (review request): submit_engram_event calls
-/// canonical_sign_url BEFORE building its NIP-98 header, keeping the POST
-/// on the original transport. These tests exercise the exact resolver the
-
 /// Caller-level regressions for the persona-import publish boundary: these
 /// tests invoke the ACTUAL submit_engram_event function with synthetic
 /// keys and an isolated AppState whose HTTP client points at a loopback
@@ -921,7 +916,6 @@ mod import_publish_boundary_tests {
     #[derive(Debug, Clone)]
     struct CapturedRequest {
         method: String,
-        path: String,
         authorization: Option<String>,
     }
 
@@ -962,7 +956,6 @@ mod import_publish_boundary_tests {
                     let is_info = path.ends_with("/info");
                     req_clone.lock().unwrap().push(CapturedRequest {
                         method,
-                        path,
                         authorization: auth,
                     });
                     let (status, resp_body) = if is_info {

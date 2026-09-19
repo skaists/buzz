@@ -884,8 +884,6 @@ mod tts_start_race_tests {
     }
 }
 
-/// Caller-level regressions for the canonical-signing boundary (review
-
 /// Caller-level regressions for the huddle publish boundary: these tests
 /// invoke the ACTUAL publish_transcript_event function (the same function
 /// the transcription loop calls), exercising the full sequence — canonical

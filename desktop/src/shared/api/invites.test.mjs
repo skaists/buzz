@@ -303,7 +303,7 @@ test("claimInvite fails closed on a malformed canonical advertisement", async ()
     { push: { origin: "ftp://beehivenature.buzz" } },
     { push: { origin: 42 } },
   ]) {
-    const tauri = setupTauriStubs("https://unused-active-relay.example");
+    setupTauriStubs("https://unused-active-relay.example");
     const fetchMock = setupClaimFetch(bad);
     try {
       await assert.rejects(
@@ -327,7 +327,7 @@ test("claimInvite fails closed on a malformed canonical advertisement", async ()
 // never silently restore transport signing.
 
 test("claimInvite fails closed when /info is invalid JSON", async () => {
-  const tauri = setupTauriStubs("https://unused-active-relay.example");
+  setupTauriStubs("https://unused-active-relay.example");
   const fetchMock = setupClaimFetch({
     __rawInfo: '{"push":{"origin":"wss://beehivenature.buzz"',
   });
