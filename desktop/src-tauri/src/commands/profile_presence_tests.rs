@@ -23,7 +23,9 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
                     line.strip_prefix("content-length:")
                         .map(|v| v.trim().parse().unwrap())
                 })
-                .unwrap();
+                // Bodyless requests (the GET /info preflight carries no
+                // Content-Length) read zero bytes past the header block.
+                .unwrap_or(0);
             if request.len() >= end + 4 + length {
                 break;
             }

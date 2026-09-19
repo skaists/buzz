@@ -129,6 +129,13 @@ async fn query(State(state): State<ServerState>, headers: HeaderMap) -> Response
     )
     .into_response()
 }
+/// Canonical-origin preflight for the signed HTTP client: serve the
+/// no-canonical-advertisement document so NIP-98 signing stays on the
+/// transport host (d4cbcc9ef pattern — same law as the other harnesses).
+async fn info() -> Response {
+    Json(serde_json::json!({})).into_response()
+}
+
 async fn server() -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let state = ServerState {
@@ -140,6 +147,7 @@ async fn server() -> Server {
         .route("/upload", put(upload))
         .route("/events", post(publish))
         .route("/query", post(query))
+        .route("/info", get(info))
         .with_state(state.clone());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Server { state, task }

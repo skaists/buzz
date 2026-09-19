@@ -25,6 +25,20 @@ test.beforeEach(async ({ page }) => {
       status: 200,
     });
   });
+  // Canonical-origin preflight (invites.ts invitePost): the signed mint
+  // resolves GET /info on the transport host before its NIP-98 POST and
+  // fail-closes when the document is unreadable. In mock mode no relay
+  // listens behind the mock host, so serve the no-canonical-advertisement
+  // document ({}): signing stays on the transport host and the mint behaves
+  // exactly as before the canonical-origin contract. Mirrors the Rust
+  // harness cures from d4cbcc9ef (same law, same document).
+  await page.route("**/info", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {},
+      status: 200,
+    });
+  });
 });
 
 test("copies a freshly minted invite link from the link field", async ({

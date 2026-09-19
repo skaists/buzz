@@ -11,6 +11,13 @@ async fn http_relay() -> (
     let (sent, received) = mpsc::channel(4);
     let router = Router::new()
         .route(
+            "/info",
+            // Canonical-origin preflight for the signed HTTP client: the
+            // no-canonical-advertisement document keeps NIP-98 signing on
+            // the transport host (d4cbcc9ef pattern).
+            axum::routing::get(|| async { Json(serde_json::json!({})) }),
+        )
+        .route(
             "/query",
             post(|| async {
                 (
