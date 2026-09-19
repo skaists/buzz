@@ -263,20 +263,20 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
-    ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
+    ("src/relay.rs", 2, 2),        // boundaries 2, 4
+    ("src/relay/submit.rs", 1, 1), // boundaries 1 + 3 (shared funnel)
     // Boundary 5 + this stack's canonical/alias transport-signing tests
     // (`#[cfg(test)]` past line 892): four `transport_url` mock
     // constructions, one `posts[0].path` assertion, and one
     // `publish_transcript_event` helper call. Production publish still rides
     // the guarded boundary-5 site only.
     ("src/huddle/pipeline.rs", 6, 1),
-    ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
+    ("src/commands/team_snapshot.rs", 1, 1), // boundary 6
     // Boundary 7 + its in-file injection-test fixture URL + this stack's
     // `import_publish_boundary_tests` mod: two `transport_url` mock
     // constructions (~lines 997/1040). Production egress is boundary 7 only.
     ("src/commands/personas/snapshot/import.rs", 4, 1),
-    ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
+    ("src/native_websocket.rs", 0, 2), // boundary 8 (WS frames; no events URL)
     // Test-only fixtures — no production egress, no guard:
     ("src/relay_admission.rs", 1, 0),
     ("src/native_relay_client_transport_tests.rs", 1, 0),
