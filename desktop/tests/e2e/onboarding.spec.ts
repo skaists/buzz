@@ -4471,6 +4471,18 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
   const relayBUrl = "wss://relay-b.example.com";
   const relayBHttpUrl = "https://relay-b.example.com";
   const policyReceipt = "relay-signed-policy-receipt";
+  // Canonical-origin preflight for the signed claim (invites.ts
+  // invitePost): the stub relay-B host has no server behind it, so serve
+  // the no-canonical-advertisement document ({}) and keep NIP-98 signing
+  // on the transport host. Scoped to the stub host only — the real
+  // integration relay keeps serving its own /info.
+  await page.route(`${relayBHttpUrl}/info`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: "{}",
+    });
+  });
   await page.route(`${relayBHttpUrl}/api/join-policy`, async (route) => {
     await route.fulfill({
       status: 200,
