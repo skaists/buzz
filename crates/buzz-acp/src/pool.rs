@@ -2045,7 +2045,7 @@ pub async fn run_prompt_task(
         // Try startup cache first; lazy-fetch via REST for dynamic channels.
         let channel_info = ctx.channel_info.resolve(b.channel_id).await;
 
-        let conversation_context = if ctx.context_message_limit > 0 {
+        let conversation_context = if context_fetch_enabled(ctx.context_message_limit) {
             fetch_conversation_context(b, &channel_info, &ctx).await
         } else {
             None
@@ -2959,15 +2959,22 @@ fn conversation_context_delta(
     delivered: &HashSet<String>,
     triggering: &HashSet<String>,
 ) -> Option<ConversationContext> {
+    // Ported from upstream: removing prior-session messages shrinks the
+    // visible window below the fetched history, so the prompt must disclose
+    // truncation instead of presenting the reduced set as complete.
     let filter = |messages: Vec<ContextMessage>| {
-        messages
+        let omitted_from_prior_session = messages
+            .iter()
+            .any(|message| !message.event_id.is_empty() && delivered.contains(&message.event_id));
+        let messages = messages
             .into_iter()
             .filter(|message| {
                 message.event_id.is_empty()
                     || (!delivered.contains(&message.event_id)
                         && !triggering.contains(&message.event_id))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (messages, omitted_from_prior_session)
     };
 
     match context? {
@@ -2976,11 +2983,11 @@ fn conversation_context_delta(
             total,
             truncated,
         } => {
-            let messages = filter(messages);
+            let (messages, omitted_from_prior_session) = filter(messages);
             (!messages.is_empty()).then_some(ConversationContext::Thread {
                 messages,
                 total,
-                truncated,
+                truncated: truncated || omitted_from_prior_session,
             })
         }
         ConversationContext::Dm {
@@ -2988,11 +2995,11 @@ fn conversation_context_delta(
             total,
             truncated,
         } => {
-            let messages = filter(messages);
+            let (messages, omitted_from_prior_session) = filter(messages);
             (!messages.is_empty()).then_some(ConversationContext::Dm {
                 messages,
                 total,
-                truncated,
+                truncated: truncated || omitted_from_prior_session,
             })
         }
     }
@@ -3007,6 +3014,13 @@ fn conversation_context_delta(
 ///
 /// For batches with multiple events, thread context is fetched for the **last**
 /// reply event only (most recent = most likely to need a response).
+/// Whether automatic conversation-context fetching is enabled for this limit.
+/// `BUZZ_ACP_CONTEXT_MESSAGE_LIMIT = 0` is the documented off switch; this is
+/// a message-count gate only and never touches the token-context setting.
+fn context_fetch_enabled(limit: u32) -> bool {
+    limit > 0
+}
+
 async fn fetch_conversation_context(
     batch: &FlushBatch,
     channel_info: &Option<PromptChannelInfo>,
@@ -3024,9 +3038,23 @@ async fn fetch_conversation_context(
     let last_event = batch.events.last()?;
     let tags = crate::queue::parse_thread_tags(&last_event.event);
     if let Some(root_id) = tags.root_event_id {
+        // Structural ancestors of the triggering events: every distinct
+        // parent id in the batch that is not the root. Pinned into the
+        // context window so a deep parent chain survives the newest-N cap.
+        let mut pinned: Vec<String> = Vec::new();
+        for event in &batch.events {
+            let t = crate::queue::parse_thread_tags(&event.event);
+            if let Some(parent) = t.parent_event_id {
+                if parent != root_id && !pinned.contains(&parent) {
+                    pinned.push(parent);
+                }
+            }
+        }
+        pinned.truncate(MAX_PINNED_ANCESTORS);
         return fetch_thread_context(
             batch.channel_id,
             &root_id,
+            &pinned,
             limit,
             ctx.agent_keys.public_key(),
             &ctx.rest_client,
@@ -3206,6 +3234,7 @@ async fn fetch_prompt_profile_lookup(
 async fn fetch_thread_context(
     channel_id: Uuid,
     root_event_id: &str,
+    pinned_event_ids: &[String],
     limit: u32,
     agent_pubkey: nostr::PublicKey,
     rest: &RestClient,
@@ -3213,6 +3242,7 @@ async fn fetch_thread_context(
     fetch_thread_context_with(
         channel_id,
         root_event_id,
+        pinned_event_ids,
         limit,
         agent_pubkey,
         |filters| async move { rest.query(&filters).await },
@@ -3224,6 +3254,7 @@ async fn fetch_thread_context(
 async fn fetch_thread_context_with<Query, QueryFut, Count, CountFut>(
     channel_id: Uuid,
     root_event_id: &str,
+    pinned_event_ids: &[String],
     limit: u32,
     agent_pubkey: nostr::PublicKey,
     query: Query,
@@ -3249,12 +3280,33 @@ where
         return None;
     }
 
+    // Structural ancestors the caller needs preserved (e.g. the triggering
+    // event's direct parent). Each is validated hex and capped so a malformed
+    // event cannot explode the filter list; the root itself is fetched by its
+    // own filter and never needs pinning.
+    let pinned: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        pinned_event_ids
+            .iter()
+            .filter(|id| {
+                id.len() == 64
+                    && id.chars().all(|c| c.is_ascii_hexdigit())
+                    && id.as_str() != root_event_id
+                    && seen.insert(id.to_ascii_lowercase())
+            })
+            .take(MAX_PINNED_ANCESTORS)
+            .cloned()
+            .collect()
+    };
+
     let e_tag = SingleLetterTag::lowercase(Alphabet::E);
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
     let ch_str = channel_id.to_string();
 
-    // Three filters: (1) root event by ID, (2) recent replies with #e=root +
-    // #h=channel plus a sentinel, and (3) the agent's newest reply for pinning.
+    // Filters: (1) root event by ID, (2) recent replies with #e=root +
+    // #h=channel plus a sentinel, (3) the agent's newest reply for pinning,
+    // and (4) structural ancestors by ID so the parent chain survives the
+    // newest-N window (context contract: structure outranks nearby chatter).
     let root_filter = nostr::Filter::new().id(nostr::EventId::from_hex(root_event_id).ok()?);
     let replies_filter = nostr::Filter::new()
         .kinds([
@@ -3265,21 +3317,31 @@ where
         .custom_tags(h_tag, [ch_str.as_str()])
         .limit(limit.saturating_add(1) as usize);
     let agent_reply_filter = replies_filter.clone().author(agent_pubkey).limit(1);
+    let mut pinned_filters: Vec<nostr::Filter> = Vec::new();
+    for id in &pinned {
+        if let Ok(event_id) = nostr::EventId::from_hex(id) {
+            pinned_filters.push(
+                nostr::Filter::new()
+                    .id(event_id)
+                    .kinds([
+                        nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+                        nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+                    ]),
+            );
+        }
+    }
 
     let context = fetch_with_retry(|| async {
-        match timeout(
-            CONTEXT_FETCH_TIMEOUT,
-            query(vec![
-                root_filter.clone(),
-                replies_filter.clone(),
-                agent_reply_filter.clone(),
-            ]),
-        )
-        .await
-        {
-            Ok(Ok(json)) => {
-                parse_nostr_thread_response_with_meta(json, root_event_id, limit, &agent_pubkey)
-            }
+        let mut filters = vec![root_filter.clone(), replies_filter.clone(), agent_reply_filter.clone()];
+        filters.extend(pinned_filters.iter().cloned());
+        match timeout(CONTEXT_FETCH_TIMEOUT, query(filters)).await {
+            Ok(Ok(json)) => parse_nostr_thread_response_with_meta(
+                json,
+                root_event_id,
+                &pinned,
+                limit,
+                &agent_pubkey,
+            ),
             Ok(Err(e)) => {
                 tracing::warn!(
                     channel_id = %channel_id,
@@ -3538,7 +3600,7 @@ fn parse_nostr_thread_response(
     limit: u32,
     agent_pubkey: &nostr::PublicKey,
 ) -> Option<ConversationContext> {
-    parse_nostr_thread_response_with_meta(json, root_event_id, limit, agent_pubkey)
+    parse_nostr_thread_response_with_meta(json, root_event_id, &[], limit, agent_pubkey)
         .map(|parsed| parsed.context)
 }
 
@@ -3547,9 +3609,15 @@ struct ParsedThreadContext {
     root_present: bool,
 }
 
+/// At most this many structural ancestors are pinned into the displayed
+/// window. The cap keeps a malformed triggering event from exploding the
+/// id-filter list; the root is fetched by its own filter and never pinned.
+const MAX_PINNED_ANCESTORS: usize = 3;
+
 fn parse_nostr_thread_response_with_meta(
     json: serde_json::Value,
     root_event_id: &str,
+    pinned_event_ids: &[String],
     limit: u32,
     agent_pubkey: &nostr::PublicKey,
 ) -> Option<ParsedThreadContext> {
@@ -3600,6 +3668,27 @@ fn parse_nostr_thread_response_with_meta(
             reply_msgs.sort_by_key(|(_, ts, _, _)| *ts);
             if let Some(oldest) = reply_msgs.first_mut() {
                 *oldest = agent_reply;
+            }
+        }
+    }
+
+    // Structural ancestors (e.g. the trigger's direct parent) must survive the
+    // newest-N cap: context contract — conversation structure outranks nearby
+    // chatter. Same swap shape as the agent-reply pin: replace the oldest
+    // displayed reply, never widen the bounded window.
+    for pinned_id in pinned_event_ids {
+        // Fetch the pinned message from the raw events if it was truncated out.
+        if !reply_msgs.iter().any(|(id, _, _, _)| id == pinned_id) {
+            if let Some(ev) = events.iter().find(|ev| {
+                ev.get("id").and_then(|v| v.as_str()) == Some(pinned_id.as_str())
+            }) {
+                if let Some(msg) = json_to_context_message(ev) {
+                    let ts = ev.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                    reply_msgs.sort_by_key(|(_, ts, _, _)| *ts);
+                    if let Some(oldest) = reply_msgs.first_mut() {
+                        *oldest = (pinned_id.clone(), ts, false, msg);
+                    }
+                }
             }
         }
     }
@@ -5099,6 +5188,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent_pubkey,
             move |filters| {
@@ -5156,6 +5246,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
@@ -5208,6 +5299,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
@@ -5260,6 +5352,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
@@ -5321,6 +5414,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
@@ -5394,6 +5488,7 @@ mod tests {
         let ctx = fetch_thread_context_with(
             channel_id,
             root_id,
+            &[],
             2,
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
@@ -6213,7 +6308,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].event_id, "new");
                 assert_eq!(total, 3);
-                assert!(!truncated);
+                // Ported upstream contract: a delivered event was omitted, so
+                // the reduced window must disclose truncation.
+                assert!(truncated);
             }
             _ => panic!("expected thread context"),
         }
@@ -8137,5 +8234,294 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+}
+// ── Context-selection contract tests (2026-09-19 context-bug brief) ──────────
+// Cases A–H from the founder brief, written RED-first against the installed
+// lineage (codex/nip42-ws-query-fix). C2 and E are the two fixes: ancestor
+// pinning (no upstream equivalent exists) and the delivery-delta port
+// (upstream has it; this is the minimal upstream-aligned port).
+mod context_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn thread_event(id: &str, pubkey: &str, content: &str, created_at: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "pubkey": pubkey,
+            "content": content,
+            "created_at": created_at,
+        })
+    }
+
+    fn agent() -> nostr::Keys {
+        nostr::Keys::generate()
+    }
+
+    fn hex_id(n: u64) -> String {
+        format!("{n:064}")
+    }
+
+    // root (REQUIRED_RULE_A) + deep parent (REQUIRED_RULE_B) + 19 newer chatter
+    // replies. The parent at ts 2000 sits outside any newest-12 window.
+    fn long_thread(root_id: &str, parent_id: &str) -> serde_json::Value {
+        let mut events = vec![thread_event(root_id, "rootpub", "REQUIRED_RULE_A root", 1000)];
+        events.push(thread_event(parent_id, "humanpub", "REQUIRED_RULE_B parent", 2000));
+        for i in 0..19u64 {
+            events.push(thread_event(
+                &hex_id(0x1000 + i),
+                "humanpub",
+                &format!("chatter {i}"),
+                3000 + i,
+            ));
+        }
+        json!(events)
+    }
+
+    // A: 5-message thread (< limit) — complete, root present, truncated=false.
+    #[tokio::test]
+    async fn a_short_thread_complete() {
+        let root_id = hex_id(1);
+        let json = json!([
+            thread_event(&root_id, "rootpub", "root", 1000),
+            thread_event(&hex_id(0xa), "p1", "r1", 2000),
+            thread_event(&hex_id(0xb), "p2", "r2", 3000),
+            thread_event(&hex_id(0xc), "p3", "r3", 4000),
+            thread_event(&hex_id(0xd), "p4", "r4", 5000),
+        ]);
+        let ctx = fetch_thread_context_with(
+            Uuid::new_v4(),
+            &root_id,
+            &[],
+            12,
+            agent().public_key(),
+            move |_f| std::future::ready(Ok(json.clone())),
+            |_f| std::future::ready(Ok(json!({"count": 0}))),
+        )
+        .await
+        .expect("ctx");
+        match ctx {
+            ConversationContext::Thread { messages, truncated, total } => {
+                assert_eq!(messages.len(), 5);
+                assert_eq!(messages[0].content, "root");
+                assert!(!truncated);
+                assert_eq!(total, 5);
+            }
+            _ => panic!("thread"),
+        }
+    }
+
+    // B: 20-reply thread, limit 12 — root pinned + newest 12, truncated=true.
+    #[tokio::test]
+    async fn b_long_thread_root_and_tail_truncated() {
+        let root_id = hex_id(1);
+        let parent_id = hex_id(2);
+        let json = long_thread(&root_id, &parent_id);
+        let ctx = fetch_thread_context_with(
+            Uuid::new_v4(),
+            &root_id,
+            &[],
+            12,
+            agent().public_key(),
+            move |_f| std::future::ready(Ok(json.clone())),
+            |_f| std::future::ready(Ok(json!({"count": 19}))),
+        )
+        .await
+        .expect("ctx");
+        match ctx {
+            ConversationContext::Thread { messages, total, truncated } => {
+                assert!(truncated);
+                assert_eq!(messages.len(), 13); // root + 12 replies
+                assert_eq!(messages[0].content, "REQUIRED_RULE_A root");
+                assert_eq!(total, 21); // sentinel-proven: root + 20 replies
+            }
+            _ => panic!("thread"),
+        }
+    }
+
+    // C1 (characterization; PASSES on unfixed code, documents the defect):
+    // without pinning, a deep parent carrying REQUIRED_RULE_B is dropped.
+    #[tokio::test]
+    async fn c1_without_pin_deep_parent_is_dropped() {
+        let root_id = hex_id(1);
+        let parent_id = hex_id(2);
+        let json = long_thread(&root_id, &parent_id);
+        let ctx = fetch_thread_context_with(
+            Uuid::new_v4(),
+            &root_id,
+            &[],
+            12,
+            agent().public_key(),
+            move |_f| std::future::ready(Ok(json.clone())),
+            |_f| std::future::ready(Ok(json!({"count": 19}))),
+        )
+        .await
+        .expect("ctx");
+        match ctx {
+            ConversationContext::Thread { messages, .. } => {
+                assert!(
+                    !messages.iter().any(|m| m.content.contains("REQUIRED_RULE_B")),
+                    "characterization: deep parent IS currently dropped"
+                );
+            }
+            _ => panic!("thread"),
+        }
+    }
+
+    // C2 (the fix): with ancestor pinning, the parent survives the cap, and
+    // the pin REPLACES chatter rather than widening the bounded window.
+    #[tokio::test]
+    async fn c2_with_pin_parent_survives_cap() {
+        let root_id = hex_id(1);
+        let parent_id = hex_id(2);
+        let json = long_thread(&root_id, &parent_id);
+        let ctx = fetch_thread_context_with(
+            Uuid::new_v4(),
+            &root_id,
+            &[parent_id.to_string()],
+            12,
+            agent().public_key(),
+            move |_f| std::future::ready(Ok(json.clone())),
+            |_f| std::future::ready(Ok(json!({"count": 19}))),
+        )
+        .await
+        .expect("ctx");
+        match ctx {
+            ConversationContext::Thread { messages, truncated, .. } => {
+                assert!(truncated);
+                assert!(
+                    messages.iter().any(|m| m.content.contains("REQUIRED_RULE_B")),
+                    "pinned ancestor must survive the window cap"
+                );
+                assert_eq!(messages.len(), 13, "pin replaces chatter, never widens the window");
+            }
+            _ => panic!("thread"),
+        }
+    }
+
+    // D: selection is stateless across rotation — identical inputs yield an
+    // identical window, so a fresh/rehydrated session sees the same structure.
+    #[tokio::test]
+    async fn d_rotation_selection_is_deterministic() {
+        let root_id = hex_id(1);
+        let parent_id = hex_id(2);
+        let json = long_thread(&root_id, &parent_id);
+        let fmt = |c: Option<ConversationContext>| match c {
+            Some(ConversationContext::Thread { messages, total, truncated }) => format!(
+                "{:?}|{total}|{truncated}",
+                messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>()
+            ),
+            _ => "none".into(),
+        };
+        let json_a = json.clone();
+        let json_b = json.clone();
+        let c1 = fetch_thread_context_with(
+                Uuid::new_v4(),
+                &root_id,
+                &[parent_id.to_string()],
+                12,
+                agent().public_key(),
+                move |_f| std::future::ready(Ok(json_a.clone())),
+                |_f| std::future::ready(Ok(json!({"count": 19}))),
+            ).await;
+        let c2 = fetch_thread_context_with(
+                Uuid::new_v4(),
+                &root_id,
+                &[parent_id.to_string()],
+                12,
+                agent().public_key(),
+                move |_f| std::future::ready(Ok(json_b.clone())),
+                |_f| std::future::ready(Ok(json!({"count": 19}))),
+            ).await;
+        assert_eq!(fmt(c1), fmt(c2));
+    }
+
+    // E: delivery-delta — delivered context ids are removed for a live session,
+    // triggering ids never duplicate the [Event] block, and omitting
+    // prior-session messages re-flags truncation. (Already in the installed
+    // lineage; this locks the contract.)
+    #[test]
+    fn e_delta_removes_delivered_and_reflags_truncated() {
+        let ctx = ConversationContext::Thread {
+            messages: vec![
+                ContextMessage { event_id: "a".into(), pubkey: "p".into(), timestamp: "t".into(), content: "old delivered".into() },
+                ContextMessage { event_id: "b".into(), pubkey: "p".into(), timestamp: "t".into(), content: "new".into() },
+            ],
+            total: 10,
+            truncated: false,
+        };
+        let delivered: HashSet<String> = ["a".into()].into();
+        let triggering: HashSet<String> = ["t1".into()].into();
+        match conversation_context_delta(Some(ctx), &delivered, &triggering) {
+            Some(ConversationContext::Thread { messages, truncated, .. }) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].event_id, "b");
+                assert!(truncated, "omitted prior-session messages must re-flag truncation");
+            }
+            _ => panic!("delta output"),
+        }
+        let ctx2 = ConversationContext::Thread {
+            messages: vec![ContextMessage { event_id: "a".into(), pubkey: "p".into(), timestamp: "t".into(), content: "x".into() }],
+            total: 1,
+            truncated: false,
+        };
+        assert!(conversation_context_delta(Some(ctx2), &delivered, & [].into()).is_none());
+    }
+
+    // F: DM context is bounded, keeps the newest messages, flags truncation.
+    #[test]
+    fn f_dm_bounded_and_flagged() {
+        let events: Vec<serde_json::Value> = (0..12u64)
+            .map(|i| thread_event(&hex_id(i), "peer", &format!("dm {i}"), 1000 + i))
+            .collect();
+        match parse_nostr_dm_response(json!(events), 12).expect("dm ctx") {
+            ConversationContext::Dm { messages, total, truncated } => {
+                assert_eq!(messages.len(), 12);
+                assert!(truncated, "at-limit flags truncated (conservative disclosure)");
+                assert_eq!(total, 13, "sentinel total = fetched + 1");
+                assert!(
+                    messages.iter().any(|m| m.content == "dm 11"),
+                    "newest message must be included"
+                );
+                assert!(messages.iter().any(|m| m.content == "dm 0"));
+            }
+            _ => panic!("dm"),
+        }
+    }
+
+    // G: limit=0 disables automatic context fetching at the gate; the gate is
+    // the ONLY place 0 is interpreted, never the token-context setting.
+    #[test]
+    fn g_limit_zero_disables_fetch() {
+        assert!(!context_fetch_enabled(0));
+        assert!(context_fetch_enabled(1));
+        assert!(context_fetch_enabled(100));
+    }
+
+    // H: limit=100 (documented upper bound) parses without touching any
+    // token-context setting.
+    #[tokio::test]
+    async fn h_upper_bound_limit_100() {
+        let root_id = hex_id(1);
+        let parent_id = hex_id(2);
+        let json = long_thread(&root_id, &parent_id);
+        let ctx = fetch_thread_context_with(
+            Uuid::new_v4(),
+            &root_id,
+            &[],
+            100,
+            agent().public_key(),
+            move |_f| std::future::ready(Ok(json.clone())),
+            |_f| std::future::ready(Ok(json!({"count": 19}))),
+        )
+        .await
+        .expect("ctx");
+        match ctx {
+            ConversationContext::Thread { messages, truncated, .. } => {
+                assert_eq!(messages.len(), 21, "21-event thread fits under 100");
+                assert!(!truncated);
+            }
+            _ => panic!("thread"),
+        }
     }
 }
