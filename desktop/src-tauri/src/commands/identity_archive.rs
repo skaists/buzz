@@ -612,20 +612,22 @@ mod tests {
 
         let hits = std::sync::Arc::new(AtomicUsize::new(0));
         let route_hits = hits.clone();
-        let router = Router::new().route(
-            "/",
-            get(move || {
-                let self_hex = self_hex.clone();
-                let route_hits = route_hits.clone();
-                async move {
-                    route_hits.fetch_add(1, Ordering::SeqCst);
-                    match self_hex {
-                        Some(self_hex) => Ok(Json(serde_json::json!({ "self": self_hex }))),
-                        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+        let router = Router::new()
+            .route("/info", get(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/",
+                get(move || {
+                    let self_hex = self_hex.clone();
+                    let route_hits = route_hits.clone();
+                    async move {
+                        route_hits.fetch_add(1, Ordering::SeqCst);
+                        match self_hex {
+                            Some(self_hex) => Ok(Json(serde_json::json!({ "self": self_hex }))),
+                            None => Err(StatusCode::SERVICE_UNAVAILABLE),
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -807,6 +809,7 @@ mod tests {
             let snapshot_json = serde_json::to_value(&snapshot).unwrap();
 
             let router = Router::new()
+                .route("/info", get(|| async { Json(serde_json::json!({})) }))
                 .route(
                     "/",
                     get(move || {

@@ -1,6 +1,6 @@
 //! Exercise the production channel-list fetch over the native HTTP bridge.
 use super::*;
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -99,6 +99,7 @@ impl Relay {
         }));
         let router = Router::new()
             .route("/query", post(query))
+            .route("/info", get(|| async { Json(json!({})) }))
             .with_state(data.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

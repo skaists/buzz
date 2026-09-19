@@ -6,6 +6,32 @@ use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Read one full HTTP request (headers + content-length body) off the stream.
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    loop {
+        let mut buf = [0; 4096];
+        let count = stream.read(&mut buf).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&buf[..count]);
+        assert!(request.len() < 16384);
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap();
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    String::from_utf8(request).unwrap()
+}
+
 #[tokio::test]
 async fn presence_command_preserves_query_failure_and_successful_absence() {
     let _serial = TEST_SERIAL.lock().await;
@@ -23,29 +49,18 @@ async fn presence_command_preserves_query_failure_and_successful_absence() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            // Canonical-origin preflight: the signed HTTP client resolves the
+            // relay's /info document before its first NIP-98 call. Serve the
+            // no-canonical-advertisement document ({}), which keeps signing
+            // against the transport host, then answer the real query.
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut buf = [0; 4096];
-                let count = stream.read(&mut buf).await.unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&buf[..count]);
-                assert!(request.len() < 16384);
-                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-                    let length: usize = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("content-length:")
-                                .map(|v| v.trim().parse().unwrap())
-                        })
-                        .unwrap();
-                    if request.len() >= end + 4 + length {
-                        break;
-                    }
-                }
-            }
-            let request = String::from_utf8(request).unwrap();
+            let preflight = read_http_request(&mut stream).await;
+            assert!(preflight.starts_with("GET /info "));
+            let info = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            stream.write_all(info.as_bytes()).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
             assert!(request.starts_with("POST /query "));
             assert!(request.to_lowercase().contains("authorization: nostr "));
             assert!(request.contains("20001"));

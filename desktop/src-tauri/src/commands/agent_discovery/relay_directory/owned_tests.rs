@@ -48,6 +48,7 @@ async fn remote_owned_discovery_and_membership_do_not_require_local_records() {
     let query_events = events.clone();
     let query_log = queries.clone();
     let router = Router::new()
+        .route("/info", get(|| async { Json(serde_json::json!({})) }))
         .route(
             "/",
             get(move || {
