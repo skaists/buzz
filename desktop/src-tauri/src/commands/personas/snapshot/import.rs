@@ -1,6 +1,6 @@
 //! Import-side helpers for `buzz-agent-snapshot v1`.
 //!
-//! Extracted from `snapshot.rs` to keep that file under the 1000-line gate.
+//! Extracted from `snapshot.rs` to keep that file under the 1500-line gate.
 //! The Tauri commands here (`preview_agent_snapshot_import`,
 //! `confirm_agent_snapshot_import`) are re-exported from `snapshot.rs` and
 //! registered in `lib.rs` through the same `personas::` path as the export
@@ -21,7 +21,7 @@ use crate::{
         load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
         ManagedAgentRecord, RespondTo,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{effective_agent_relay_url, relay_ws_url_with_override},
     util::now_iso,
 };
 
@@ -557,12 +557,14 @@ pub async fn confirm_agent_snapshot_import(
 
         let now = now_iso();
         let persona_id = uuid::Uuid::new_v4().to_string();
-
         // Build persona from snapshot definition.
         let persona = AgentDefinition {
             id: persona_id.clone(),
             display_name: display_name.clone(),
             avatar_url: effective_avatar.clone(),
+            description: crate::managed_agents::effective_agent_description(
+                snapshot.profile.about.as_deref(),
+            ),
             system_prompt: snapshot
                 .definition
                 .system_prompt
@@ -578,10 +580,12 @@ pub async fn confirm_agent_snapshot_import(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             env_vars: std::collections::BTreeMap::new(),
             respond_to: respond_to_wire.clone(),
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             parallelism: minted_parallelism,
+            session_policy: snapshot.definition.session_policy,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -591,13 +595,16 @@ pub async fn confirm_agent_snapshot_import(
 
         // Enqueue the kind:30175 persona event via the retention path.
         super::super::pending::retain_persona_pending(&app, &state, &persona);
-
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            // Linked definitions remain the sole description authority. Do
+            // not persist a second instance copy that can go stale after an
+            // edit or survive a later definition deletion.
+            description: None,
             slug: None,
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),
@@ -616,6 +623,7 @@ pub async fn confirm_agent_snapshot_import(
             max_turn_duration_seconds: snapshot.definition.max_turn_duration_seconds,
             parallelism: minted_parallelism
                 .unwrap_or(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+            session_policy: snapshot.definition.session_policy,
             system_prompt: snapshot.definition.system_prompt.clone(),
             model: snapshot.definition.model.clone(),
             provider: snapshot.definition.provider.clone(),
@@ -626,6 +634,7 @@ pub async fn confirm_agent_snapshot_import(
             runtime_pid: None,
             backend: crate::managed_agents::BackendKind::Local,
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -648,10 +657,12 @@ pub async fn confirm_agent_snapshot_import(
             source_team: None,
             source_team_persona_slug: None,
             catalog_source: None,
+            team_catalog_source: None,
             definition_respond_to: respond_to_wire.clone(),
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,
             relay_mesh: None,
+            effort_level: None,
             runtime: snapshot.definition.runtime.clone(),
             name_pool: snapshot.definition.name_pool.clone(),
         };
@@ -676,16 +687,16 @@ pub async fn confirm_agent_snapshot_import(
     // ── Phase 3b: publish kind:0 profile (async, outside lock) ───────────────
     let relay_url =
         effective_agent_relay_url(&record.relay_url, &relay_ws_url_with_override(&state));
-    let profile_sync_error = sync_managed_agent_profile(
+    let profile_sync_error = crate::commands::agents::publish_persona_profile(
         &state,
-        &relay_url,
+        &record.relay_url,
         &agent_keys,
         &display_name,
         effective_avatar.as_deref(),
+        &persona,
         auth_tag.as_deref(),
     )
-    .await
-    .err();
+    .await;
 
     // ── Phase 4: restore memory (async, outside lock) ─────────────────────────
     let memory_total = snapshot.memory.entries.len();
@@ -816,7 +827,9 @@ pub(crate) async fn submit_engram_event(
     // gate may hold for up to MAX_HINT_SECONDS (300s). Building auth before the
     // wait produces a stale `created_at` that the relay will reject.
     crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, url, event_json)?;
+    // Sign the canonical identity; POST the transport road (alias-host law).
+    let sign_url = crate::relay::canonical_sign_url(state, url).await?;
+    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &sign_url, event_json)?;
     let mut request = state
         .http_client
         .post(url)
@@ -886,112 +899,155 @@ mod egress_guard_tests {
 }
 
 #[cfg(test)]
-mod import_avatar_tests {
-    use super::materialize_import_avatar;
-    use std::cell::Cell;
+#[path = "import_avatar_tests.rs"]
+mod import_avatar_tests;
+
+/// Caller-level regressions for the persona-import publish boundary: these
+/// tests invoke the ACTUAL submit_engram_event function with synthetic
+/// keys and an isolated AppState whose HTTP client points at a loopback
+/// server that captures the incoming request. The NIP-98 event is decoded
+/// to verify the canonical `u` tag while the POST rides the alias.
+#[cfg(test)]
+mod import_publish_boundary_tests {
+    use crate::app_state::build_app_state;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        method: String,
+        authorization: Option<String>,
+    }
+
+    struct SpyServer {
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        addr: String,
+    }
+
+    impl SpyServer {
+        fn start(info_body: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let req_clone = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut buf = [0u8; 16384];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (head, _body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                    let mut lines = head.lines();
+                    let request_line = lines.next().unwrap_or_default();
+                    let auth = lines.find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        if lower.starts_with("authorization: ") {
+                            Some(l[15..].to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    let parts: Vec<&str> = request_line.split_whitespace().collect();
+                    let method = parts.first().copied().unwrap_or_default().to_string();
+                    let path = parts.get(1).copied().unwrap_or_default().to_string();
+                    let is_info = path.ends_with("/info");
+                    req_clone.lock().unwrap().push(CapturedRequest {
+                        method,
+                        authorization: auth,
+                    });
+                    let (status, resp_body) = if is_info {
+                        ("200 OK", info_body.clone())
+                    } else {
+                        ("200 OK", r#"{"accepted":true}"#.to_string())
+                    };
+                    let len = resp_body.len();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{resp_body}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            SpyServer {
+                requests,
+                addr: format!("http://{addr}"),
+            }
+        }
+
+        fn post_requests(&self) -> Vec<CapturedRequest> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .cloned()
+                .collect()
+        }
+    }
 
     #[tokio::test]
-    async fn inline_avatar_is_uploaded_and_replaced_with_hosted_url() {
-        let uploaded = Cell::new(false);
-        let result = materialize_import_avatar(
-            Some("data:image/png;base64,iVBORw0KGgo="),
-            Some("https://sender.invalid/avatar.png"),
-            |bytes| {
-                uploaded.set(true);
-                async move {
-                    assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
-                    Ok("https://relay.example/media/avatar.png".to_string())
-                }
-            },
-        )
-        .await
-        .unwrap();
+    async fn import_valid_metadata_signs_canonical_posts_alias() {
+        let server =
+            SpyServer::start(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
+        let state = Arc::new(build_app_state());
+        let agent_keys = nostr::Keys::generate();
+        let event_json = br#"{"kind":9,"content":"test"}"#;
+        let transport_url = format!("{}/events", server.addr);
 
-        assert!(uploaded.get());
-        assert_eq!(
-            result.as_deref(),
-            Some("https://relay.example/media/avatar.png")
+        // Invoke the ACTUAL submit_engram_event — the same function the
+        // persona-import caller uses for memory events.
+        let result =
+            super::submit_engram_event(&state, &agent_keys, event_json, &transport_url, None).await;
+        assert!(result.is_ok(), "valid metadata must submit, got {result:?}");
+
+        let posts = server.post_requests();
+        assert_eq!(posts.len(), 1, "exactly one POST to the transport");
+
+        // Decode the NIP-98 event from the Authorization header
+        let auth = posts[0]
+            .authorization
+            .as_ref()
+            .expect("Authorization header present");
+        assert!(auth.starts_with("Nostr "), "NIP-98 scheme");
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let event_json = auth.strip_prefix("Nostr ").unwrap();
+        let decoded = B64.decode(event_json).expect("valid base64");
+        let event: serde_json::Value = serde_json::from_slice(&decoded).expect("valid JSON");
+        let tags = event["tags"].as_array().expect("tags array");
+        let u_tag = tags
+            .iter()
+            .find(|t| t[0] == "u")
+            .and_then(|t| t[1].as_str())
+            .expect("u tag present");
+        assert!(
+            u_tag.starts_with("https://beehivenature.buzz/"),
+            "u tag must name the canonical origin, got {u_tag}"
+        );
+        assert!(
+            !u_tag.contains("127.0.0.1"),
+            "u tag must NOT name the transport/alias"
         );
     }
 
     #[tokio::test]
-    async fn hosted_avatar_skips_upload() {
+    async fn import_invalid_metadata_no_signing_no_post() {
+        let server = SpyServer::start(r#"{"push":{"origin":null}}"#.to_string());
+        let state = Arc::new(build_app_state());
+        let agent_keys = nostr::Keys::generate();
+        let event_json = br#"{"kind":9,"content":"test"}"#;
+        let transport_url = format!("{}/events", server.addr);
+
         let result =
-            materialize_import_avatar(None, Some("https://sender.example/avatar.png"), |_| async {
-                panic!("hosted avatars must not be uploaded")
-            })
-            .await
-            .unwrap();
+            super::submit_engram_event(&state, &agent_keys, event_json, &transport_url, None).await;
+        assert!(result.is_err(), "null origin must refuse before signing");
 
-        assert_eq!(result.as_deref(), Some("https://sender.example/avatar.png"));
-    }
-
-    #[tokio::test]
-    async fn relay_sized_inline_avatar_becomes_bounded_signed_profile() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        use image::ImageEncoder;
-        use nostr::JsonUtil;
-
-        let mut pixels = vec![0_u8; 512 * 512 * 4];
-        let mut seed = 0x1234_5678_u32;
-        for byte in &mut pixels {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            *byte = seed as u8;
-        }
-        let mut source = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut source)
-            .write_image(&pixels, 512, 512, image::ExtendedColorType::Rgba8)
-            .unwrap();
-        assert!(source.len() > 256 * 1024);
-        let data_url = format!("data:image/png;base64,{}", STANDARD.encode(&source));
-        assert!(data_url.len() > 256 * 1024);
-
-        let avatar = materialize_import_avatar(Some(&data_url), None, |bytes| async move {
-            let mime = crate::commands::media::detect_and_validate_mime(&bytes)?;
-            assert_eq!(mime, "image/png");
-            let sanitized = crate::commands::media::sanitize_image_for_upload(bytes, &mime)?;
-            image::load_from_memory(&sanitized).map_err(|error| error.to_string())?;
-            Ok("https://relay.example/media/avatar.png".to_string())
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        let event =
-            crate::events::build_profile(Some("Imported agent"), None, Some(&avatar), None, None)
-                .unwrap()
-                .sign_with_keys(&nostr::Keys::generate())
-                .unwrap();
-        assert!(event.content.len() < 64 * 1024);
-        assert!(!event.content.contains("data:image/"));
-        assert!(event
-            .content
-            .contains("https://relay.example/media/avatar.png"));
-        assert!(event.as_json().len() < 256 * 1024);
-    }
-
-    #[tokio::test]
-    async fn upload_failure_aborts_avatar_materialization() {
-        let result = materialize_import_avatar(
-            Some("data:image/png;base64,iVBORw0KGgo="),
-            None,
-            |_| async { Err("relay upload failed".to_string()) },
-        )
-        .await;
-
-        assert_eq!(result.unwrap_err(), "relay upload failed");
-    }
-
-    #[tokio::test]
-    async fn malformed_inline_avatar_fails_before_upload() {
-        let result =
-            materialize_import_avatar(Some("data:image/png;base64,not-base64!"), None, |_| async {
-                panic!("malformed avatars must not be uploaded")
-            })
-            .await;
-
-        assert_eq!(result.unwrap_err(), "Snapshot avatar data is malformed.");
+        let posts = server.post_requests();
+        assert_eq!(
+            posts.len(),
+            0,
+            "ZERO POST requests — no signing/POST on invalid metadata"
+        );
     }
 }

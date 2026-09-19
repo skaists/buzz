@@ -32,6 +32,18 @@ test.beforeEach(async ({ page }, testInfo) => {
       status: 200,
     });
   });
+  // Canonical-origin preflight (invites.ts invitePost): serve the
+  // no-canonical-advertisement document ({}) so the signed mint resolves
+  // GET /info against the mock transport host instead of fail-closing on
+  // an unreachable one. Same law and document as the Rust harness cures
+  // (d4cbcc9ef); see invite-link-copy.spec.ts.
+  await page.route("**/info", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: {},
+      status: 200,
+    });
+  });
   await page.goto("/");
   await openSettings(page, "community-members");
 });

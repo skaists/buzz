@@ -17,6 +17,10 @@
 //! are driven by user-initiated file transfers rather than bridge event flow,
 //! and they have independent retry logic.
 //!
+//! The native WS client also arms this gate for the explicit
+//! `shared admission unavailable` signal. Quota/concurrency CLOSEDs stay on
+//! WebSocket; they do not consume the HTTP bridge's separate ApiCalls budget.
+//!
 //! **Community scope:** the gate is reset on every `apply_workspace` call,
 //! mirroring the TS gate's `resetRateLimitGate()` on community switch in
 //! `useCommunityInit.ts`. A 429 from community A cannot stall community B.
@@ -36,8 +40,7 @@ const DEFAULT_RATE_LIMIT_SECONDS: u64 = 10;
 /// Prevents an untrusted relay from pinning traffic for an unreasonable window
 /// or overflowing `Instant` arithmetic.
 /// Exposed `pub` so `relay.rs` can clamp the hint before embedding it in the
-/// returned error string — ensuring every consumer (Rust gate and TS gate via
-/// `applyTauriRateLimitIfNeeded`) sees the same capped value.
+/// returned error string, matching the window the native HTTP gate honours.
 pub const MAX_HINT_SECONDS: u64 = 300;
 
 static GATE_EXPIRY: Mutex<Option<Instant>> = Mutex::new(None);
@@ -270,7 +273,9 @@ mod tests {
         let _serial = TEST_SERIAL.lock().await;
         reset_rate_limit_gate();
 
-        // The loopback server answers every request with 200 [].
+        // The loopback server answers the signed client's GET /info preflight
+        // with the no-canonical-advertisement document ({}) and every other
+        // request with 200 [].
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || loop {
@@ -279,9 +284,12 @@ mod tests {
             };
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
+            let is_info_preflight = buf.starts_with(b"GET /info ");
+            let body: &[u8] = if is_info_preflight { b"{}" } else { b"[]" };
             let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
             );
+            let _ = stream.write_all(body);
             let _ = stream.flush();
         });
 
@@ -444,9 +452,20 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // First request → 429 with a 1s retry hint; every later request → 200 [].
+        // Connection script: the signed client preflights GET /info before
+        // its first NIP-98 POST on this transport base and caches the
+        // decision (relay.rs CANONICAL_SIGNING_BASES), so command 2 re-POSTs
+        // without a second preflight. conn 1 = /info -> the
+        // no-canonical-advertisement document {}; conn 2 = command 1's POST
+        // -> 429 with a 1s retry hint (arms the admission gate); conn 3 =
+        // command 2's POST after the gate wait -> 200 [].
         let server = std::thread::spawn(move || {
             let responses = [
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 Connection: close\r\n\r\n\
+                 {}",
                 "HTTP/1.1 429 Too Many Requests\r\n\
                  Content-Type: application/json\r\n\
                  Content-Length: 53\r\n\
@@ -458,13 +477,13 @@ mod tests {
                  Connection: close\r\n\r\n\
                  []",
             ];
-            for i in 0..2 {
+            for i in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(responses[i.min(1)].as_bytes());
+                let _ = stream.write_all(responses[i.min(2)].as_bytes());
                 let _ = stream.flush();
             }
         });
