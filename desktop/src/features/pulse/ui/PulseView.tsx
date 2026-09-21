@@ -19,6 +19,11 @@ import {
   useTimelineQuery,
 } from "@/features/pulse/hooks";
 import { groupAgentNotes } from "@/features/pulse/lib/groupAgentNotes";
+import {
+  describeQueryError,
+  describeTimelineState,
+  filterPulseNotes,
+} from "@/features/pulse/lib/pulseTimeline";
 import { usePulseNoteActions } from "@/features/pulse/lib/useNoteActions";
 import { AgentActivityCard } from "@/features/pulse/ui/AgentActivityCard";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
@@ -51,6 +56,32 @@ function EmptyState({ message }: { message: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-border/60 px-4 py-12 text-center">
       <p className="text-sm text-muted-foreground">{message}</p>
+    </div>
+  );
+}
+
+function ErrorState({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div
+      className="flex flex-1 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-destructive/40 px-4 py-12 text-center"
+      role="alert"
+    >
+      <p className="text-sm text-destructive">
+        Could not load notes: {message}
+      </p>
+      <button
+        className="rounded-full bg-foreground/10 px-3 py-1 text-sm text-foreground transition-colors hover:bg-foreground/15"
+        onClick={onRetry}
+        type="button"
+      >
+        Retry
+      </button>
     </div>
   );
 }
@@ -143,7 +174,9 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
     [currentPubkey, peoplePubkeys, agentPubkeys],
   );
 
-  const everyoneQuery = useGlobalNotesQuery(activeTab === "everyone");
+  const everyoneQuery = useGlobalNotesQuery(
+    activeTab === "everyone" || activeTab === "search",
+  );
   const peopleQuery = useTimelineQuery(peoplePubkeys, activeTab === "people");
   const likedNotesQuery = useLikedNotesQuery(
     currentPubkey,
@@ -158,7 +191,7 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
   );
   const publishMutation = usePublishNoteMutation(currentPubkey);
   const visibleNotes: UserNote[] = React.useMemo(() => {
-    if (activeTab === "everyone") {
+    if (activeTab === "everyone" || activeTab === "search") {
       return everyoneQuery.data?.notes ?? [];
     }
     if (activeTab === "people") {
@@ -251,7 +284,27 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
           : activeTab === "agents"
             ? agentTimelineQuery
             : myNotesQuery;
-  const isLoading = activeQuery.isLoading;
+  const searchResults = React.useMemo(
+    () =>
+      activeTab === "search"
+        ? filterPulseNotes(visibleNotes, profiles, searchQuery)
+        : [],
+    [activeTab, visibleNotes, profiles, searchQuery],
+  );
+  const isSearching = activeTab === "search" && searchQuery.trim().length > 0;
+  const timelineNotes = activeTab === "search" ? searchResults : visibleNotes;
+  const timelineState = describeTimelineState({
+    isLoading: activeQuery.isLoading,
+    isError: activeQuery.isError,
+    count:
+      activeTab === "agents" ? agentNoteGroups.length : visibleNotes.length,
+  });
+  const queryErrorMessage = activeQuery.isError
+    ? describeQueryError(activeQuery.error)
+    : null;
+  const retryActiveQuery = () => {
+    void activeQuery.refetch();
+  };
 
   const emptyMessages: Record<PulseTab, string> = {
     search: "Search Pulse notes by author or text.",
@@ -266,8 +319,39 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
   };
 
   function renderTimeline() {
-    if (isLoading) return <TimelineSkeleton />;
+    if (timelineState === "loading") return <TimelineSkeleton />;
+    if (timelineState === "error") {
+      return (
+        <ErrorState
+          message={queryErrorMessage ?? ""}
+          onRetry={retryActiveQuery}
+        />
+      );
+    }
 
+    return (
+      <>
+        {queryErrorMessage !== null ? (
+          <div
+            className="mb-4 flex items-center justify-between gap-3 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            role="alert"
+          >
+            <span>Could not refresh notes: {queryErrorMessage}</span>
+            <button
+              className="shrink-0 underline"
+              onClick={retryActiveQuery}
+              type="button"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
+        {renderTimelineBody()}
+      </>
+    );
+  }
+
+  function renderTimelineBody() {
     if (activeTab === "agents") {
       return agentNoteGroups.length === 0 ? (
         <EmptyState message={emptyMessages.agents} />
@@ -290,13 +374,25 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
       );
     }
 
-    return visibleNotes.length === 0 ? (
+    if (activeTab === "search" && timelineNotes.length === 0) {
+      return (
+        <EmptyState
+          message={
+            timelineState === "empty"
+              ? emptyMessages.everyone
+              : `No Pulse notes match “${searchQuery.trim()}”.`
+          }
+        />
+      );
+    }
+
+    return timelineNotes.length === 0 ? (
       <EmptyState message={emptyMessages[activeTab]} />
     ) : (
       <VirtualizedList
         estimateSize={140}
         getItemKey={(note) => note.id}
-        items={visibleNotes}
+        items={timelineNotes}
         renderItem={(note) => (
           <div className="pb-4">
             <NoteCard
@@ -346,12 +442,22 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
           role="tabpanel"
         >
           {activeTab === "search" ? (
-            <div className="flex min-h-[calc(100vh-96px)] items-center justify-center">
+            <div
+              className={`flex items-center justify-center ${
+                isSearching ? "mb-7" : "min-h-[calc(100vh-96px)]"
+              }`}
+            >
               <div className="relative flex w-full max-w-xl flex-col items-center px-2">
                 <h2 className="mb-5 text-center text-2xl font-semibold tracking-tight text-foreground">
                   What are you looking for?
                 </h2>
-                <div className="relative w-full max-w-lg">
+                <form
+                  className="relative w-full max-w-lg"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    setSearchQuery((query) => query.trim());
+                  }}
+                >
                   <div className="relative rounded-full border border-foreground/10 bg-background/80 p-1 shadow-[0_12px_48px_rgba(0,0,0,0.12)] backdrop-blur-xl dark:border-white/10 dark:bg-white/[0.04] dark:shadow-[0_16px_70px_rgba(0,0,0,0.55)]">
                     <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground dark:text-white/55" />
                     <Input
@@ -365,12 +471,17 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
                     <button
                       aria-label="Search Pulse"
                       className="absolute right-1.5 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-foreground/10 text-foreground transition-colors hover:bg-foreground/15 dark:bg-white/85 dark:text-black dark:hover:bg-white"
-                      type="button"
+                      type="submit"
                     >
                       <Search className="h-4 w-4" />
                     </button>
                   </div>
-                </div>
+                </form>
+                {!isSearching ? (
+                  <p className="mt-4 text-center text-sm text-muted-foreground">
+                    {emptyMessages.search}
+                  </p>
+                ) : null}
               </div>
             </div>
           ) : activeTab !== "agents" ? (
@@ -417,7 +528,9 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
             </div>
           ) : null}
 
-          {activeTab !== "search" ? <div>{renderTimeline()}</div> : null}
+          {activeTab !== "search" || isSearching ? (
+            <div>{renderTimeline()}</div>
+          ) : null}
         </div>
       </div>
     </div>
