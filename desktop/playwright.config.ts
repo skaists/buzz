@@ -92,6 +92,7 @@ export default defineConfig({
         "**/reminders.spec.ts",
         "**/reminder-click-repro.spec.ts",
         "**/virtualization.spec.ts",
+        "**/pulse-truth.spec.ts",
         "**/scroll-history.spec.ts",
         "**/channel-dense-second-reach.spec.ts",
         "**/channel-window-mock-paging.spec.ts",
