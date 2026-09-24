@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{is_workflow_execution_kind, KIND_STREAM_MESSAGE};
 use buzz_core::tenant::CommunityId;
 use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
 use chrono::Utc;
@@ -354,6 +354,147 @@ impl ActionSink for RelayActionSink {
                     &stored_event,
                     kind_u32,
                     &author_pubkey_hex,
+                    None,
+                )
+                .await;
+            }
+
+            Ok(event_id_hex)
+        })
+    }
+
+    fn emit_workflow_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        kind: u32,
+        content: &str,
+        notify_pubkeys: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let content = content.to_owned();
+        let notify_pubkeys = notify_pubkeys.to_vec();
+
+        Box::pin(async move {
+            // Only workflow-execution kinds may travel this path: they are
+            // excluded from workflow triggering at kind level, so a lifecycle
+            // event can never re-enter the engine (WF-08 loop safety).
+            if !is_workflow_execution_kind(kind) {
+                return Err(ActionSinkError::InvalidInput(format!(
+                    "kind {kind} is not a workflow-execution kind"
+                )));
+            }
+            if content.trim().is_empty() {
+                return Err(ActionSinkError::EmptyContent);
+            }
+
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+
+            // Same tenant derivation as `send_message`: the run's community,
+            // never the deployment default.
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database(format!(
+                        "workflow run community {community_id} is not mapped to a host"
+                    ))
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+            let channel_id_canonical = channel_uuid.to_string();
+            let channel = state
+                .db
+                .get_channel(tenant.community(), channel_uuid)
+                .await
+                .map_err(|e| match &e {
+                    buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
+                        ActionSinkError::ChannelNotFound(channel_id_canonical.clone())
+                    }
+                    _ => ActionSinkError::Database(e.to_string()),
+                })?;
+            if channel.archived_at.is_some() {
+                return Err(ActionSinkError::ChannelArchived(
+                    channel_id_canonical.clone(),
+                ));
+            }
+
+            let mut tags = vec![
+                Tag::parse(["h", &channel_id_canonical])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("h tag: {e}")))?,
+                Tag::parse(["buzz:workflow", "true"])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
+            ];
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for pk in &notify_pubkeys {
+                let parsed = nostr::PublicKey::from_hex(pk).map_err(|e| {
+                    ActionSinkError::InvalidInput(format!("invalid notify pubkey: {e}"))
+                })?;
+                let hex = parsed.to_hex();
+                if seen.insert(hex.clone()) {
+                    tags.push(
+                        Tag::parse(["p", &hex])
+                            .map_err(|e| ActionSinkError::EventBuild(format!("p tag: {e}")))?,
+                    );
+                }
+            }
+
+            let event = EventBuilder::new(Kind::from(kind as u16), &content)
+                .tags(tags)
+                .sign_with_keys(&state.relay_keypair)
+                .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))?;
+
+            let event_id_hex = event.id.to_hex();
+            let event_id_bytes = event.id.as_bytes().to_vec();
+            let relay_pubkey_hex = state.relay_keypair.public_key().to_hex();
+            let event_created_at = {
+                let ts = event.created_at.as_secs() as i64;
+                chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now)
+            };
+
+            info!(
+                event_id = %event_id_hex,
+                channel_id = %channel_id_canonical,
+                kind,
+                "Workflow lifecycle event: publishing"
+            );
+
+            let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
+                event_id: &event_id_bytes,
+                event_created_at,
+                channel_id: channel_uuid,
+                parent_event_id: None,
+                parent_event_created_at: None,
+                root_event_id: None,
+                root_event_created_at: None,
+                depth: 0,
+                broadcast: false,
+            });
+            let (stored_event, was_inserted) = state
+                .db
+                .insert_event_with_thread_metadata(
+                    tenant.community(),
+                    &event,
+                    Some(channel_uuid),
+                    thread_meta,
+                )
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+
+            if was_inserted {
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored_event,
+                    kind,
+                    &relay_pubkey_hex,
                     None,
                 )
                 .await;

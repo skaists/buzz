@@ -7,6 +7,11 @@ import {
   useWorkflowQuery,
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
+import {
+  describeRunBlocker,
+  runBlockerLabel,
+} from "@/features/workflows/reviewGate";
+import { WorkflowRunHistory } from "@/features/workflows/ui/WorkflowRunHistory";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
 import type { Workflow } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
@@ -20,19 +25,24 @@ import {
 
 type WorkflowDetailPanelProps = {
   workflowId: string;
+  /** Run to open on mount, for example one picked from the instances list. */
+  initialRunId?: string | null;
   onClose: () => void;
   onEdit: (workflow: Workflow) => void;
 };
 
 export function WorkflowDetailPanel({
   workflowId,
+  initialRunId = null,
   onClose,
   onEdit,
 }: WorkflowDetailPanelProps) {
   const workflowQuery = useWorkflowQuery(workflowId);
   const runsQuery = useWorkflowRunsQuery(workflowId);
   const triggerMutation = useTriggerWorkflowMutation(workflowId);
-  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
+  const [selectedRunId, setSelectedRunId] = React.useState<string | null>(
+    initialRunId,
+  );
 
   const workflow = workflowQuery.data;
   const runs = runsQuery.data ?? [];
@@ -202,6 +212,7 @@ export function WorkflowDetailPanel({
                       run.errorCode,
                       run.errorMessage,
                     );
+                    const blocker = describeRunBlocker(run);
 
                     return (
                       <div
@@ -260,12 +271,34 @@ export function WorkflowDetailPanel({
                                   {failureReason}
                                 </p>
                               ) : null}
+                              {blocker ? (
+                                <p
+                                  className={`mt-2 break-words pl-6 text-xs ${
+                                    blocker.kind === "review_expired"
+                                      ? "text-destructive"
+                                      : "text-muted-foreground"
+                                  }`}
+                                  data-blocker-kind={blocker.kind}
+                                  data-testid="workflow-run-blocker"
+                                >
+                                  {runBlockerLabel(blocker)}
+                                </p>
+                              ) : null}
                             </div>
                           </div>
                         </button>
 
                         {isSelected ? (
                           <div className="border-t border-border/60 bg-background/60 px-4 py-4">
+                            <div className="mb-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+                              History
+                            </div>
+                            <div className="mb-4">
+                              <WorkflowRunHistory
+                                approvals={approvalsQuery.data}
+                                run={run}
+                              />
+                            </div>
                             <div className="mb-3 flex items-center gap-2 text-2xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                               <span>Execution Trace</span>
                               {approvalsQuery.isFetching ? (

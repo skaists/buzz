@@ -44,7 +44,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
+use buzz_core::kind::{
+    event_kind_u32, is_workflow_execution_kind, KIND_REACTION, KIND_WORKFLOW_APPROVAL_REQUESTED,
+};
 use buzz_core::tenant::CommunityId;
 use buzz_db::workflow::RunStatus;
 use buzz_db::Db;
@@ -226,33 +228,54 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
+                if let (Some(token), Some(request)) = (
+                    result.approval_token.as_deref(),
+                    result.approval_request.as_ref(),
+                ) {
+                    // WF-08: mint the durable gate. On any failure the run is
+                    // marked failed with a precise code and the trace it
+                    // already holds — never left "running" or silently
+                    // completed.
+                    let trace_vec = match trace_json {
+                        serde_json::Value::Array(v) => v,
+                        other => vec![other],
+                    };
                     if let Err(e) = self
-                        .db
-                        .update_workflow_run(
+                        .mint_approval_gate(
                             community_id,
                             run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some(buzz_db::workflow::WorkflowRunFailure {
-                                code: "approval_not_supported",
-                                message: "approval gates not yet implemented — see WF-08",
-                            }),
+                            token,
+                            request,
+                            result.step_index,
+                            trace_vec.clone(),
                         )
                         .await
                     {
                         tracing::error!(
                             run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
+                            step = %request.step_id,
+                            "Approval gate could not be minted: {}", e.message
                         );
+                        if let Err(db_err) = self
+                            .db
+                            .update_workflow_run(
+                                community_id,
+                                run_id,
+                                RunStatus::Failed,
+                                step_count,
+                                &serde_json::Value::Array(trace_vec),
+                                Some(buzz_db::workflow::WorkflowRunFailure {
+                                    code: e.code,
+                                    message: &e.message,
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                run_id = %run_id,
+                                "Failed to update run to Failed (approval gate): {db_err}"
+                            );
+                        }
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
@@ -302,6 +325,145 @@ impl WorkflowEngine {
                 }
             }
         }
+    }
+
+    /// WF-08: persist a pending approval gate and notify the designated
+    /// approver.
+    ///
+    /// Order is deliberate: the durable record and the `waiting_approval` run
+    /// state land first, then the kind:46010 notification. A notification
+    /// failure returns `Err` and the caller marks the run failed with code
+    /// `approval_notify_failed` — a pending record nobody was told about must
+    /// not look like a live obligation.
+    async fn mint_approval_gate(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        token: &str,
+        request: &executor::ApprovalRequest,
+        step_index: usize,
+        mut trace: Vec<serde_json::Value>,
+    ) -> Result<(), GateError> {
+        let run = self
+            .db
+            .get_workflow_run(community_id, run_id)
+            .await
+            .map_err(|e| GateError::new("approval_mint_failed", format!("read run: {e}")))?;
+        let workflow = self
+            .db
+            .get_workflow(community_id, run.workflow_id)
+            .await
+            .map_err(|e| GateError::new("approval_mint_failed", format!("read workflow: {e}")))?;
+        let Some(channel_id) = workflow.channel_id else {
+            return Err(GateError::new(
+                "approval_mint_failed",
+                "workflow has no channel scope — nowhere to publish the approval request",
+            ));
+        };
+        let owner_hex = hex::encode(&workflow.owner_pubkey);
+
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(request.timeout_secs as i64);
+        self.db
+            .create_approval(buzz_db::workflow::CreateApprovalParams {
+                community_id,
+                token,
+                workflow_id: workflow.id,
+                run_id,
+                step_id: &request.step_id,
+                step_index: step_index as i32,
+                approver_spec: &request.approver_spec,
+                candidate_ref: request.candidate_ref.as_deref(),
+                expires_at,
+            })
+            .await
+            .map_err(|e| GateError::new("approval_mint_failed", format!("create approval: {e}")))?;
+
+        let approval_ref = hex::encode(buzz_db::workflow::hash_approval_token(token));
+        trace.push(approval_gate_trace_entry(
+            request,
+            &approval_ref,
+            now,
+            expires_at,
+        ));
+        self.db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::WaitingApproval,
+                step_index as i32,
+                &serde_json::Value::Array(trace),
+                None,
+            )
+            .await
+            .map_err(|e| GateError::new("approval_mint_failed", format!("update run: {e}")))?;
+
+        let content = approval_requested_content(
+            workflow.id,
+            run_id,
+            request,
+            step_index,
+            &approval_ref,
+            token,
+            &owner_hex,
+            expires_at,
+        );
+        let mut notify: Vec<String> = Vec::new();
+        if request.approver_spec != "any" {
+            notify.push(request.approver_spec.clone());
+        }
+        if !notify.contains(&owner_hex) {
+            notify.push(owner_hex.clone());
+        }
+        let notified: Result<String, String> = match self.action_sink() {
+            Ok(sink) => sink
+                .emit_workflow_event(
+                    community_id,
+                    &channel_id.to_string(),
+                    KIND_WORKFLOW_APPROVAL_REQUESTED,
+                    &content.to_string(),
+                    &notify,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let event_id = match notified {
+            Ok(id) => id,
+            Err(e) => {
+                // F-B: the run is about to be marked failed, so the pending
+                // record must not outlive it — otherwise a later grant would
+                // publish kind:46011 for a dead run. Expire it in place; the
+                // hash-only trace entry stays as the audit of what was minted.
+                let token_hash = buzz_db::workflow::hash_approval_token(token);
+                if let Err(db_err) = self
+                    .db
+                    .update_approval_by_stored_hash(
+                        community_id,
+                        &token_hash,
+                        buzz_db::workflow::ApprovalStatus::Expired,
+                        None,
+                        Some("expired: run failed before the approver was notified (approval_notify_failed)"),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        run_id = %run_id,
+                        "approval_notify_failed and the pending record could not be expired: {db_err}"
+                    );
+                }
+                return Err(GateError::new("approval_notify_failed", e));
+            }
+        };
+        tracing::info!(
+            run_id = %run_id,
+            step = %request.step_id,
+            approver = %request.approver_spec,
+            candidate = ?request.candidate_ref,
+            event_id = %event_id,
+            "Approval gate minted and kind:46010 published"
+        );
+        Ok(())
     }
 
     /// Called from the event handler post-store hook for every stored event.
@@ -1051,9 +1213,132 @@ fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
     }
 }
 
+/// Why an approval gate could not be minted. `code` is the stable
+/// `workflow_runs.error_code`; `message` is the human diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateError {
+    /// Stable failure classification.
+    pub code: &'static str,
+    /// Human-readable diagnostic.
+    pub message: String,
+}
+
+impl GateError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// The execution-trace entry recorded for a suspended `request_approval`
+/// step. Its `output` is what later steps see as
+/// `{{steps.<id>.output.<field>}}` until the grant overwrites it with the
+/// reviewer's evidence. `approval_ref` is the token *hash* — never the token.
+pub fn approval_gate_trace_entry(
+    request: &executor::ApprovalRequest,
+    approval_ref: &str,
+    requested_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "step_id": request.step_id,
+        "status": "waiting_approval",
+        "output": {
+            "approval_ref": approval_ref,
+            "approver_spec": request.approver_spec,
+            "candidate_ref": request.candidate_ref,
+            "message": request.message,
+            "requested_at": requested_at.to_rfc3339(),
+            "expires_at": expires_at.to_rfc3339(),
+        },
+        "started_at": requested_at.timestamp(),
+    })
+}
+
+/// Content of the relay-signed kind:46010 approval request. Carries every
+/// binding the reviewer's grant must reproduce, plus the raw token the CLI
+/// needs (`buzz workflows approve --token`). With `approver_spec = "any"` the
+/// token is readable by every channel member — which is exactly the
+/// authority "any" grants, since the relay accepts any authenticated signer
+/// for such gates.
+#[allow(clippy::too_many_arguments)]
+pub fn approval_requested_content(
+    workflow_id: Uuid,
+    run_id: Uuid,
+    request: &executor::ApprovalRequest,
+    step_index: usize,
+    approval_ref: &str,
+    token: &str,
+    owner_hex: &str,
+    expires_at: DateTime<Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "workflow_approval_requested",
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "step_id": request.step_id,
+        "step_index": step_index,
+        "approval_ref": approval_ref,
+        "token": token,
+        "approver": request.approver_spec,
+        "candidate_ref": request.candidate_ref,
+        "owner": owner_hex,
+        "message": request.message,
+        "expires_at": expires_at.to_rfc3339(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_request() -> executor::ApprovalRequest {
+        executor::ApprovalRequest {
+            step_id: "review".to_owned(),
+            approver_spec: "755029663fee78e734a217867246e22933a4683dda19dd8435488688a29f9541"
+                .to_owned(),
+            message: "review commit abc".to_owned(),
+            candidate_ref: Some("abc123".to_owned()),
+            timeout_secs: 3600,
+        }
+    }
+
+    #[test]
+    fn gate_trace_entry_is_waiting_and_never_leaks_the_token() {
+        let now = Utc::now();
+        let entry = approval_gate_trace_entry(&gate_request(), "ff00", now, now);
+        assert_eq!(entry["step_id"], "review");
+        assert_eq!(entry["status"], "waiting_approval");
+        assert_eq!(entry["output"]["approval_ref"], "ff00");
+        assert_eq!(entry["output"]["candidate_ref"], "abc123");
+        assert!(
+            !entry.to_string().contains("token"),
+            "trace must carry the hash only, never a raw token"
+        );
+    }
+
+    #[test]
+    fn approval_requested_content_carries_every_binding() {
+        let wf = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let now = Utc::now();
+        let c = approval_requested_content(wf, run, &gate_request(), 2, "hash", "tok", "own", now);
+        assert_eq!(c["type"], "workflow_approval_requested");
+        assert_eq!(c["workflow_id"], wf.to_string());
+        assert_eq!(c["run_id"], run.to_string());
+        assert_eq!(c["step_id"], "review");
+        assert_eq!(c["step_index"], 2);
+        assert_eq!(c["approval_ref"], "hash");
+        assert_eq!(c["token"], "tok");
+        assert_eq!(
+            c["approver"],
+            "755029663fee78e734a217867246e22933a4683dda19dd8435488688a29f9541"
+        );
+        assert_eq!(c["candidate_ref"], "abc123");
+        assert_eq!(c["owner"], "own");
+    }
 
     #[test]
     fn cron_fire_instant_matches_within_window() {

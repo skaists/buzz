@@ -63,6 +63,8 @@ export type WorkflowApproval = {
   status: WorkflowApprovalStatus;
   approverPubkey: string | null;
   note: string | null;
+  /** Exact candidate the gate is bound to (opaque, e.g. a commit sha); null for unbound gates. */
+  candidateRef: string | null;
   expiresAt: string;
   createdAt: number;
 };

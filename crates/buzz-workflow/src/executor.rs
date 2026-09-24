@@ -440,10 +440,12 @@ pub fn resolve_step_templates(
             from,
             message,
             timeout,
+            candidate,
         } => Ok(RequestApproval {
             from: t(from)?,
             message: t(message)?,
             timeout: timeout.clone(),
+            candidate: t_opt(candidate)?,
         }),
         Delay { duration } => Ok(Delay {
             duration: duration.clone(),
@@ -460,9 +462,88 @@ pub enum StepResult {
     Suspended {
         /// Token used to resume or reject this approval gate.
         approval_token: String,
+        /// The fully-resolved gate the caller must persist (WF-08).
+        request: ApprovalRequest,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
+}
+
+/// A resolved `request_approval` gate, ready to be minted as a durable
+/// approval record (WF-08). Every template has already been substituted, so
+/// the values here are exactly what the record binds to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalRequest {
+    /// Step id of the gate.
+    pub step_id: String,
+    /// Normalized approver spec: `"any"` or a 64-char lowercase hex pubkey.
+    pub approver_spec: String,
+    /// Message shown to the approver.
+    pub message: String,
+    /// Exact candidate the approval is bound to (`None` = unbound gate).
+    pub candidate_ref: Option<String>,
+    /// Seconds until the pending approval expires.
+    pub timeout_secs: u64,
+}
+
+/// Normalize a resolved `from:` value into an enforceable approver spec.
+///
+/// Accepted: `"any"` (case-insensitive) or a 64-char hex pubkey, optionally
+/// `@`-prefixed. Everything else — role mentions, display names, empty —
+/// fails closed so a gate can never be minted with an approver nobody can
+/// satisfy or that the relay would silently widen.
+pub fn normalize_approver_spec(raw: &str) -> Result<String, WorkflowError> {
+    let spec = raw.trim().trim_start_matches('@').trim();
+    if spec.eq_ignore_ascii_case("any") {
+        return Ok("any".to_owned());
+    }
+    if spec.len() == 64 && spec.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(spec.to_ascii_lowercase());
+    }
+    Err(WorkflowError::InvalidDefinition(format!(
+        "request_approval `from` must be a 64-char hex pubkey or \"any\" (got {raw:?})"
+    )))
+}
+
+/// Build the durable gate description from a resolved `request_approval`
+/// action. Pure: no DB, no clock.
+pub fn build_approval_request(
+    step_id: &str,
+    from: &str,
+    message: &str,
+    timeout: Option<&str>,
+    candidate: Option<&str>,
+) -> Result<ApprovalRequest, WorkflowError> {
+    let approver_spec = normalize_approver_spec(from)?;
+    let timeout_secs = parse_duration_secs(timeout.unwrap_or("24h"))?;
+    let candidate_ref = candidate
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned);
+    if candidate.is_some() && candidate_ref.is_none() {
+        // A `candidate:` that resolved to nothing means the trigger did not
+        // supply one. Minting an unbound gate here would silently drop the
+        // stale-candidate rule the definition asked for.
+        return Err(WorkflowError::InvalidDefinition(format!(
+            "request_approval step '{step_id}' names a candidate but it resolved to empty"
+        )));
+    }
+    if candidate_ref.as_deref().is_some_and(|c| c.contains("{{")) {
+        // Unknown template variables are emitted literally by
+        // `resolve_template`; a candidate of `{{trigger.candidate_commit}}`
+        // is an unsupplied input, not a binding.
+        return Err(WorkflowError::InvalidDefinition(format!(
+            "request_approval step '{step_id}' candidate is unresolved: {}",
+            candidate_ref.unwrap_or_default()
+        )));
+    }
+    Ok(ApprovalRequest {
+        step_id: step_id.to_owned(),
+        approver_spec,
+        message: message.to_owned(),
+        candidate_ref,
+        timeout_secs,
+    })
 }
 
 fn resolve_send_message_channel(
@@ -670,20 +751,31 @@ pub async fn dispatch_action(
                     from,
                     message,
                     timeout,
+                    candidate,
                 } => {
-                    let timeout_str = timeout.as_deref().unwrap_or("24h");
+                    // WF-08: resolve the gate completely here (templates are
+                    // already substituted) and hand it up as a durable
+                    // request. Minting the DB record and emitting kind:46010
+                    // happens in `WorkflowEngine::finalize_run`, the single
+                    // point every execution path funnels through.
+                    let request = build_approval_request(
+                        step_id,
+                        from,
+                        message,
+                        timeout.as_deref(),
+                        candidate.as_deref(),
+                    )?;
                     info!(
                         run_id = %run_id, step = step_id,
-                        "RequestApproval from={from} timeout={timeout_str}: {message}"
+                        approver = %request.approver_spec,
+                        candidate = ?request.candidate_ref,
+                        timeout_secs = request.timeout_secs,
+                        "RequestApproval gate resolved: {message}"
                     );
 
-                    let token = generate_approval_token(run_id, step_id);
-
-                    // TODO (WF-08): create approval record in DB, emit kind:46010.
-                    // For now, return Suspended with the token so the caller can persist state.
-
                     Ok(StepResult::Suspended {
-                        approval_token: token,
+                        approval_token: generate_approval_token(),
+                        request,
                     })
                 }
 
@@ -732,7 +824,14 @@ pub async fn dispatch_action(
 /// crate). The `run_id` and `step_id` parameters are accepted for logging
 /// context but are not mixed into the token — the UUID's own randomness is
 /// sufficient and avoids the predictability of time-based entropy.
-fn generate_approval_token(_run_id: Uuid, _step_id: &str) -> String {
+/// Mint a fresh, unguessable approval token (UUID v4, 122 bits of entropy).
+///
+/// The token is a bearer secret only in combination with the durable record
+/// that binds its SHA-256 hash to `(community, workflow, run, step, approver,
+/// candidate)`. Binding lives in that record and is enforced by the relay's
+/// grant/deny handlers — deriving the token from run/step ids would add
+/// nothing but predictability.
+fn generate_approval_token() -> String {
     Uuid::new_v4().to_string()
 }
 
@@ -980,6 +1079,9 @@ pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
     pub approval_token: Option<String>,
+    /// The resolved gate that produced `approval_token` (WF-08). Always
+    /// `Some` when `approval_token` is `Some`.
+    pub approval_request: Option<ApprovalRequest>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
@@ -1071,14 +1173,22 @@ pub async fn execute_from_step(
 
     // Mark run as Running now that we have a permit (resume from approval).
     // Preserve the existing execution trace from pre-approval steps.
+    // WF-08 restart-safety: the pre-approval trace is the durable record of
+    // completed evidence. If it cannot be read, refuse to resume rather than
+    // overwrite it with an empty trace. The caller's finalize path then
+    // records the failure against the trace it already holds, so completed
+    // evidence is never replaced by `[]`.
     let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
         Ok(r) => r.execution_trace,
         Err(e) => {
             warn!(
                 run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
+                "Refusing to resume: existing trace unreadable, would lose pre-approval evidence: {e}"
             );
-            serde_json::json!([])
+            return Err((
+                WorkflowError::from(e),
+                crate::error::PartialProgress::default(),
+            ));
         }
     };
     engine
@@ -1220,7 +1330,10 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended {
+                approval_token,
+                request,
+            } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
@@ -1229,6 +1342,7 @@ async fn execute_steps(
                 // approval record and update the run's execution trace.
                 return Ok(ExecutionResult {
                     approval_token: Some(approval_token),
+                    approval_request: Some(request),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1247,6 +1361,7 @@ async fn execute_steps(
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
         approval_token: None,
+        approval_request: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
@@ -1870,5 +1985,114 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+
+    // -- WF-08: approval gate resolution -----------------------------------
+
+    const REVIEWER: &str = "755029663fee78e734a217867246e22933a4683dda19dd8435488688a29f9541";
+
+    #[test]
+    fn approver_spec_accepts_any_and_hex_pubkey() {
+        assert_eq!(normalize_approver_spec("any").unwrap(), "any");
+        assert_eq!(normalize_approver_spec(" ANY ").unwrap(), "any");
+        assert_eq!(normalize_approver_spec(REVIEWER).unwrap(), REVIEWER);
+        assert_eq!(
+            normalize_approver_spec(&format!("@{}", REVIEWER.to_uppercase())).unwrap(),
+            REVIEWER,
+            "an @-prefixed, upper-case pubkey normalizes to lowercase hex"
+        );
+    }
+
+    #[test]
+    fn approver_spec_fails_closed_on_roles_names_and_empty() {
+        for bad in [
+            "@release-manager",
+            "bFUzZ",
+            "",
+            "  ",
+            "deadbeef",
+            "{{trigger.author}}",
+        ] {
+            assert!(
+                normalize_approver_spec(bad).is_err(),
+                "{bad:?} must not mint a gate"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_request_binds_candidate_and_timeout() {
+        let req = build_approval_request(
+            "review",
+            REVIEWER,
+            "please review",
+            Some("2h"),
+            Some("  abc123def  "),
+        )
+        .unwrap();
+        assert_eq!(req.step_id, "review");
+        assert_eq!(req.approver_spec, REVIEWER);
+        assert_eq!(req.candidate_ref.as_deref(), Some("abc123def"));
+        assert_eq!(req.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn approval_request_without_candidate_is_unbound_gate() {
+        let req = build_approval_request("gate", "any", "ok?", None, None).unwrap();
+        assert_eq!(req.candidate_ref, None);
+        assert_eq!(req.timeout_secs, 24 * 3600, "default timeout is 24h");
+    }
+
+    #[test]
+    fn approval_request_rejects_empty_or_unresolved_candidate() {
+        assert!(
+            build_approval_request("r", "any", "m", None, Some("   ")).is_err(),
+            "candidate named but empty must not silently become an unbound gate"
+        );
+        assert!(
+            build_approval_request("r", "any", "m", None, Some("{{trigger.candidate_commit}}"))
+                .is_err(),
+            "unresolved template literal is not a candidate binding"
+        );
+    }
+
+    #[test]
+    fn approval_request_rejects_bad_timeout() {
+        assert!(build_approval_request("r", "any", "m", Some("soon"), None).is_err());
+    }
+
+    #[test]
+    fn resolved_request_approval_action_carries_candidate_from_trigger_inputs() {
+        // Manual trigger inputs land in `webhook_fields` and resolve through
+        // `{{trigger.<field>}}` — the path the two-bee workflow uses.
+        let mut ctx = make_trigger();
+        ctx.webhook_fields
+            .insert("candidate_commit".to_owned(), "0123abcd".to_owned());
+        let step = Step {
+            id: "review".to_owned(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::RequestApproval {
+                from: REVIEWER.to_owned(),
+                message: "review {{trigger.candidate_commit}}".to_owned(),
+                timeout: Some("1h".to_owned()),
+                candidate: Some("{{trigger.candidate_commit}}".to_owned()),
+            },
+        };
+        let resolved = resolve_step_templates(&step, &ctx, &HashMap::new()).unwrap();
+        match resolved {
+            ActionDef::RequestApproval {
+                from,
+                message,
+                candidate,
+                ..
+            } => {
+                assert_eq!(from, REVIEWER);
+                assert_eq!(message, "review 0123abcd");
+                assert_eq!(candidate.as_deref(), Some("0123abcd"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 }

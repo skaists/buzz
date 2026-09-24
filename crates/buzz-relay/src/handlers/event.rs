@@ -518,18 +518,14 @@ async fn dispatch_persistent_event_inner(
     }
 
     // Skip workflow triggering for workflow-execution kinds and relay-signed workflow messages.
-    let is_relay_workflow_msg = stored_event.event.pubkey == state.relay_keypair.public_key()
-        && stored_event
-            .event
-            .tags
-            .iter()
-            .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
+    let is_relay_signed = stored_event.event.pubkey == state.relay_keypair.public_key();
+    let has_workflow_tag = stored_event
+        .event
+        .tags
+        .iter()
+        .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
 
-    if !buzz_core::kind::is_workflow_execution_kind(kind_u32)
-        && !buzz_core::kind::is_command_kind(kind_u32)
-        && !is_relay_workflow_msg
-        && kind_u32 != KIND_GIFT_WRAP
-    {
+    if workflow_trigger_eligible(kind_u32, is_relay_signed, has_workflow_tag) {
         let workflow_engine = Arc::clone(&state.workflow_engine);
         let workflow_event = stored_event.clone();
         let trigger_kind = kind_u32.to_string();
@@ -2490,6 +2486,69 @@ mod tests {
                 out.is_empty(),
                 "Inv_NonInterference: a connection bound to community A \
                  must not receive a community-B event. Got: {out:?}"
+            );
+        }
+    }
+}
+
+/// Whether a freshly stored event may be offered to the workflow engine as a
+/// trigger. Pure so the loop guard is unit-provable (WF-08 / T8).
+///
+/// Excluded, in order:
+/// - workflow-execution kinds (46001–46012: lifecycle, approval request,
+///   grant, deny) — the engine's own outputs;
+/// - command kinds (46020/46030/46031, …) — instructions *to* the engine;
+/// - anything the relay itself signed and tagged `buzz:workflow` — every
+///   `send_message` step output and every lifecycle event travel this way,
+///   so a workflow's own kind:9 status post can never re-trigger it;
+/// - gift wraps.
+pub(crate) fn workflow_trigger_eligible(
+    kind: u32,
+    is_relay_signed: bool,
+    has_workflow_tag: bool,
+) -> bool {
+    let excluded = buzz_core::kind::is_workflow_execution_kind(kind)
+        || buzz_core::kind::is_command_kind(kind)
+        || (is_relay_signed && has_workflow_tag)
+        || kind == KIND_GIFT_WRAP;
+    !excluded
+}
+
+#[cfg(test)]
+mod wf08_loop_guard {
+    use super::*;
+    use buzz_core::kind::{
+        KIND_APPROVAL_GRANT, KIND_STREAM_MESSAGE, KIND_WORKFLOW_APPROVAL_GRANTED,
+        KIND_WORKFLOW_APPROVAL_REQUESTED, KIND_WORKFLOW_TRIGGER,
+    };
+
+    #[test]
+    fn a_workflows_own_kind9_status_output_cannot_trigger_it() {
+        // Relay-signed + `buzz:workflow` is exactly how `send_message` steps
+        // and lifecycle events are published.
+        assert!(!workflow_trigger_eligible(KIND_STREAM_MESSAGE, true, true));
+    }
+
+    #[test]
+    fn ordinary_member_kind9_still_triggers() {
+        assert!(workflow_trigger_eligible(KIND_STREAM_MESSAGE, false, false));
+        // A member cannot borrow the guard by adding the tag themselves…
+        assert!(workflow_trigger_eligible(KIND_STREAM_MESSAGE, false, true));
+        // …and a relay-signed message without the tag is not a workflow output.
+        assert!(workflow_trigger_eligible(KIND_STREAM_MESSAGE, true, false));
+    }
+
+    #[test]
+    fn approval_lifecycle_and_command_kinds_never_trigger() {
+        for kind in [
+            KIND_WORKFLOW_APPROVAL_REQUESTED,
+            KIND_WORKFLOW_APPROVAL_GRANTED,
+            KIND_WORKFLOW_TRIGGER,
+            KIND_APPROVAL_GRANT,
+        ] {
+            assert!(
+                !workflow_trigger_eligible(kind, false, false),
+                "kind {kind} must not trigger workflows even when member-signed"
             );
         }
     }
