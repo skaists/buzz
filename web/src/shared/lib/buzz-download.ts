@@ -1,18 +1,10 @@
 export const BUZZ_RELEASES_URL = "https://github.com/block/buzz/releases";
-const BUZZ_RELEASES_API_URL =
-  "https://api.github.com/repos/block/buzz/releases?per_page=10";
-const CACHE_KEY = "buzz.latestDownload.v1";
-const CACHE_TTL_MS = 60 * 60 * 1000;
+
+export const SKAISTS_EDITION_LABEL = "skaists buzz";
 
 export type BuzzDownloadPlatform = {
   operatingSystem: "linux" | "macos" | "windows" | "unknown";
   architecture: "arm64" | "x64" | "unknown";
-};
-
-type GitHubRelease = {
-  draft: boolean;
-  prerelease: boolean;
-  assets: Array<{ name: string; browser_download_url: string }>;
 };
 
 type UserAgentData = {
@@ -99,92 +91,29 @@ export async function detectBuzzDownloadPlatform(
         `${values.architecture ?? ""} ${values.bitness ?? ""}`,
       );
     } catch {
-      // Privacy settings may reject high-entropy client hints. The matcher
-      // below applies the safest compatible fallback for the detected OS.
+      // Privacy settings may reject high-entropy client hints; the user-agent
+      // guess above stands.
     }
   }
 
   return { operatingSystem, architecture };
 }
 
-function assetPattern(platform: BuzzDownloadPlatform): RegExp | undefined {
-  switch (platform.operatingSystem) {
-    case "macos":
-      if (platform.architecture === "arm64") return /_aarch64\.dmg$/i;
-      if (platform.architecture === "x64") return /_x64\.dmg$/i;
-      return undefined;
-    case "windows":
-      return /_x64-setup[^/]*\.exe$/i;
-    case "linux":
-      return platform.architecture === "arm64"
-        ? undefined
-        : /_amd64\.AppImage$/i;
-    default:
-      return undefined;
-  }
-}
-
-export function selectBuzzDownloadUrl(
-  releases: GitHubRelease[],
-  platform: BuzzDownloadPlatform,
-): string | undefined {
-  const pattern = assetPattern(platform);
-  if (!pattern) return undefined;
-
-  for (const release of releases) {
-    if (release.draft || release.prerelease) continue;
-    const asset = release.assets.find(({ name }) => pattern.test(name));
-    if (asset) return asset.browser_download_url;
-  }
-  return undefined;
-}
-
+/** Where the invite page sends a visitor on `platform`. */
 export async function resolveBuzzDownloadUrlForPlatform(
   platform: BuzzDownloadPlatform,
 ): Promise<string> {
-  try {
-    const cached = JSON.parse(sessionStorage.getItem(CACHE_KEY) ?? "null") as {
-      expiresAt: number;
-      platform: BuzzDownloadPlatform;
-      url: string;
-    } | null;
-    if (
-      cached &&
-      cached.expiresAt > Date.now() &&
-      cached.platform.operatingSystem === platform.operatingSystem &&
-      cached.platform.architecture === platform.architecture
-    ) {
-      return cached.url;
-    }
-  } catch {
-    // Storage is only an optimization.
-  }
-
-  try {
-    const response = await fetch(BUZZ_RELEASES_API_URL, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-    if (!response.ok) return BUZZ_RELEASES_URL;
-    const url = selectBuzzDownloadUrl(
-      (await response.json()) as GitHubRelease[],
-      platform,
-    );
-    if (!url) return BUZZ_RELEASES_URL;
-    try {
-      sessionStorage.setItem(
-        CACHE_KEY,
-        JSON.stringify({
-          expiresAt: Date.now() + CACHE_TTL_MS,
-          platform,
-          url,
-        }),
-      );
-    } catch {
-      // Storage is only an optimization.
-    }
-    return url;
-  } catch {
-    return BUZZ_RELEASES_URL;
+  switch (platform.operatingSystem) {
+    case "linux":
+    case "macos":
+    case "windows":
+      // Desktop visitors choose their build on the releases page, which
+      // states each installer's alpha/unsigned status.
+      return BUZZ_RELEASES_URL;
+    case "unknown":
+      // No Buzz build targets phones or unrecognised devices from this page
+      // yet; the releases page is the same fallback as before.
+      return BUZZ_RELEASES_URL;
   }
 }
 
@@ -192,4 +121,20 @@ export async function resolveBuzzDownloadUrl(): Promise<string> {
   return resolveBuzzDownloadUrlForPlatform(
     await detectBuzzDownloadPlatform(navigator),
   );
+}
+
+/**
+ * The published skaists buzz build, or undefined while none exists. Only an
+ * https URL counts; anything else leaves the edition entry off the page.
+ */
+export function skaistsBuildUrl(
+  configured: string | undefined,
+): string | undefined {
+  const url = configured?.trim();
+  if (!url) return undefined;
+  try {
+    return new URL(url).protocol === "https:" ? url : undefined;
+  } catch {
+    return undefined;
+  }
 }
