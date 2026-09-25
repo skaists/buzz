@@ -55,7 +55,7 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
         let mut hs = state.huddle()?;
         if let Some(ref p) = hs.stt_pipeline {
             if p.is_finished() {
-                hs.stt_pipeline = None;
+                hs.take_stt_pipeline();
             }
         }
         if let Some(ref p) = hs.tts_pipeline {
@@ -311,6 +311,8 @@ pub(crate) async fn maybe_start_stt_pipeline(
         stt_starting,
         ptt_active_for_stt,
         manual_mic_unmuted_for_stt,
+        human_floor,
+        output_device,
         old_stt,
     ) = {
         let mut hs = state.huddle()?;
@@ -325,7 +327,7 @@ pub(crate) async fn maybe_start_stt_pipeline(
         if hs.stt_pipeline.is_some() {
             hs.session_generation.fetch_add(1, Ordering::Release);
         }
-        let old = hs.stt_pipeline.take();
+        let old = hs.take_stt_pipeline();
         if let Some(ref p) = old {
             p.shutdown();
         }
@@ -346,6 +348,13 @@ pub(crate) async fn maybe_start_stt_pipeline(
             stt_starting,
             ptt,
             manual_mic_unmuted,
+            hs.human_floor.clone(),
+            state
+                .huddle_audio
+                .output_device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             old,
         )
     };
@@ -353,7 +362,13 @@ pub(crate) async fn maybe_start_stt_pipeline(
     drop(old_stt);
 
     let constructed = tokio::task::spawn_blocking(move || {
-        stt::SttPipeline::new(model_dir, ptt_active_for_stt, manual_mic_unmuted_for_stt)
+        stt::SttPipeline::new(
+            model_dir,
+            ptt_active_for_stt,
+            manual_mic_unmuted_for_stt,
+            human_floor,
+            output_device,
+        )
     })
     .await;
     let (pipeline, text_rx) = match constructed {
@@ -382,7 +397,7 @@ pub(crate) async fn maybe_start_stt_pipeline(
         {
             return Ok(false);
         }
-        hs.stt_pipeline = Some(Arc::clone(&pipeline));
+        hs.set_stt_pipeline(Arc::clone(&pipeline));
     }
 
     spawn_transcription_task(text_rx, channel_uuid, agent_pubkeys_arc, session_gen, state);
@@ -457,7 +472,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
     // Atomically check preconditions and claim the construction slot.
     // The sentinel prevents a second caller from starting construction
     // while we're building outside the lock.
-    let (tts_active, tts_cancel, tts_starting) = {
+    let (tts_active, tts_cancel, human_floor, tts_starting) = {
         let hs = state.huddle()?;
         if hs.tts_pipeline.is_some() {
             return Ok(false);
@@ -471,6 +486,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         (
             Arc::clone(&hs.tts_active),
             Arc::clone(&hs.tts_cancel),
+            hs.human_floor.clone(),
             Arc::clone(&hs.tts_starting),
         )
     };
@@ -484,6 +500,7 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
             model_dir,
             tts_active,
             tts_cancel,
+            human_floor,
             &initial_voice,
             output_device,
             app,
@@ -679,43 +696,47 @@ pub(crate) fn spawn_transcription_task(
                 }
             };
             let url = format!("{relay_base_url}/events");
-            let auth_header = match crate::relay::build_nip98_auth_header_for_keys(
-                &keys,
-                &reqwest::Method::POST,
-                &url,
-                &body_bytes,
-            ) {
-                Ok(h) => h,
+            match publish_transcript_event(&http_client, &keys, &url, &body_bytes).await {
+                Ok(()) => {}
                 Err(e) => {
-                    eprintln!("buzz-desktop: STT NIP-98 auth: {e}");
-                    continue;
-                }
-            };
-
-            let response = {
-                http_client
-                    .post(&url)
-                    .header("Authorization", auth_header)
-                    .header("Content-Type", "application/json")
-                    .body(body_bytes)
-                    .send()
-                    .await
-            };
-
-            match response {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => {
-                    // Route through relay_error_message so a 429 arms the
-                    // admission gate for subsequent relay sends.
-                    let msg = crate::relay::relay_error_message(resp).await;
-                    eprintln!("buzz-desktop: STT kind:9 post failed: {msg}");
-                }
-                Err(e) => {
-                    eprintln!("buzz-desktop: STT kind:9 post failed: {e}");
+                    eprintln!("buzz-desktop: STT publish: {e}");
                 }
             }
         }
     });
+}
+
+/// The STT publish boundary: resolve the canonical signing URL from /info,
+/// build the NIP-98 header against the canonical identity, and POST the
+/// transcript body to the transport URL. Fail-closed on metadata errors —
+/// no NIP-98 signing or POST happens when canonical resolution fails.
+/// Extracted so the actual boundary (resolution → signing → POST) is
+/// testable as one unit rather than only through the spawned loop.
+pub(crate) async fn publish_transcript_event(
+    http_client: &reqwest::Client,
+    keys: &nostr::Keys,
+    transport_url: &str,
+    body_bytes: &[u8],
+) -> Result<(), String> {
+    let sign_url = crate::relay::canonical_sign_url_with_client(http_client, transport_url).await?;
+    let auth_header = crate::relay::build_nip98_auth_header_for_keys(
+        keys,
+        &reqwest::Method::POST,
+        &sign_url,
+        body_bytes,
+    )?;
+    let response = http_client
+        .post(transport_url)
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/json")
+        .body(body_bytes.to_vec())
+        .send()
+        .await
+        .map_err(|e| crate::relay::classify_request_error(&e))?;
+    if !response.status().is_success() {
+        return Err(crate::relay::relay_error_message(response).await);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -860,5 +881,191 @@ mod tts_start_race_tests {
             .expect("huddle state")
             .tts_starting
             .load(Ordering::Acquire));
+    }
+}
+
+/// Caller-level regressions for the huddle publish boundary: these tests
+/// invoke the ACTUAL publish_transcript_event function (the same function
+/// the transcription loop calls), exercising the full sequence — canonical
+/// resolution → NIP-98 header construction → POST — against a real
+/// loopback server that captures every incoming request.
+#[cfg(test)]
+mod huddle_publish_boundary_tests {
+    use super::publish_transcript_event;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+    }
+
+    /// Loopback server that captures every request. Serves the given body
+    /// for GET /info and a 200 for everything else.
+    struct SpyServer {
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+        addr: String,
+    }
+
+    impl SpyServer {
+        fn start(info_body: String) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let req_clone = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut buf = [0u8; 16384];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (head, _body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                    let mut lines = head.lines();
+                    let request_line = lines.next().unwrap_or_default();
+                    let auth = lines.find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        if lower.starts_with("authorization: ") {
+                            Some(l[15..].to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    let parts: Vec<&str> = request_line.split_whitespace().collect();
+                    let method = parts.first().copied().unwrap_or_default().to_string();
+                    let path = parts.get(1).copied().unwrap_or_default().to_string();
+                    let is_info = path.ends_with("/info");
+                    req_clone.lock().unwrap().push(CapturedRequest {
+                        method,
+                        path,
+                        authorization: auth,
+                    });
+                    let (status, resp_body) = if is_info {
+                        ("200 OK", info_body.clone())
+                    } else {
+                        ("200 OK", "{}".to_string())
+                    };
+                    let len = resp_body.len();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{resp_body}"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            SpyServer {
+                requests,
+                addr: format!("http://{addr}"),
+            }
+        }
+
+        fn post_requests(&self) -> Vec<CapturedRequest> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn huddle_valid_metadata_signs_canonical_posts_alias() {
+        let server =
+            SpyServer::start(r#"{"push":{"origin":"wss://beehivenature.buzz"}}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let transport_url = format!("{}/events", server.addr);
+
+        let result = publish_transcript_event(&client, &keys, &transport_url, b"{}").await;
+        assert!(
+            result.is_ok(),
+            "valid metadata must publish, got {result:?}"
+        );
+
+        let posts = server.post_requests();
+        assert_eq!(posts.len(), 1, "exactly one POST to the transport");
+        assert!(
+            posts[0].path.ends_with("/events"),
+            "POST arrived at the transport road"
+        );
+
+        let auth = posts[0]
+            .authorization
+            .as_ref()
+            .expect("Authorization header present on the POST");
+        assert!(auth.starts_with("Nostr "), "NIP-98 scheme");
+
+        // Decode the NIP-98 event and verify the u tag names the canonical
+        // origin, NOT the loopback transport (the alias-host law)
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let event_json = auth.strip_prefix("Nostr ").unwrap();
+        let decoded = B64.decode(event_json).expect("valid base64");
+        let event: serde_json::Value = serde_json::from_slice(&decoded).expect("valid JSON");
+        let tags = event["tags"].as_array().expect("tags array");
+        let u_tag = tags
+            .iter()
+            .find(|t| t[0] == "u")
+            .and_then(|t| t[1].as_str())
+            .expect("u tag present");
+        assert!(
+            u_tag.starts_with("https://beehivenature.buzz/"),
+            "u tag must name the canonical origin, got {u_tag}"
+        );
+        assert!(
+            !u_tag.contains("127.0.0.1"),
+            "u tag must NOT name the transport/alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn huddle_malformed_metadata_no_signing_no_post() {
+        let server = SpyServer::start(
+            r#"{"push":{"origin":"wss://beehivenature.buzz""#.to_string(), // truncated JSON
+        );
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let transport_url = format!("{}/events", server.addr);
+
+        let result = publish_transcript_event(&client, &keys, &transport_url, b"{}").await;
+        assert!(result.is_err(), "malformed /info must refuse");
+
+        let posts = server.post_requests();
+        assert_eq!(
+            posts.len(),
+            0,
+            "ZERO POST requests — no signing/POST on malformed metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn huddle_null_push_no_signing_no_post() {
+        let server = SpyServer::start(r#"{"push":null}"#.to_string());
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+        let transport_url = format!("{}/events", server.addr);
+
+        let result = publish_transcript_event(&client, &keys, &transport_url, b"{}").await;
+        assert!(result.is_err(), "null push must refuse");
+
+        let posts = server.post_requests();
+        assert_eq!(posts.len(), 0, "ZERO POST requests on null push");
+    }
+
+    #[tokio::test]
+    async fn huddle_transport_failure_no_signing_no_post() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let keys = nostr::Keys::generate();
+
+        let result =
+            publish_transcript_event(&client, &keys, &format!("http://{addr}/events"), b"{}").await;
+        assert!(result.is_err(), "transport failure must refuse");
     }
 }

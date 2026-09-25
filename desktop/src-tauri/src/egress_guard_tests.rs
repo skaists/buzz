@@ -109,6 +109,7 @@ async fn boundary_sync_managed_agent_profile_blocks_ncryptsec() {
         &format!("agent {NCRYPTSEC}"),
         None,
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -262,20 +263,44 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
-    ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
-    ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
-    ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
-    ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
-    ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
+    ("src/relay.rs", 2, 2),        // boundaries 2, 4
+    ("src/relay/submit.rs", 1, 1), // boundaries 1 + 3 (shared funnel)
+    // Boundary 5 + this stack's canonical/alias transport-signing tests
+    // (`#[cfg(test)]` past line 892): four `transport_url` mock
+    // constructions, one `posts[0].path` assertion, and one
+    // `publish_transcript_event` helper call. Production publish still rides
+    // the guarded boundary-5 site only.
+    ("src/huddle/pipeline.rs", 6, 1),
+    ("src/commands/team_snapshot.rs", 1, 1), // boundary 6
+    // Boundary 7 + its in-file injection-test fixture URL + this stack's
+    // `import_publish_boundary_tests` mod: two `transport_url` mock
+    // constructions (~lines 997/1040). Production egress is boundary 7 only.
+    ("src/commands/personas/snapshot/import.rs", 4, 1),
+    ("src/native_websocket.rs", 0, 2), // boundary 8 (WS frames; no events URL)
     // Test-only fixtures — no production egress, no guard:
     ("src/relay_admission.rs", 1, 0),
+    ("src/native_relay_client_transport_tests.rs", 1, 0),
     ("src/archive/mod_tests.rs", 1, 0),
+    ("src/relay/profile_avatar/tests.rs", 1, 0),
     ("src/managed_agents/persona_events/tests.rs", 1, 0),
     ("src/commands/team_snapshot/tests.rs", 1, 0),
     // Mock-relay route in its in-file tests; production publish goes through
     // the guarded boundary-1 funnel (`submit_signed_event_at_with_keys`).
     ("src/commands/personas/sharing.rs", 1, 0),
+    // Loopback submit relay in `identity_archive.rs`'s in-file regen tests;
+    // production archive/unarchive publish through the guarded boundary-1
+    // funnel via `submit_event`.
+    ("src/commands/identity_archive.rs", 1, 0),
+    // Mock-relay routes in team-sharing tests (accept/reject stub +
+    // recording stub for the delete-then-share gate + gated recording stub for
+    // the two-flush serialization gate + stalling stub for the per-scope
+    // isolation and bounded-stall gates); same pattern as persona sharing
+    // above — production publish goes through the guarded boundary-1 funnel via
+    // the flush loop.
+    ("src/commands/teams/sharing/tests.rs", 4, 0),
+    // Stub-relay route in the tombstone-flush gate tests; production flush
+    // publishes through the guarded boundary-1 funnel.
+    ("src/commands/teams/pending/tests/gate.rs", 1, 0),
 ];
 
 // Needles are assembled at runtime so this scan file itself contains no
