@@ -146,7 +146,8 @@ fn parse_launcher_args(mut argv: impl Iterator<Item = OsString>) -> Result<Launc
 #[derive(Debug)]
 pub(crate) enum SandboxError {
     /// The grants themselves are wrong (a path cannot be opened): fix the
-    /// Buzz configuration.
+    /// Buzz configuration. Only the Linux launcher opens grants.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Config(String),
     /// The kernel cannot enforce the required Landlock ABI or ruleset:
     /// upgrade the worker kernel. Never a reason to fall back.
