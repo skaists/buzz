@@ -148,7 +148,14 @@ Off by default. When on, each agent runs under a Landlock filesystem boundary th
 
 `/proc` is not granted as a whole. `/proc/<pid>/environ` of the harness would hand the agent the variables env isolation withholds, and Landlock does not block that read. The agent process can read its own `/proc/self`, but processes it starts cannot read theirs. `/dev/shm` is not granted.
 
-Everything else, including `~/.ssh`, the host `~/.cargo` and wallet files, is denied by the kernel. The launcher refuses to start the agent if the kernel cannot fully enforce the ruleset (Landlock ABI v3, Linux 6.2+), and the flags are rejected on other platforms.
+Everything else, including `~/.ssh`, the host `~/.cargo` and wallet files, is denied by the kernel. Symlinks do not help: Landlock checks the resolved target, so a link inside the workspace to a forbidden file is still denied.
+
+**Fail closed, never fall back.** At startup the harness runs `buzz-acp sandbox-exec --check` with the real grants. If that probe fails, the harness exits before connecting, and it never degrades to env-only isolation. The error names who has to act:
+
+- `configuration error`: a grant path cannot be opened, so fix the `--agent-fs-*` flags;
+- `kernel cannot enforce Landlock`: the kernel lacks Landlock ABI v3 (Linux 6.2+) or cannot fully enforce the ruleset, so upgrade the worker kernel.
+
+The flags are rejected on non-Linux platforms.
 
 This limits file access only. Network access is not restricted, and denied paths remain visible even though they cannot be opened. Agents that keep config or caches under `$HOME` (for example `~/.claude` or npm global installs) need those directories granted explicitly.
 

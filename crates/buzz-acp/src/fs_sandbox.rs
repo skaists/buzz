@@ -97,14 +97,17 @@ impl FsPolicy {
 struct LauncherArgs {
     read_write: Vec<PathBuf>,
     read_only: Vec<PathBuf>,
-    command: OsString,
+    /// `None` = `--check`: enforce the ruleset, report, and exit.
+    command: Option<OsString>,
     args: Vec<OsString>,
 }
 
 fn parse_launcher_args(mut argv: impl Iterator<Item = OsString>) -> Result<LauncherArgs, String> {
     let (mut read_write, mut read_only) = (Vec::new(), Vec::new());
     loop {
-        let flag = argv.next().ok_or("sandbox-exec: missing `-- <command>`")?;
+        let flag = argv
+            .next()
+            .ok_or("sandbox-exec: missing `-- <command>` or `--check`")?;
         match flag.to_str() {
             Some("--rw") => {
                 read_write.push(argv.next().ok_or("sandbox-exec: --rw needs a path")?.into())
@@ -113,6 +116,17 @@ fn parse_launcher_args(mut argv: impl Iterator<Item = OsString>) -> Result<Launc
                 read_only.push(argv.next().ok_or("sandbox-exec: --ro needs a path")?.into())
             }
             Some("--") => break,
+            Some("--check") => {
+                if argv.next().is_some() {
+                    return Err("sandbox-exec: --check must be the last argument".into());
+                }
+                return Ok(LauncherArgs {
+                    read_write,
+                    read_only,
+                    command: None,
+                    args: Vec::new(),
+                });
+            }
             _ => return Err(format!("sandbox-exec: unexpected argument {flag:?}")),
         }
     }
@@ -122,17 +136,72 @@ fn parse_launcher_args(mut argv: impl Iterator<Item = OsString>) -> Result<Launc
     Ok(LauncherArgs {
         read_write,
         read_only,
-        command,
+        command: Some(command),
         args: argv.collect(),
     })
 }
 
-/// Entry point for `buzz-acp sandbox-exec`. Only returns on failure; on
-/// success the process image is replaced by the agent.
+/// Why the boundary could not be established. Both stop an explicitly
+/// isolated agent from starting; they differ in who has to act.
+#[derive(Debug)]
+pub(crate) enum SandboxError {
+    /// The grants themselves are wrong (a path cannot be opened): fix the
+    /// Buzz configuration.
+    Config(String),
+    /// The kernel cannot enforce the required Landlock ABI or ruleset:
+    /// upgrade the worker kernel. Never a reason to fall back.
+    Kernel(String),
+}
+
+impl std::fmt::Display for SandboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SandboxError::Config(msg) => write!(
+                f,
+                "sandbox-exec: configuration error: {msg} (fix the --agent-fs-* grants)"
+            ),
+            SandboxError::Kernel(msg) => write!(
+                f,
+                "sandbox-exec: kernel cannot enforce Landlock filesystem isolation: {msg} \
+                 (needs Landlock ABI v3, Linux 6.2+; upgrade the worker kernel)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SandboxError {}
+
+/// Entry point for `buzz-acp sandbox-exec`. With a command it only returns on
+/// failure, because on success the process image is replaced by the agent.
+/// With `--check` it enforces the ruleset and exits, as a startup probe.
 pub(crate) fn run_launcher(argv: impl Iterator<Item = OsString>) -> anyhow::Result<()> {
     let launch = parse_launcher_args(argv).map_err(anyhow::Error::msg)?;
     imp::restrict(&launch.read_write, &launch.read_only)?;
-    Err(imp::exec(&launch.command, &launch.args))
+    match launch.command {
+        None => Ok(()),
+        Some(command) => Err(imp::exec(&command, &launch.args)),
+    }
+}
+
+/// Startup probe run by the harness: enforce `policy` in a throwaway launcher
+/// so an unsupported kernel or a bad grant stops the harness before any
+/// agent is spawned, with the launcher's classified error.
+pub(crate) fn probe(policy: &FsPolicy) -> anyhow::Result<()> {
+    let mut argv = policy.launcher_args("", &[]);
+    argv.truncate(argv.len() - 2); // drop `-- <command>`
+    argv.push("--check".into());
+    let mut cmd = std::process::Command::new(&policy.launcher);
+    cmd.args(argv);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::arg0(&mut cmd, "buzz-acp");
+    let out = cmd.output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    // First line only: the launcher's classified error, without a backtrace.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let reason = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    anyhow::bail!("agent filesystem isolation unavailable: {}", reason.trim())
 }
 
 #[cfg(target_os = "linux")]
@@ -141,9 +210,10 @@ mod imp {
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
 
+    use super::SandboxError;
     use landlock::{
-        path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
+        Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetError, RulesetStatus, ABI,
     };
 
     /// Landlock ABI floor (Linux 6.2+): covers file rename/link across
@@ -151,25 +221,55 @@ mod imp {
     /// rather than sandboxed partially.
     const ABI_FLOOR: ABI = ABI::V3;
 
-    pub(super) fn restrict(read_write: &[PathBuf], read_only: &[PathBuf]) -> anyhow::Result<()> {
+    pub(super) fn restrict(
+        read_write: &[PathBuf],
+        read_only: &[PathBuf],
+    ) -> Result<(), SandboxError> {
+        // Open every grant before touching Landlock, so a bad path is
+        // reported as configuration, never as a kernel limitation.
+        let rules = read_only
+            .iter()
+            .map(|p| (p, AccessFs::from_read(ABI_FLOOR)))
+            .chain(
+                read_write
+                    .iter()
+                    .map(|p| (p, AccessFs::from_all(ABI_FLOOR))),
+            )
+            .map(|(path, access)| {
+                let fd = PathFd::new(path)
+                    .map_err(|e| SandboxError::Config(format!("grant path: {e}")))?;
+                let is_dir = path
+                    .metadata()
+                    .map_err(|e| {
+                        SandboxError::Config(format!("grant path {}: {e}", path.display()))
+                    })?
+                    .is_dir();
+                // Directory-only rights cannot apply to a file rule.
+                let access = if is_dir {
+                    access
+                } else {
+                    access & AccessFs::from_file(ABI_FLOOR)
+                };
+                Ok(PathBeneath::new(fd, access))
+            })
+            .collect::<Result<Vec<_>, SandboxError>>()?;
+
+        let kernel = |e: RulesetError| SandboxError::Kernel(e.to_string());
         let status = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(AccessFs::from_all(ABI_FLOOR))?
-            .create()?
-            .add_rules(path_beneath_rules(
-                read_only,
-                AccessFs::from_read(ABI_FLOOR),
-            ))?
-            .add_rules(path_beneath_rules(
-                read_write,
-                AccessFs::from_all(ABI_FLOOR),
-            ))?
-            .restrict_self()?;
-        if status.ruleset != RulesetStatus::FullyEnforced {
-            anyhow::bail!(
-                "sandbox-exec: Landlock not fully enforced ({:?}); refusing to start the agent",
-                status.ruleset
-            );
+            .handle_access(AccessFs::from_all(ABI_FLOOR))
+            .map_err(kernel)?
+            .create()
+            .map_err(kernel)?
+            .add_rules(rules.into_iter().map(Ok::<_, RulesetError>))
+            .map_err(kernel)?
+            .restrict_self()
+            .map_err(kernel)?;
+        if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+            return Err(SandboxError::Kernel(format!(
+                "ruleset {:?}, no_new_privs {}",
+                status.ruleset, status.no_new_privs
+            )));
         }
         Ok(())
     }
@@ -188,8 +288,12 @@ mod imp {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    pub(super) fn restrict(_: &[PathBuf], _: &[PathBuf]) -> anyhow::Result<()> {
-        anyhow::bail!("sandbox-exec: filesystem isolation requires Linux (Landlock)")
+    use super::SandboxError;
+
+    pub(super) fn restrict(_: &[PathBuf], _: &[PathBuf]) -> Result<(), SandboxError> {
+        Err(SandboxError::Kernel(
+            "filesystem isolation requires Linux (Landlock)".into(),
+        ))
     }
 
     pub(super) fn exec(_: &OsString, _: &[OsString]) -> anyhow::Error {
@@ -225,7 +329,7 @@ mod tests {
             parsed.read_only,
             vec![PathBuf::from("/usr"), PathBuf::from("/opt/agent")]
         );
-        assert_eq!(parsed.command, "claude-agent-acp");
+        assert_eq!(parsed.command.as_deref(), Some("claude-agent-acp".as_ref()));
         // A literal `--` in the agent's own args belongs to the agent.
         assert_eq!(parsed.args, vec![OsString::from("--flag"), "--".into()]);
     }
@@ -237,6 +341,7 @@ mod tests {
             &["--rw", "/work"][..],
             &["--"][..],
             &["--bogus", "x", "--", "sh"][..],
+            &["--check", "extra"][..],
         ] {
             assert!(parse_launcher_args(os(argv)).is_err(), "{argv:?}");
         }

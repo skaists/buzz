@@ -1922,6 +1922,11 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    // Explicitly requested filesystem isolation must be enforceable before
+    // anything else starts; there is no fallback to env-only isolation.
+    if let Some(fs) = &config.agent_fs_policy {
+        fs_sandbox::probe(fs)?;
+    }
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //

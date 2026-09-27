@@ -25,9 +25,10 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn sandboxed(workspace: &Path, script: &str) -> Output {
-    // The harness's real defaults, so a leak in them fails these tests.
-    let mut cmd = Command::new(LAUNCHER);
-    cmd.arg("sandbox-exec").arg("--rw").arg(workspace);
+    sandboxed_with(&[workspace], script)
+}
+
+fn default_grants(cmd: &mut Command) {
     for rw in buzz_acp::DEFAULT_READ_WRITE
         .iter()
         .filter(|p| Path::new(p).exists())
@@ -40,6 +41,18 @@ fn sandboxed(workspace: &Path, script: &str) -> Output {
     {
         cmd.args(["--ro", ro]);
     }
+}
+
+/// Run `script` under the launcher with the harness's real default grants
+/// plus `rw` (the workspace, and e.g. the agent Cargo home), so a leak in
+/// the defaults fails these tests.
+fn sandboxed_with(rw: &[&Path], script: &str) -> Output {
+    let mut cmd = Command::new(LAUNCHER);
+    cmd.arg("sandbox-exec");
+    for dir in rw {
+        cmd.arg("--rw").arg(dir);
+    }
+    default_grants(&mut cmd);
     cmd.args(["--", "/bin/sh", "-c", script]);
     cmd.output().expect("run launcher")
 }
@@ -54,8 +67,8 @@ fn enforced_or_refused(out: &Output, marker: &Path) -> bool {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success() && stderr.contains("Landlock"),
-        "agent did not start and the launcher gave no Landlock refusal: {stderr}"
+        !out.status.success() && stderr.contains("kernel cannot enforce Landlock"),
+        "agent did not start and the launcher gave no kernel refusal: {stderr}"
     );
     eprintln!("Landlock unavailable on this kernel; verified fail-closed refusal only");
     false
@@ -196,6 +209,179 @@ fn agent_cannot_read_another_processs_environment_via_proc() {
         );
     }
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn probe_reports_kernel_support_or_a_kernel_refusal() {
+    // Fact 1: the minimum ABI and every promised right are enforceable, or
+    // the probe fails closed with an error that names the kernel.
+    let mut cmd = Command::new(LAUNCHER);
+    cmd.arg("sandbox-exec");
+    default_grants(&mut cmd);
+    let out = cmd.arg("--check").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || stderr.contains("kernel cannot enforce Landlock"),
+        "probe failed without a kernel classification: {stderr}"
+    );
+    eprintln!(
+        "landlock probe on this kernel: {}",
+        if out.status.success() {
+            "enforced"
+        } else {
+            "refused"
+        }
+    );
+}
+
+#[test]
+fn bad_grants_are_a_configuration_error_not_a_kernel_error() {
+    // Operators must know whether to fix the Buzz config or the kernel.
+    let out = Command::new(LAUNCHER)
+        .args([
+            "sandbox-exec",
+            "--ro",
+            "/definitely/not/a/grant/path",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("configuration error"), "{stderr}");
+    assert!(!stderr.contains("kernel cannot enforce"), "{stderr}");
+}
+
+#[test]
+fn workspace_and_agent_cargo_home_stay_writable() {
+    // Fact 2 (positive half): the grants the agent needs actually work.
+    let workspace = scratch("ws-cargo");
+    let cargo_home = scratch("cargo-home");
+    let marker = workspace.join("ran");
+    let script = format!(
+        "touch '{marker}'; echo ok > '{ws}/w' && echo ok > '{ch}/registry-cache' && \
+         cat '{ch}/registry-cache' > '{ws}/r'",
+        marker = marker.display(),
+        ws = workspace.display(),
+        ch = cargo_home.display(),
+    );
+    let out = sandboxed_with(&[&workspace, &cargo_home], &script);
+    if enforced_or_refused(&out, &marker) {
+        assert!(workspace.join("w").exists());
+        assert!(cargo_home.join("registry-cache").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("r")).unwrap(),
+            "ok\n"
+        );
+    }
+    for dir in [workspace, cargo_home] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn symlink_inside_workspace_does_not_reach_outside_it() {
+    // A link planted in an allowed directory must not become a door to a
+    // forbidden file: Landlock checks the resolved target, not the link.
+    let secrets = scratch("secrets-link");
+    let workspace = scratch("ws-link");
+    let key = secrets.join("wallet.json");
+    std::fs::write(&key, "{\"seed\": \"host-wallet-secret\"}").unwrap();
+    std::os::unix::fs::symlink(&key, workspace.join("wallet-link")).unwrap();
+    std::os::unix::fs::symlink(&secrets, workspace.join("dir-link")).unwrap();
+    let marker = workspace.join("ran");
+    let script = format!(
+        "touch '{marker}'; \
+         {{ cat '{ws}/wallet-link'; cat '{ws}/dir-link/wallet.json'; }} > '{ws}/link.out' 2>&1",
+        marker = marker.display(),
+        ws = workspace.display(),
+    );
+    // Control: unsandboxed, the link reads the secret.
+    let control = Command::new("/bin/cat")
+        .arg(workspace.join("wallet-link"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&control.stdout).contains("host-wallet-secret"));
+
+    let out = sandboxed(&workspace, &script);
+    if enforced_or_refused(&out, &marker) {
+        let read = std::fs::read_to_string(workspace.join("link.out")).unwrap();
+        assert!(
+            !read.contains("host-wallet-secret"),
+            "symlink escaped: {read}"
+        );
+        assert_eq!(read.matches("Permission denied").count(), 2, "{read}");
+    }
+    for dir in [secrets, workspace] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn real_tools_spawned_by_the_agent_cannot_read_outside_it() {
+    // Fact 3 through ordinary tool chains: agent shell → child shell →
+    // grandchild tool (python3, perl, git). Escaping the policy by launching
+    // a different executable must not work.
+    let secrets = scratch("secrets-tools");
+    let workspace = scratch("ws-tools");
+    let key = secrets.join("credentials.toml");
+    std::fs::write(&key, "token = \"tool-secret\"").unwrap();
+    let marker = workspace.join("ran");
+    let k = key.display();
+    let tools: Vec<(&str, String)> = [
+        ("python3", format!("python3 -c 'print(open(\"{k}\").read())'")),
+        ("perl", format!("perl -e 'open(F, \"<{k}\") or die \\$!; print <F>'")),
+        ("git", format!("git hash-object --no-filters '{k}' && git --no-pager diff --no-index /dev/null '{k}'")),
+    ]
+    .into_iter()
+    .filter(|(tool, _)| Command::new(tool).arg("--version").output().is_ok())
+    .collect();
+    assert!(
+        tools.len() >= 2,
+        "need at least two of python3/perl/git to test tool chains"
+    );
+
+    let mut script = format!("touch '{}';", marker.display());
+    for (tool, cmd) in &tools {
+        script.push_str(&format!(
+            " /bin/sh -c \"{}\" > '{}/{tool}.out' 2>&1;",
+            cmd.replace('\"', "\\\""),
+            workspace.display()
+        ));
+    }
+    // Control: unsandboxed, each tool reads the secret.
+    let control_ws = scratch("ws-tools-control");
+    let control = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &script.replace(&*workspace.to_string_lossy(), &control_ws.to_string_lossy()),
+        ])
+        .output()
+        .unwrap();
+    assert!(control.status.success() || control_ws.join("ran").exists());
+    for (tool, _) in &tools {
+        let out = std::fs::read_to_string(control_ws.join(format!("{tool}.out"))).unwrap();
+        assert!(out.contains("tool-secret"), "{tool} control: {out}");
+    }
+
+    let out = sandboxed(&workspace, &script);
+    if enforced_or_refused(&out, &marker) {
+        for (tool, _) in &tools {
+            let read = std::fs::read_to_string(workspace.join(format!("{tool}.out"))).unwrap();
+            assert!(
+                !read.contains("tool-secret"),
+                "{tool} read the secret: {read}"
+            );
+            // The tool really ran and the kernel refused it (not merely absent).
+            assert!(
+                read.contains("Permission denied") || read.contains("PermissionError"),
+                "{tool} was not refused by the kernel: {read}"
+            );
+        }
+    }
+    for dir in [secrets, workspace, control_ws] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
