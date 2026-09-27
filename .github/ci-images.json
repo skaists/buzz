@@ -1,0 +1,23 @@
+{
+  "_comment": "Images CI builds from pinned upstream source because upstream no longer serves the prebuilt digests (see PR #9). `commit` must be the commit `release_tag` points at; the workflow re-checks it. `replaces` is the upstream image the build stands in for. Built by .github/workflows/ci-images.yml from ci/images/minio-from-source.Dockerfile.",
+  "images": [
+    {
+      "name": "minio",
+      "repo": "minio/minio",
+      "release_tag": "RELEASE.2025-09-07T16-13-09Z",
+      "commit": "07c3a429bfed433e49018cb0f78a52145d4bedeb",
+      "bin": "minio",
+      "platforms": "linux/amd64,linux/arm64",
+      "replaces": "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    },
+    {
+      "name": "mc",
+      "repo": "minio/mc",
+      "release_tag": "RELEASE.2025-08-13T08-35-41Z",
+      "commit": "7394ce0dd2a80935aded936b09fa12cbb3cb8096",
+      "bin": "mc",
+      "platforms": "linux/amd64,linux/arm64",
+      "replaces": "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+    }
+  ]
+}
