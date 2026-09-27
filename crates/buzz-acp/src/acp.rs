@@ -485,6 +485,14 @@ fn env_name_has_prefix(name: &str, prefix: &str) -> bool {
         .is_some_and(|head| env_name_eq(head, prefix))
 }
 
+/// Every isolation boundary applied when spawning an agent subprocess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentSandbox {
+    pub env: AgentEnvPolicy,
+    /// `Some` runs the agent under the Landlock launcher (`--agent-fs-isolation`).
+    pub fs: Option<crate::fs_sandbox::FsPolicy>,
+}
+
 impl AgentEnvPolicy {
     /// Whether a parent variable reaches the agent under this policy.
     fn forwards(&self, key: &str) -> bool {
@@ -566,31 +574,47 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
-        Self::spawn_with_env_policy(
+        Self::spawn_sandboxed(
             command,
             args,
             extra_env,
             has_generated_codex_config,
-            &AgentEnvPolicy::Inherit,
+            &AgentSandbox::default(),
         )
         .await
     }
 
-    /// [`spawn`](Self::spawn) with an explicit [`AgentEnvPolicy`]. Pool
-    /// workers use this so `--agent-env-isolation` applies to every spawn and
-    /// respawn.
-    pub async fn spawn_with_env_policy(
+    /// [`spawn`](Self::spawn) under an explicit [`AgentSandbox`]. Pool
+    /// workers use this so `--agent-env-isolation` and `--agent-fs-isolation`
+    /// apply to every spawn and respawn.
+    pub async fn spawn_sandboxed(
         command: &str,
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
-        env_policy: &AgentEnvPolicy,
+        sandbox: &AgentSandbox,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
+        let env_policy = &sandbox.env;
 
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        let mut cmd = match &sandbox.fs {
+            None => {
+                let mut cmd = tokio::process::Command::new(command);
+                cmd.args(args);
+                cmd
+            }
+            Some(fs) => {
+                // Re-enter this binary as the Landlock launcher, which
+                // restricts itself and then execs `command`. argv0 selects
+                // the buzz-acp personality inside the sprig multicall binary.
+                let mut cmd = tokio::process::Command::new(&fs.launcher);
+                cmd.args(fs.launcher_args(command, args));
+                #[cfg(unix)]
+                cmd.arg0("buzz-acp");
+                cmd
+            }
+        };
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so agent logs are visible in the harness terminal.
             .stderr(Stdio::inherit())
@@ -2496,12 +2520,16 @@ mod tests {
                 .as_nanos()
         ));
         let script = format!("env > '{}'", out.display());
-        let mut acp = AcpClient::spawn_with_env_policy(
+        let sandbox = AgentSandbox {
+            env: policy.clone(),
+            fs: None,
+        };
+        let mut acp = AcpClient::spawn_sandboxed(
             "/bin/sh",
             &["-c".to_string(), script],
             extra_env,
             false,
-            policy,
+            &sandbox,
         )
         .await
         .expect("spawn env probe");

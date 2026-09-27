@@ -13,8 +13,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::acp::AgentEnvPolicy;
+use crate::acp::{AgentEnvPolicy, AgentSandbox};
 use crate::filter::SubscriptionRule;
+use crate::fs_sandbox::FsPolicy;
 
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
 /// deprecated `--turn-timeout` is set.
@@ -509,6 +510,24 @@ pub struct CliArgs {
     /// Requires `--agent-env-isolation`.
     #[arg(long, env = "BUZZ_ACP_AGENT_CARGO_HOME")]
     pub agent_cargo_home: Option<PathBuf>,
+
+    /// Linux only: run agents under a Landlock filesystem boundary. The agent
+    /// and everything it starts may only use the harness working directory,
+    /// the agent Cargo home, `--agent-fs-rw` and `--agent-fs-ro` paths, and
+    /// system read-only paths. Refuses to start where Landlock cannot be
+    /// fully enforced. Limits file access only, not the network.
+    #[arg(long, env = "BUZZ_ACP_AGENT_FS_ISOLATION", default_value_t = false)]
+    pub agent_fs_isolation: bool,
+
+    /// Comma-separated absolute paths isolated agents may read and write
+    /// (e.g. a private temp dir, `~/.claude`). Requires `--agent-fs-isolation`.
+    #[arg(long, env = "BUZZ_ACP_AGENT_FS_RW", value_delimiter = ',')]
+    pub agent_fs_rw: Vec<PathBuf>,
+
+    /// Comma-separated absolute paths isolated agents may read and execute
+    /// (e.g. the agent's install directory). Requires `--agent-fs-isolation`.
+    #[arg(long, env = "BUZZ_ACP_AGENT_FS_RO", value_delimiter = ',')]
+    pub agent_fs_ro: Vec<PathBuf>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -601,6 +620,8 @@ pub struct Config {
     pub base_prompt_content: Option<String>,
     /// Which harness env vars agent subprocesses inherit.
     pub agent_env_policy: AgentEnvPolicy,
+    /// Landlock filesystem boundary for agents; `None` = unrestricted.
+    pub agent_fs_policy: Option<FsPolicy>,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -906,7 +927,72 @@ fn agent_env_policy_from_args(
     })
 }
 
+/// Validate the agent-fs flags into an optional [`FsPolicy`].
+fn agent_fs_policy_from_args(
+    isolation: bool,
+    read_write: Vec<PathBuf>,
+    read_only: Vec<PathBuf>,
+    env_policy: &AgentEnvPolicy,
+) -> Result<Option<FsPolicy>, ConfigError> {
+    if !isolation {
+        if !read_write.is_empty() || !read_only.is_empty() {
+            return Err(ConfigError::ConfigFile(
+                "--agent-fs-rw and --agent-fs-ro require --agent-fs-isolation".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    if !cfg!(target_os = "linux") {
+        return Err(ConfigError::ConfigFile(
+            "--agent-fs-isolation requires Linux (Landlock)".into(),
+        ));
+    }
+    for path in read_write.iter().chain(&read_only) {
+        if !path.is_absolute() || !path.exists() {
+            return Err(ConfigError::ConfigFile(format!(
+                "agent fs path must be absolute and exist: {}",
+                path.display()
+            )));
+        }
+    }
+    // Agents run in the harness working directory; it is the workspace.
+    let mut rw = vec![std::env::current_dir()?];
+    if let AgentEnvPolicy::Isolated {
+        cargo_home: Some(dir),
+        ..
+    } = env_policy
+    {
+        rw.push(dir.clone());
+    }
+    rw.extend(
+        crate::fs_sandbox::DEFAULT_READ_WRITE
+            .iter()
+            .map(PathBuf::from),
+    );
+    rw.extend(read_write);
+    let mut ro: Vec<PathBuf> = crate::fs_sandbox::DEFAULT_READ_ONLY
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+    ro.extend(read_only);
+    rw.retain(|p| p.exists());
+    Ok(Some(FsPolicy {
+        read_write: rw,
+        read_only: ro,
+        launcher: std::env::current_exe()?,
+    }))
+}
+
 impl Config {
+    /// The isolation boundaries applied to every agent spawn.
+    pub fn agent_sandbox(&self) -> AgentSandbox {
+        AgentSandbox {
+            env: self.agent_env_policy.clone(),
+            fs: self.agent_fs_policy.clone(),
+        }
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
@@ -1143,6 +1229,12 @@ impl Config {
             args.agent_env_passthrough,
             args.agent_cargo_home,
         )?;
+        let agent_fs_policy = agent_fs_policy_from_args(
+            args.agent_fs_isolation,
+            args.agent_fs_rw,
+            args.agent_fs_ro,
+            &agent_env_policy,
+        )?;
 
         let config = Config {
             keys,
@@ -1196,6 +1288,7 @@ impl Config {
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
             agent_env_policy,
+            agent_fs_policy,
         };
 
         Ok(config)
@@ -1569,6 +1662,7 @@ mod tests {
             no_base_prompt: false,
             base_prompt_content: None,
             agent_env_policy: AgentEnvPolicy::Inherit,
+            agent_fs_policy: None,
         }
     }
 
@@ -2922,6 +3016,70 @@ channels = "ALL"
             .expect_err("credential-bearing cargo home must be rejected");
             assert!(err.to_string().contains("credential-free"), "{err}");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn agent_fs_isolation_defaults_off() {
+        let config = parse_agent_env(&[]).expect("default config");
+        assert_eq!(config.agent_fs_policy, None);
+        assert_eq!(config.agent_sandbox().fs, None);
+    }
+
+    #[test]
+    fn agent_fs_paths_without_isolation_are_rejected() {
+        // Grants that silently do nothing would read as a sandbox that is not there.
+        for extra in [
+            &["--agent-fs-rw", "/tmp"][..],
+            &["--agent-fs-ro", "/opt"][..],
+        ] {
+            let err = parse_agent_env(extra).expect_err("must require fs isolation");
+            assert!(err.to_string().contains("--agent-fs-isolation"), "{err}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_fs_policy_grants_workspace_and_cargo_home_only_by_default() {
+        let cargo_home = unique_temp_dir("fs-cargo");
+        let extra = unique_temp_dir("fs-extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        let config = parse_agent_env(&[
+            "--agent-env-isolation",
+            "--agent-cargo-home",
+            cargo_home.to_str().unwrap(),
+            "--agent-fs-isolation",
+            "--agent-fs-rw",
+            extra.to_str().unwrap(),
+        ])
+        .expect("fs isolated config");
+        let fs = config.agent_fs_policy.expect("fs policy");
+        let cwd = std::env::current_dir().unwrap();
+        assert!(fs.read_write.contains(&cwd), "workspace must be writable");
+        assert!(
+            fs.read_write.contains(&cargo_home),
+            "agent cargo home must be writable"
+        );
+        assert!(fs.read_write.contains(&extra));
+        // The host home is never granted implicitly: that is where ~/.ssh,
+        // ~/.cargo and wallet files live.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            if !cwd.starts_with(&home) {
+                assert!(!fs.read_write.contains(&home) && !fs.read_only.contains(&home));
+            }
+        }
+        assert!(fs.read_only.iter().all(|p| p.is_absolute()));
+        let _ = std::fs::remove_dir_all(&cargo_home);
+        let _ = std::fs::remove_dir_all(&extra);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_fs_grants_must_be_absolute_and_exist() {
+        for path in ["relative/dir", "/definitely/not/here/buzz-acp"] {
+            let err = parse_agent_env(&["--agent-fs-isolation", "--agent-fs-ro", path])
+                .expect_err("bad grant must be rejected");
+            assert!(err.to_string().contains("absolute and exist"), "{err}");
         }
     }
 
