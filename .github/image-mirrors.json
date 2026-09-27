@@ -1,0 +1,17 @@
+{
+  "_comment": "Third-party images CI depends on, mirrored into this org's registry by exact digest. `digest` is the upstream content address and must never change without a review. `sources` are tried in order; any source that serves this exact digest is acceptable because the digest pins the content. See .github/workflows/mirror-images.yml.",
+  "images": [
+    {
+      "name": "minio",
+      "upstream_tag": "RELEASE.2025-09-07T16-13-09Z",
+      "digest": "sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "sources": ["quay.io/minio/minio", "docker.io/minio/minio"]
+    },
+    {
+      "name": "mc",
+      "upstream_tag": "RELEASE.2025-08-13T08-35-41Z",
+      "digest": "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727",
+      "sources": ["quay.io/minio/mc", "docker.io/minio/mc"]
+    }
+  ]
+}
