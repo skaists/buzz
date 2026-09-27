@@ -413,6 +413,115 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+/// How much of the harness's own environment an agent subprocess receives.
+///
+/// `Inherit` is the historical default: the agent sees every variable the
+/// harness sees. `Isolated` starts the agent from an empty environment and
+/// forwards only process essentials, the agent's own Buzz identity (which the
+/// `buzz` CLI and `git-credential-nostr` need), and variables the operator
+/// names explicitly. This narrows what reaches the agent *through the
+/// environment* only — it is not a filesystem or network boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AgentEnvPolicy {
+    #[default]
+    Inherit,
+    Isolated {
+        /// Additional parent variable names the operator chose to forward.
+        passthrough: Vec<String>,
+        /// Credential-free Cargo home used instead of the host's `~/.cargo`.
+        cargo_home: Option<std::path::PathBuf>,
+    },
+}
+
+/// Parent variables forwarded in isolated mode so the agent can run at all.
+const ISOLATED_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "TMPDIR",
+    // Windows process essentials.
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+];
+
+/// The agent's own identity and relay git auth. The desktop launcher sets
+/// these on the harness for the agent (`managed_agents/runtime.rs`); they are
+/// the agent's credentials, not the host's.
+const ISOLATED_AGENT_IDENTITY_ENV: &[&str] = &[
+    "BUZZ_RELAY_URL",
+    "BUZZ_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_COUNT",
+];
+const ISOLATED_AGENT_IDENTITY_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Env var names are case-insensitive on Windows (`Path`, `SystemRoot`).
+fn env_name_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+fn env_name_has_prefix(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len())
+        .is_some_and(|head| env_name_eq(head, prefix))
+}
+
+impl AgentEnvPolicy {
+    /// Whether a parent variable reaches the agent under this policy.
+    fn forwards(&self, key: &str) -> bool {
+        match self {
+            Self::Inherit => true,
+            Self::Isolated { passthrough, .. } => {
+                ISOLATED_BASE_ENV
+                    .iter()
+                    .chain(ISOLATED_AGENT_IDENTITY_ENV)
+                    .any(|name| env_name_eq(name, key))
+                    || ISOLATED_AGENT_IDENTITY_PREFIXES
+                        .iter()
+                        .any(|prefix| env_name_has_prefix(key, prefix))
+                    || passthrough.iter().any(|name| env_name_eq(name, key))
+            }
+        }
+    }
+
+    /// Whether the agent will see a parent value for `key`.
+    fn inherits(&self, key: &str) -> bool {
+        self.forwards(key) && std::env::var_os(key).is_some()
+    }
+
+    /// Replace the inherited environment with the forwarded subset.
+    fn restrict(&self, cmd: &mut tokio::process::Command) {
+        if matches!(self, Self::Inherit) {
+            return;
+        }
+        cmd.env_clear();
+        for (key, value) in std::env::vars_os() {
+            if key.to_str().is_some_and(|k| self.forwards(k)) {
+                cmd.env(key, value);
+            }
+        }
+    }
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -457,6 +566,26 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
+        Self::spawn_with_env_policy(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            &AgentEnvPolicy::Inherit,
+        )
+        .await
+    }
+
+    /// [`spawn`](Self::spawn) with an explicit [`AgentEnvPolicy`]. Pool
+    /// workers use this so `--agent-env-isolation` applies to every spawn and
+    /// respawn.
+    pub async fn spawn_with_env_policy(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        env_policy: &AgentEnvPolicy,
+    ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
         let mut cmd = tokio::process::Command::new(command);
@@ -468,10 +597,11 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        env_policy.restrict(&mut cmd);
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
-        // in the parent environment.
+        // in the parent environment and forwarded to the agent by `env_policy`.
         //
         // CODEX_CONFIG is handled specially via build_codex_config_env:
         //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
@@ -479,7 +609,10 @@ impl AcpClient {
         //   • has_generated_codex_config=false: return None; any persona-supplied
         //     CODEX_CONFIG falls through to the normal operator-wins loop below.
         let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
-        let parent_codex_config = if has_generated_codex_config && has_codex_config {
+        let parent_codex_config = if has_generated_codex_config
+            && has_codex_config
+            && env_policy.forwards("CODEX_CONFIG")
+        {
             std::env::var("CODEX_CONFIG").ok()
         } else {
             None
@@ -498,7 +631,7 @@ impl AcpClient {
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
         for &(key, value) in crate::config::default_agent_env(command) {
-            if std::env::var_os(key).is_none() {
+            if !env_policy.inherits(key) {
                 cmd.env(key, value);
             }
         }
@@ -508,12 +641,21 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
+            if !env_policy.inherits(key) {
                 cmd.env(key, value);
             }
         }
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
+        }
+        // Operator-configured Cargo home wins over persona env: its purpose
+        // is keeping host registry credentials out of the agent's cargo.
+        if let AgentEnvPolicy::Isolated {
+            cargo_home: Some(dir),
+            ..
+        } = env_policy
+        {
+            cmd.env("CARGO_HOME", dir);
         }
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
@@ -2329,6 +2471,129 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AgentEnvPolicy ───────────────────────────────────────────────────
+    //
+    // Isolation exists so host credentials the harness happens to hold
+    // (cloud keys, registry tokens, other apps' secrets) do not reach the
+    // agent or anything it shells out to. These tests spawn a real child and
+    // read back its environment, and run the same spawn under `Inherit` as a
+    // control so they fail if isolation stops isolating.
+
+    /// Spawn `env` under `policy` and return the child's environment.
+    #[cfg(unix)]
+    async fn child_env(
+        policy: &AgentEnvPolicy,
+        extra_env: &[(String, String)],
+        tag: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let out = std::env::temp_dir().join(format!(
+            "buzz-acp-env-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!("env > '{}'", out.display());
+        let mut acp = AcpClient::spawn_with_env_policy(
+            "/bin/sh",
+            &["-c".to_string(), script],
+            extra_env,
+            false,
+            policy,
+        )
+        .await
+        .expect("spawn env probe");
+        acp.child.wait().await.expect("env probe exits");
+        let text = std::fs::read_to_string(&out).expect("env probe output");
+        let _ = std::fs::remove_file(&out);
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_agent_env_blocks_host_secrets_and_keeps_granted_vars() {
+        // Unique names: std::env is process-global and tests run in parallel.
+        const HOST_SECRET: &str = "BUZZ_ACP_TEST_ISO_HOST_SECRET";
+        const GRANTED: &str = "BUZZ_ACP_TEST_ISO_GRANTED";
+        const PERSONA_KEY: &str = "BUZZ_ACP_TEST_ISO_PERSONA_KEY";
+        std::env::set_var(HOST_SECRET, "host-secret-value");
+        std::env::set_var(GRANTED, "granted-value");
+        std::env::set_var(PERSONA_KEY, "host-value");
+        let persona = vec![(PERSONA_KEY.to_string(), "persona-value".to_string())];
+        let cargo_home = std::env::temp_dir().join("buzz-acp-test-agent-cargo-home");
+
+        let isolated = AgentEnvPolicy::Isolated {
+            passthrough: vec![GRANTED.to_string()],
+            cargo_home: Some(cargo_home.clone()),
+        };
+        let env = child_env(&isolated, &persona, "isolated").await;
+        assert!(
+            !env.contains_key(HOST_SECRET),
+            "un-granted host variable must not reach an isolated agent"
+        );
+        assert_eq!(env.get(GRANTED).map(String::as_str), Some("granted-value"));
+        assert!(env.contains_key("PATH"), "agent needs PATH to run tools");
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some(cargo_home.to_str().unwrap()),
+            "agent cargo must not fall back to the host ~/.cargo"
+        );
+        // The parent value is not forwarded, so it cannot win over the persona.
+        assert_eq!(
+            env.get(PERSONA_KEY).map(String::as_str),
+            Some("persona-value")
+        );
+
+        // Control: the historical default still inherits everything, with
+        // operator (parent) precedence over persona values.
+        let env = child_env(&AgentEnvPolicy::Inherit, &persona, "inherit").await;
+        assert_eq!(
+            env.get(HOST_SECRET).map(String::as_str),
+            Some("host-secret-value")
+        );
+        assert_eq!(env.get(PERSONA_KEY).map(String::as_str), Some("host-value"));
+    }
+
+    #[test]
+    fn isolated_policy_forwards_the_agents_own_identity() {
+        // The `buzz` CLI and git-credential-nostr run inside the agent and
+        // authenticate as the agent; isolation must not break them.
+        let policy = AgentEnvPolicy::Isolated {
+            passthrough: vec![],
+            cargo_home: None,
+        };
+        for key in [
+            "BUZZ_PRIVATE_KEY",
+            "NOSTR_PRIVATE_KEY",
+            "BUZZ_RELAY_URL",
+            "BUZZ_AUTH_TAG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_1",
+        ] {
+            assert!(policy.forwards(key), "{key} must reach the agent");
+        }
+        // Harness-only credentials and common host secrets must not.
+        for key in [
+            "BUZZ_API_TOKEN",
+            "BUZZ_ACP_PRIVATE_KEY",
+            "BUZZ_ACP_SETUP_PAYLOAD",
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_HOME",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CODEX_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+        ] {
+            assert!(!policy.forwards(key), "{key} must not reach the agent");
+        }
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {

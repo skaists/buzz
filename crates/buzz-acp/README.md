@@ -129,6 +129,16 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `--heartbeat-prompt` | `BUZZ_ACP_HEARTBEAT_PROMPT` | (built-in) | Custom heartbeat prompt text. Conflicts with `--heartbeat-prompt-file`. |
 | `--heartbeat-prompt-file` | `BUZZ_ACP_HEARTBEAT_PROMPT_FILE` | — | Read heartbeat prompt from a file. Conflicts with `--heartbeat-prompt`. |
 
+### Agent Environment Isolation
+
+Off by default: agent subprocesses inherit the harness's full environment. With isolation on, an agent starts from an empty environment and receives only process essentials (`PATH`, `HOME`, locale, temp dirs, …), its own Buzz identity (`BUZZ_PRIVATE_KEY`, `NOSTR_PRIVATE_KEY`, `BUZZ_RELAY_URL`, `BUZZ_AUTH_TAG`, relay `GIT_CONFIG_*`), persona env vars, and the names you pass through. This limits the **environment only**. It is not a filesystem or network sandbox, so an agent can still read files such as `~/.cargo/credentials.toml` directly.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--agent-env-isolation` | `BUZZ_ACP_AGENT_ENV_ISOLATION` | `false` | Start agents from an empty environment plus the forwarded set above. |
+| `--agent-env-passthrough` | `BUZZ_ACP_AGENT_ENV_PASSTHROUGH` | — | Comma-separated extra parent variables to forward (e.g. `ANTHROPIC_API_KEY,HTTPS_PROXY`). Requires isolation. |
+| `--agent-cargo-home` | `BUZZ_ACP_AGENT_CARGO_HOME` | — | Absolute path used as the agent's `CARGO_HOME`, so agent cargo runs never pick up host registry tokens. Created if missing; startup fails if it contains `credentials.toml` or `credentials`. Requires isolation. |
+
 ### Inbound Author Gate
 
 Controls which authors' events the harness forwards to the agent. Events from disallowed authors are silently dropped before reaching subscription rules.
