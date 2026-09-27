@@ -139,6 +139,32 @@ Off by default: agent subprocesses inherit the harness's full environment. With 
 | `--agent-env-passthrough` | `BUZZ_ACP_AGENT_ENV_PASSTHROUGH` | — | Comma-separated extra parent variables to forward (e.g. `ANTHROPIC_API_KEY,HTTPS_PROXY`). Requires isolation. |
 | `--agent-cargo-home` | `BUZZ_ACP_AGENT_CARGO_HOME` | — | Absolute path used as the agent's `CARGO_HOME`, so agent cargo runs never pick up host registry tokens. Created if missing; startup fails if it contains `credentials.toml` or `credentials`. Requires isolation. |
 
+### Agent Filesystem Isolation (Linux)
+
+Off by default. When on, each agent runs under a Landlock filesystem boundary that it and every process it starts inherit. `buzz-acp` re-executes itself as `buzz-acp sandbox-exec`, restricts that process, then execs the agent. Access is allowed only to:
+
+- **read-write:** the harness working directory (the workspace), the `--agent-cargo-home` directory, `/dev/null`, `/dev/full`, and `--agent-fs-rw` paths;
+- **read and execute only:** system paths (`/usr`, `/bin`, `/lib*`, `/etc`, `/opt`, `/nix`, `/sys`), a few system-wide `/proc` files (`cpuinfo`, `meminfo`, `stat`, `/proc/sys`, …), plain devices (`/dev/zero`, `/dev/urandom`, …) and `--agent-fs-ro` paths.
+
+`/proc` is not granted as a whole. `/proc/<pid>/environ` of the harness would hand the agent the variables env isolation withholds, and Landlock does not block that read. The agent process can read its own `/proc/self`, but processes it starts cannot read theirs. `/dev/shm` is not granted.
+
+Everything else, including `~/.ssh`, the host `~/.cargo` and wallet files, is denied by the kernel. Symlinks do not help: Landlock checks the resolved target, so a link inside the workspace to a forbidden file is still denied.
+
+**Fail closed, never fall back.** At startup the harness runs `buzz-acp sandbox-exec --check` with the real grants. If that probe fails, the harness exits before connecting, and it never degrades to env-only isolation. The error names who has to act:
+
+- `configuration error`: a grant path cannot be opened, so fix the `--agent-fs-*` flags;
+- `kernel cannot enforce Landlock`: the kernel lacks Landlock ABI v3 (Linux 6.2+) or cannot fully enforce the ruleset, so upgrade the worker kernel.
+
+The flags are rejected on non-Linux platforms.
+
+This limits file access only. Network access is not restricted, and denied paths remain visible even though they cannot be opened. Agents that keep config or caches under `$HOME` (for example `~/.claude` or npm global installs) need those directories granted explicitly.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--agent-fs-isolation` | `BUZZ_ACP_AGENT_FS_ISOLATION` | `false` | Run agents under the Landlock filesystem boundary. |
+| `--agent-fs-rw` | `BUZZ_ACP_AGENT_FS_RW` | — | Comma-separated absolute paths agents may read and write (e.g. a private temp dir). Must exist. |
+| `--agent-fs-ro` | `BUZZ_ACP_AGENT_FS_RO` | — | Comma-separated absolute paths agents may read and execute (e.g. the agent's install directory). Must exist. |
+
 ### Inbound Author Gate
 
 Controls which authors' events the harness forwards to the agent. Events from disallowed authors are silently dropped before reaching subscription rules.

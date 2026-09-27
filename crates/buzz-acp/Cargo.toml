@@ -73,6 +73,10 @@ evalexpr = { workspace = true }
 
 # Process-group kill (safe wrapper around killpg) — Unix-only; kill_process_group
 # has a #[cfg(not(unix))] fallback in acp.rs.
+# Filesystem capability boundary for `--agent-fs-isolation` (Linux Landlock LSM).
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 

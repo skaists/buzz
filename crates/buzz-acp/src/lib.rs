@@ -4,6 +4,9 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod fs_sandbox;
+#[doc(hidden)]
+pub use fs_sandbox::{DEFAULT_READ_ONLY, DEFAULT_READ_WRITE};
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -1864,6 +1867,11 @@ mod idle_pool_sleep_tests {
 }
 
 pub fn run() -> Result<()> {
+    // The Landlock launcher runs before any runtime or thread exists: it must
+    // restrict a single-threaded process and then exec the agent.
+    if std::env::args_os().nth(1).as_deref() == Some(fs_sandbox::SUBCOMMAND.as_ref()) {
+        return fs_sandbox::run_launcher(std::env::args_os().skip(2));
+    }
     config::propagate_legacy_env_vars();
     tokio_main()
 }
@@ -1914,6 +1922,11 @@ async fn tokio_main() -> Result<()> {
         .init();
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    // Explicitly requested filesystem isolation must be enforceable before
+    // anything else starts; there is no fallback to env-only isolation.
+    if let Some(fs) = &config.agent_fs_policy {
+        fs_sandbox::probe(fs)?;
+    }
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -2431,13 +2444,12 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
-                let env_policy = config.agent_env_policy.clone();
+                let sandbox = config.agent_sandbox();
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
                     let result =
-                        spawn_and_init(&cmd, &args, &env, has_codex, &env_policy, idx, observer)
-                            .await;
+                        spawn_and_init(&cmd, &args, &env, has_codex, &sandbox, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -4316,13 +4328,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let env_policy = config.agent_env_policy.clone();
+    let sandbox = config.agent_sandbox();
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, &env_policy, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, &sandbox, i, observer).await;
         guard.send(result);
     });
 }
@@ -4528,7 +4540,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let env_policy = config.agent_env_policy.clone();
+    let sandbox = config.agent_sandbox();
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -4540,8 +4552,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result =
-            spawn_and_init(&cmd, &args, &env, has_codex, &env_policy, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, &sandbox, index, observer).await;
         guard.send(result);
     });
 
@@ -4585,7 +4596,7 @@ struct PoolStartup {
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
-    env_policy: acp::AgentEnvPolicy,
+    sandbox: acp::AgentSandbox,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
 }
@@ -4598,7 +4609,7 @@ impl PoolStartup {
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
-            env_policy: config.agent_env_policy.clone(),
+            sandbox: config.agent_sandbox(),
             model: config.model.clone(),
             observer,
         }
@@ -4613,12 +4624,12 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
-        let spawn_result = AcpClient::spawn_with_env_policy(
+        let spawn_result = AcpClient::spawn_sandboxed(
             &startup.command,
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
-            &startup.env_policy,
+            &startup.sandbox,
         )
         .await;
         match spawn_result {
@@ -4719,16 +4730,16 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
-    env_policy: &acp::AgentEnvPolicy,
+    sandbox: &acp::AgentSandbox,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn_with_env_policy(
+    let mut acp = AcpClient::spawn_sandboxed(
         command,
         args,
         extra_env,
         has_generated_codex_config,
-        env_policy,
+        sandbox,
     )
     .await
     .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
@@ -6782,6 +6793,7 @@ mod build_mcp_servers_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             agent_env_policy: acp::AgentEnvPolicy::Inherit,
+            agent_fs_policy: None,
         }
     }
 
@@ -7006,6 +7018,7 @@ mod error_outcome_emission_tests {
             no_base_prompt: false,
             base_prompt_content: None,
             agent_env_policy: acp::AgentEnvPolicy::Inherit,
+            agent_fs_policy: None,
         }
     }
 
