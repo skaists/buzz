@@ -1,5 +1,5 @@
 {
-  "_comment": "Images CI builds from pinned upstream source because upstream no longer serves the prebuilt digests (see PR #9). `commit` must be the commit `release_tag` points at; the workflow re-checks it. `replaces` is the upstream image the build stands in for. Built by .github/workflows/ci-images.yml from ci/images/minio-from-source.Dockerfile.",
+  "_comment": "Images CI builds from pinned upstream source because upstream no longer serves the prebuilt digests (see PR #9). `commit` must be the commit `release_tag` points at; the workflow re-checks it. `replaces` is the upstream image the build stands in for; the rebuild is NOT byte-identical to it, only built from the same release commit under a recorded recipe. Built by .github/workflows/ci-images.yml from ci/images/minio-from-source.Dockerfile.",
   "images": [
     {
       "name": "minio",

@@ -101,7 +101,8 @@ jobs:
               --arg platforms "$platforms" --arg image "${image}:${tag}-src@${digest}" \
               --arg replaces "$(field replaces)" --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --arg run "$RUN_URL" \
-              '{name: $name, source: $source, release_tag: $release_tag, commit: $commit, dockerfile: $dockerfile, dockerfile_sha256: $dockerfile_sha256, platforms: $platforms, image: $image, replaces: $replaces, built_at: $built_at, run: $run}')"
+              --arg equivalence "Not byte-identical to 'replaces'. Rebuilt from the pinned upstream release commit with the recorded Dockerfile, base-image digests and go.sum; equivalent in source and release, not in bytes." \
+              '{name: $name, source: $source, release_tag: $release_tag, commit: $commit, dockerfile: $dockerfile, dockerfile_sha256: $dockerfile_sha256, platforms: $platforms, image: $image, replaces: $replaces, equivalence: $equivalence, built_at: $built_at, run: $run}')"
             echo "built and verified $name: ${refs[$name]}"
           done
 
