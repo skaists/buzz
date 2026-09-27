@@ -44,7 +44,7 @@ services:
   minio:
     # Built from the pinned upstream release commit by .github/workflows/ci-images.yml
     # (provenance: .github/ci-images.json); not byte-identical to the retired quay.io image.
-    image: ghcr.io/skaists/buzz-ci-images/minio:RELEASE.2025-09-07T16-13-09Z-src@sha256:a660f3ee421bf618bb64a6ae8883ba71d3af89250b8db78a5d18393d1b2200bb
+    image: ghcr.io/skaists/buzz-ci-images/minio:RELEASE.2025-09-07T16-13-09Z-src@sha256:638b02a789d65a452b3155289ecebfed0c33dfb71b74adb00c5b1d32cd513d03
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: buzz_dev
@@ -64,7 +64,7 @@ services:
   minio-init:
     # Built from the pinned upstream release commit by .github/workflows/ci-images.yml
     # (provenance: .github/ci-images.json); not byte-identical to the retired quay.io image.
-    image: ghcr.io/skaists/buzz-ci-images/mc:RELEASE.2025-08-13T08-35-41Z-src@sha256:4998594829860f920d024d200c69ab14bb3e171d6804c0f76a77528e88f81699
+    image: ghcr.io/skaists/buzz-ci-images/mc:RELEASE.2025-08-13T08-35-41Z-src@sha256:4c4e0a735916a0475b6bfdba4ba935d6a94cbe0c314fba6db965ec28162723e5
     depends_on:
       minio:
         condition: service_healthy
