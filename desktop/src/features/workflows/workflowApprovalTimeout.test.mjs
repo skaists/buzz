@@ -22,6 +22,9 @@ const approval = {
 const TIMEOUT = 20_000;
 const REFETCH = 3_000;
 
+// Drain pending promise callbacks (setImmediate is not mocked).
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 function deferred() {
   let resolve;
   let reject;
@@ -50,7 +53,7 @@ function start(request, { refetch = () => {} } = {}) {
     refetchMs: REFETCH,
     refetch: () => {
       card.refetches++;
-      refetch();
+      return refetch();
     },
     onPhase: (update) => {
       card.phase = update.phase;
@@ -137,12 +140,74 @@ test("P1: approvals are re-read while waiting and the polling stops on the answe
   assert.equal(card.refetches, 0, "no extra reads before the deadline");
   t.mock.timers.tick(1);
   assert.equal(card.refetches, 1, "re-read immediately at the deadline");
-  t.mock.timers.tick(3 * REFETCH);
+  for (let i = 0; i < 3; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
   assert.equal(card.refetches, 4);
   request.resolve();
   await card.handle.settled;
-  t.mock.timers.tick(5 * REFETCH);
+  for (let i = 0; i < 5; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
   assert.equal(card.refetches, 4, "no reads after the relay answered");
+});
+
+test("P2: a slow read is never overlapped by the next tick", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const read = deferred();
+  const card = start(new Promise(() => {}), { refetch: () => read.promise });
+  t.mock.timers.tick(TIMEOUT);
+  assert.equal(card.refetches, 1);
+  for (let i = 0; i < 5; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
+  assert.equal(card.refetches, 1, "still waiting on the first read");
+  read.resolve();
+  await flush();
+  t.mock.timers.tick(REFETCH);
+  assert.equal(card.refetches, 2, "next read only after the slow one ended");
+  card.handle.dispose();
+});
+
+test("P2: a stop before the deadline keeps the deadline from starting a poll", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const card = start(new Promise(() => {}));
+  // The ordinary approvals refresh showed the gate settled at 10 s.
+  t.mock.timers.tick(TIMEOUT / 2);
+  card.handle.stopPolling();
+  t.mock.timers.tick(TIMEOUT);
+  for (let i = 0; i < 5; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
+  assert.equal(card.refetches, 0);
+  card.handle.dispose();
+});
+
+test("P2: an overdue decision on an expired gate shows Expired, not busy", () => {
+  const past = Date.parse(approval.expiresAt) + 1;
+  const v = decision.approvalCardView({
+    approval,
+    myPubkey: ME,
+    nowMs: past,
+    phase: "uncertain",
+    action: "grant",
+  });
+  assert.equal(v.mode, "settled");
+  assert.equal(v.settledStatus, "expired");
+  assert.equal(v.buttonsDisabled, true);
+  // Before expiry the same state is still the locked waiting state.
+  const before = decision.approvalCardView({
+    approval,
+    myPubkey: ME,
+    nowMs: NOW,
+    phase: "uncertain",
+    action: "grant",
+  });
+  assert.equal(before.mode, "uncertain");
 });
 
 test("P1: a settle seen from the relay while waiting settles the card", (t) => {

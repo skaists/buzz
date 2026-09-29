@@ -27,6 +27,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const [phase, setPhase] = React.useState<ApprovalCardPhase>("idle");
   const [action, setAction] = React.useState<Decision | undefined>();
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
+  const [, setExpiryTick] = React.useState(0);
   // Synchronous guard: a second click in the same frame, before React has
   // re-rendered the disabled buttons, must not send a second decision. It is
   // released only when the relay actually answers, never by the deadline.
@@ -59,11 +60,26 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   // Stop timers if the card goes away mid-decision.
   React.useEffect(() => () => tracker.current?.dispose(), []);
 
-  // The gate record settled (seen from the relay) while our submit is still
-  // overdue: the card already shows it, so stop re-reading the gate.
+  // The card shows a settled gate (seen from the relay, or expired) while our
+  // submit is still overdue: stop re-reading the gate.
+  const showsSettled = view.mode === "settled";
   React.useEffect(() => {
-    if (approval.status !== "pending") tracker.current?.stopPolling();
-  }, [approval.status]);
+    if (showsSettled) tracker.current?.stopPolling();
+  }, [showsSettled]);
+
+  // An overdue decision on a gate that then expires must not stay busy:
+  // re-render at expiry so the card shows Expired.
+  const expiresAtMs = new Date(approval.expiresAt).getTime();
+  React.useEffect(() => {
+    if (phase !== "uncertain") return undefined;
+    const wait = expiresAtMs - Date.now();
+    if (!(wait > 0)) return undefined;
+    const timer = setTimeout(
+      () => setExpiryTick((tick) => tick + 1),
+      Math.min(wait + 50, 2_147_483_647),
+    );
+    return () => clearTimeout(timer);
+  }, [phase, expiresAtMs]);
 
   const decide = (next: Decision) => {
     if (inFlight.current || view.buttonsDisabled || !view.decision) return;

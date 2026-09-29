@@ -256,20 +256,26 @@ export function useTriggerWorkflowMutation(workflowId: string) {
 /** Re-read everything an approval decision can change. */
 function invalidateApprovalState(
   queryClient: ReturnType<typeof useQueryClient>,
+  cancelRefetch = true,
 ) {
-  void queryClient.invalidateQueries({
-    predicate: (query) =>
-      query.queryKey[0] === "workflow-runs" ||
-      query.queryKey[0] === "workflow" ||
-      query.queryKey[0] === "run-approvals",
-  });
+  return queryClient.invalidateQueries(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === "workflow-runs" ||
+        query.queryKey[0] === "workflow" ||
+        query.queryKey[0] === "run-approvals",
+    },
+    { cancelRefetch },
+  );
 }
 
-/** Lets the approval card re-read the gate while a decision is overdue. */
+/** Lets the approval card re-read the gate while a decision is overdue.
+ * Never cancels a read already in flight: on a slow relay, restarting it every
+ * few seconds could mean the settled record never arrives. */
 export function useRefreshApprovalState() {
   const queryClient = useQueryClient();
   return React.useCallback(
-    () => invalidateApprovalState(queryClient),
+    () => invalidateApprovalState(queryClient, false),
     [queryClient],
   );
 }
@@ -290,6 +296,8 @@ export function useApprovalMutation() {
         ? grantApproval(input.token, input.note, input.candidate)
         : denyApproval(input.token, input.note, input.candidate),
     // Refresh on refusal too: a race refusal means another seat settled it.
-    onSettled: () => invalidateApprovalState(queryClient),
+    onSettled: () => {
+      void invalidateApprovalState(queryClient);
+    },
   });
 }

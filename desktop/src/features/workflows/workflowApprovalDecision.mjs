@@ -43,15 +43,15 @@ export function settledStatusFromRelayError(message) {
  * A slow submit cannot be cancelled: the grant or denial may still reach the
  * relay after any deadline. So the deadline never hands the buttons back.
  * After `timeoutMs` the card goes "uncertain" (buttons stay disabled) and
- * re-reads the gate every `refetchMs`, so a settle seen from the relay also
- * settles the card. Only the original request's own outcome ends the wait:
+ * re-reads the gate every `refetchMs` (one read at a time), so a settle seen
+ * from the relay also settles the card. Only the original request's own outcome ends the wait:
  * success → "sent", failure → "failed" (which makes the card actionable).
  *
  * @param {Promise<unknown>} request the real submit, not a raced copy
  * @param {{
  *   onPhase: (update: { phase: "sending" | "uncertain" | "sent" | "failed",
  *                       errorMessage?: string }) => void,
- *   refetch?: () => void,
+ *   refetch?: () => unknown,
  *   timeoutMs?: number,
  *   refetchMs?: number,
  * }} options
@@ -66,25 +66,48 @@ export function trackApprovalDecision(
   },
 ) {
   let done = false;
+  let stopped = false;
+  let refreshing = false;
   let poll = null;
-  const stopPolling = () => {
+  const clearPoll = () => {
     if (poll !== null) clearInterval(poll);
     poll = null;
+  };
+  const stopPolling = () => {
+    // Also covers a stop that arrives before the deadline has started polling.
+    stopped = true;
+    clearPoll();
+  };
+  // One read at a time: a slow read is allowed to finish rather than being
+  // overlapped (and cancelled) by the next tick.
+  const pollOnce = () => {
+    if (done || stopped || refreshing || !refetch) return;
+    refreshing = true;
+    let pending;
+    try {
+      pending = refetch();
+    } catch {
+      pending = undefined;
+    }
+    Promise.resolve(pending)
+      .catch(() => {})
+      .finally(() => {
+        refreshing = false;
+      });
   };
   onPhase({ phase: "sending" });
   const deadline = setTimeout(() => {
     if (done) return;
     onPhase({ phase: "uncertain" });
-    refetch?.();
-    poll = setInterval(() => {
-      if (!done) refetch?.();
-    }, refetchMs);
+    if (stopped) return;
+    pollOnce();
+    poll = setInterval(pollOnce, refetchMs);
   }, timeoutMs);
   const finish = (update) => {
     if (done) return;
     done = true;
     clearTimeout(deadline);
-    stopPolling();
+    clearPoll();
     onPhase(update);
   };
   const settled = Promise.resolve(request).then(
@@ -103,7 +126,7 @@ export function trackApprovalDecision(
     dispose() {
       done = true;
       clearTimeout(deadline);
-      stopPolling();
+      clearPoll();
     },
   };
 }
@@ -159,6 +182,10 @@ export function approvalCardView({
     };
   }
   if (phase === "uncertain") {
+    // Past expiry the relay refuses any decision, and a pending record will
+    // not change: show Expired rather than waiting forever.
+    if (new Date(approval.expiresAt).getTime() < nowMs)
+      return settled("expired");
     // The submit is overdue but may still land: never re-enable here.
     return {
       mode: "uncertain",

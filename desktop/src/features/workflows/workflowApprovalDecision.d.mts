@@ -32,7 +32,7 @@ export function trackApprovalDecision(
   request: Promise<unknown>,
   options: {
     onPhase: (update: ApprovalDecisionUpdate) => void;
-    refetch?: () => void;
+    refetch?: () => unknown;
     timeoutMs?: number;
     refetchMs?: number;
   },
