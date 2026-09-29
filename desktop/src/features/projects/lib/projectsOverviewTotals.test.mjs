@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { projectsOverviewTotals } from "./projectsOverviewTotals.ts";
+import {
+  projectsOverviewActivityByDay,
+  projectsOverviewTotals,
+} from "./projectsOverviewTotals.ts";
 
 function repository(repoAddress) {
   return { repoAddress };
@@ -69,5 +72,54 @@ test("no summaries at all reads zero activity, not a crash", () => {
       prs: 0,
       issues: 0,
     },
+  );
+});
+
+const activity = {
+  [SHARED]: { activityByDay: { "2026-09-27": 4, "2026-09-28": 1 } },
+  [ONLY_A]: { activityByDay: { "2026-09-28": 2 } },
+  [ONLY_B]: { activityByDay: { "2026-09-26": 3 } },
+};
+
+test("rail activity: a repository in two projects adds its days once", () => {
+  const projects = [
+    project("a", [SHARED, ONLY_A]),
+    project("b", [SHARED, ONLY_B]),
+  ];
+
+  assert.deepEqual(projectsOverviewActivityByDay(projects, activity), {
+    "2026-09-26": 3,
+    "2026-09-27": 4,
+    "2026-09-28": 1 + 2,
+  });
+});
+
+test("rail activity: equals the per-repository sum over distinct repositories", () => {
+  // Precondition: SHARED really is listed by both projects.
+  const projects = [
+    project("a", [SHARED, ONLY_A]),
+    project("b", [SHARED, ONLY_B]),
+  ];
+  const listed = projects.flatMap((entry) =>
+    entry.repositories.map((repo) => repo.repoAddress),
+  );
+  assert.equal(listed.filter((address) => address === SHARED).length, 2);
+
+  const byDay = projectsOverviewActivityByDay(projects, activity);
+  const total = Object.values(byDay).reduce((sum, count) => sum + count, 0);
+  assert.equal(total, 5 + 2 + 3);
+});
+
+test("rail activity: missing summaries read as no activity, not a crash", () => {
+  assert.deepEqual(
+    projectsOverviewActivityByDay([project("a", [SHARED])], undefined),
+    {},
+  );
+  assert.deepEqual(
+    projectsOverviewActivityByDay(
+      [project("a", [SHARED, "30617:owner:unsummarised"])],
+      { [SHARED]: activity[SHARED] },
+    ),
+    { "2026-09-27": 4, "2026-09-28": 1 },
   );
 });
