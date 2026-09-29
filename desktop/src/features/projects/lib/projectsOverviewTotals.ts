@@ -40,3 +40,29 @@ export function projectsOverviewTotals(
     issues,
   };
 }
+
+/**
+ * Contribution activity for the Projects overview rail, by day. Like the
+ * tiles, it adds up each repository once, however many projects list it.
+ */
+export function projectsOverviewActivityByDay(
+  projects: Pick<Project, "repositories">[],
+  repositorySummaries:
+    | Record<string, Pick<ProjectActivitySummary, "activityByDay">>
+    | undefined,
+): Record<string, number> {
+  const repoAddresses = new Set(
+    projects.flatMap((project) =>
+      project.repositories.map((repository) => repository.repoAddress),
+    ),
+  );
+  const merged: Record<string, number> = {};
+  for (const repoAddress of repoAddresses) {
+    const byDay = repositorySummaries?.[repoAddress]?.activityByDay;
+    if (!byDay) continue;
+    for (const [day, count] of Object.entries(byDay)) {
+      merged[day] = (merged[day] ?? 0) + count;
+    }
+  }
+  return merged;
+}

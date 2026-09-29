@@ -152,8 +152,8 @@ export function ProjectsView() {
       ? []
       : projects,
   );
-  // The overview tiles total by repository too, so a repository listed in
-  // two projects is counted once.
+  // The overview tiles and the rail's activity total by repository too, so
+  // a repository listed in two projects is counted once.
   const repositoryActivitySummariesQuery = useRepositoryActivitySummariesQuery(
     filter === "repositories" || filter === "all" ? projects : [],
   );
@@ -863,6 +863,7 @@ export function ProjectsView() {
                     <ProjectsOverviewRail
                       profiles={profiles}
                       projects={projects}
+                      repositorySummaries={repositoryActivitySummariesQuery.data}
                       summaries={activitySummariesQuery.data}
                     />
                   }

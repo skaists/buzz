@@ -6,6 +6,7 @@ import type {
   Project,
   ProjectActivitySummary,
 } from "@/features/projects/hooks";
+import { projectsOverviewActivityByDay } from "@/features/projects/lib/projectsOverviewTotals";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
@@ -15,6 +16,8 @@ import { ProjectsContributionGraph } from "./ProjectsContributionGraph";
 type ProjectsOverviewRailProps = {
   profiles?: UserProfileLookup;
   projects: Project[];
+  /** Activity keyed by repository address, not by project. */
+  repositorySummaries?: Record<string, ProjectActivitySummary>;
   summaries?: Record<string, ProjectActivitySummary>;
 };
 
@@ -38,29 +41,18 @@ function overviewPeople(
   ];
 }
 
-function overviewActivityByDay(
-  projects: Project[],
-  summaries: Record<string, ProjectActivitySummary> | undefined,
-) {
-  const merged: Record<string, number> = {};
-  for (const project of projects) {
-    const byDay = summaries?.[project.id]?.activityByDay;
-    if (!byDay) continue;
-    for (const [day, count] of Object.entries(byDay)) {
-      merged[day] = (merged[day] ?? 0) + count;
-    }
-  }
-  return merged;
-}
-
 /** Workspace people and contribution activity for the overview side rail. */
 export function ProjectsOverviewRail({
   profiles,
   projects,
+  repositorySummaries,
   summaries,
 }: ProjectsOverviewRailProps) {
   const people = overviewPeople(projects, summaries);
-  const activityByDay = overviewActivityByDay(projects, summaries);
+  const activityByDay = projectsOverviewActivityByDay(
+    projects,
+    repositorySummaries,
+  );
 
   // Plain stacked cards — the overview panel's rail column owns placement
   // and spacing, so the sections can never drift apart or collide.
