@@ -34,6 +34,7 @@ import { resetAvatarPresentations } from "@/features/profile/avatarPresentationS
 import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { clearMarkdownNodeCache } from "@/shared/ui/markdown/nodeCache";
+import { resetUncertainDecisionLocks } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { resetVideoPlayerState } from "@/shared/ui/videoPlayerState";
 
 import {
@@ -75,6 +76,7 @@ async function resetCommunityState({
   resetRenderScopedReactionHydration();
   resetBackgroundMediaUploads();
   resetLinkPreviewPreparations();
+  resetUncertainDecisionLocks();
   clearSearchHitEventCache();
   clearMarkdownNodeCache();
 }

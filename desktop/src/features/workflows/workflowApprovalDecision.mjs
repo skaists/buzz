@@ -12,6 +12,8 @@ const HEX64 = /^[0-9a-f]{64}$/i;
 export const APPROVAL_DECISION_TIMEOUT_MS = 20_000;
 /** While an answer is overdue, how often the card re-reads the gate. */
 export const APPROVAL_UNCERTAIN_REFETCH_MS = 3_000;
+/** A verified relay read that takes longer than this is retired and retried. */
+export const APPROVAL_VERIFY_READ_TIMEOUT_MS = 10_000;
 export const APPROVAL_STILL_WAITING_TEXT = "Still waiting for the relay…";
 export const APPROVAL_VERIFYING_TEXT =
   "Checking the gate with the relay before another decision…";
@@ -52,12 +54,18 @@ export function isDefinitiveRelayRefusal(message) {
 }
 
 /**
- * Per-session record of decisions whose outcome was ever unknown, keyed by
- * approval reference. Survives card remounts, so a reload of the card cannot
- * be used to sign the opposite decision.
+ * Per-session record of signed decisions, keyed by identity + approval
+ * reference. A decision is recorded the moment it is signed and dropped only
+ * when the relay definitively refuses it, so a card remount (even while the
+ * original submit is still running) cannot be used to sign the opposite one.
  * @type {Map<string, "grant" | "deny">}
  */
 export const UNCERTAIN_DECISION_LOCKS = new Map();
+
+/** Community teardown: decision locks are community-scoped state. */
+export function resetUncertainDecisionLocks() {
+  UNCERTAIN_DECISION_LOCKS.clear();
+}
 
 const ALL_OFF = Object.freeze({ grant: true, deny: true });
 
@@ -75,8 +83,11 @@ const ALL_OFF = Object.freeze({ grant: true, deny: true });
  * - No double-sign: when the outcome is unknown (the 20 s deadline passed, or
  *   the submit failed without a definitive relay refusal), no second signing
  *   is allowed until `verify()` has read the gate from the relay and found it
- *   still pending. After a non-definitive failure only the same decision may
- *   be signed again, so Approve followed by Deny cannot happen.
+ *   still pending. The signed decision is recorded in `locks` when it is sent;
+ *   only a definitive relay refusal removes it. While recorded, only the same
+ *   decision may be signed again, so Approve followed by Deny cannot happen.
+ *   A controller created while a decision is recorded (a remount) starts by
+ *   verifying, not idle.
  *
  * @param {{
  *   send: (input: { action: "grant" | "deny", attempt: number }) => Promise<unknown>,
@@ -87,6 +98,8 @@ const ALL_OFF = Object.freeze({ grant: true, deny: true });
  *   locks?: Map<string, "grant" | "deny">,
  *   timeoutMs?: number,
  *   refetchMs?: number,
+ *   verifyTimeoutMs?: number,
+ *   isActive?: () => boolean,
  * }} options
  *
  * @typedef {{
@@ -107,14 +120,19 @@ export function createApprovalDecisionController({
   locks = UNCERTAIN_DECISION_LOCKS,
   timeoutMs = APPROVAL_DECISION_TIMEOUT_MS,
   refetchMs = APPROVAL_UNCERTAIN_REFETCH_MS,
+  verifyTimeoutMs = APPROVAL_VERIFY_READ_TIMEOUT_MS,
+  isActive = () => true,
 }) {
+  const recorded = (lockKey && locks.get(lockKey)) || null;
   /** @type {ApprovalDecisionState} */
   let state = {
     attempt: 0,
-    phase: "idle",
-    action: undefined,
+    // A decision was already signed for this gate (possibly still in flight
+    // in a previous card): verify before allowing anything.
+    phase: recorded ? "verifying" : "idle",
+    action: recorded ?? undefined,
     errorMessage: null,
-    lockedAction: (lockKey && locks.get(lockKey)) || null,
+    lockedAction: recorded,
     settledStatus: null,
   };
   let disposed = false;
@@ -124,7 +142,9 @@ export function createApprovalDecisionController({
   // Each poll has a generation; a verify answer is honoured only for the
   // current attempt AND the current poll generation.
   let pollGeneration = 0;
-  let verifyInFlight = 0;
+  let readSeq = 0;
+  let inFlightRead = 0;
+  let inFlightReadGeneration = 0;
   let refreshing = false;
 
   const set = (patch) => {
@@ -162,8 +182,18 @@ export function createApprovalDecisionController({
   // poll generation. `settleOnly`: the submit is still unresolved, so a pending
   // gate must not re-enable anything (the decision may still land).
   const verifyOnce = (attempt, generation, settleOnly) => {
-    if (verifyInFlight === generation || !current(attempt)) return;
-    verifyInFlight = generation;
+    if (!current(attempt)) return;
+    if (inFlightRead !== 0 && inFlightReadGeneration === generation) return;
+    readSeq += 1;
+    const readId = readSeq;
+    inFlightRead = readId;
+    inFlightReadGeneration = generation;
+    const release = () => {
+      if (inFlightRead === readId) inFlightRead = 0;
+    };
+    // A hung read (no HTTP timeout, no invoke abort) is retired after
+    // `verifyTimeoutMs` so the next tick can try again.
+    setTimeout(release, verifyTimeoutMs);
     let read;
     try {
       read = Promise.resolve(verify());
@@ -173,7 +203,7 @@ export function createApprovalDecisionController({
     const fenced = () => !current(attempt) || generation !== pollGeneration;
     read.then(
       (status) => {
-        if (verifyInFlight === generation) verifyInFlight = 0;
+        release();
         if (fenced()) return;
         const s = `${status ?? ""}`.toLowerCase();
         if (s === "granted" || s === "denied" || s === "expired") {
@@ -187,7 +217,7 @@ export function createApprovalDecisionController({
         // Anything else (unknown status) is not a verification: keep waiting.
       },
       () => {
-        if (verifyInFlight === generation) verifyInFlight = 0;
+        release();
         // Not verified; the poll retries.
       },
     );
@@ -201,6 +231,9 @@ export function createApprovalDecisionController({
     const generation = pollGeneration;
     const tick = () => {
       if (!current(attempt) || generation !== pollGeneration) return;
+      // Like the ordinary approvals poll: no background traffic while the
+      // app is not focused. The interval keeps ticking and resumes on focus.
+      if (!isActive()) return;
       refreshCache();
       verifyOnce(attempt, generation, settleOnly);
     };
@@ -209,6 +242,9 @@ export function createApprovalDecisionController({
   };
 
   const view = () => state;
+
+  // Created with a recorded decision (remount): verify before anything else.
+  if (recorded) startPolling(state.attempt, false);
 
   /** @param {"grant" | "deny"} action */
   const canSubmit = (action) => {
@@ -226,12 +262,17 @@ export function createApprovalDecisionController({
     const attempt = state.attempt + 1;
     let transportDone = false;
     let timedOut = false;
+    // Record the decision before it is sent: from here until the relay
+    // definitively refuses it, only this decision may be signed for the gate.
+    const previousLock = state.lockedAction;
+    if (lockKey) locks.set(lockKey, action);
     set({
       attempt,
       phase: "sending",
       action,
       errorMessage: null,
       settledStatus: null,
+      lockedAction: action,
     });
 
     deadline = setTimeout(() => {
@@ -266,15 +307,20 @@ export function createApprovalDecisionController({
           return;
         }
         const definitive = isDefinitiveRelayRefusal(message);
+        // The relay refused this signed decision: it can never be accepted,
+        // so drop its record (back to whatever was recorded before it).
+        const lockedAction = definitive ? previousLock : action;
+        if (lockKey) {
+          if (lockedAction) locks.set(lockKey, lockedAction);
+          else locks.delete(lockKey);
+        }
         if (definitive && !timedOut) {
           clearTimers();
-          set({ phase: "failed", errorMessage: message });
+          set({ phase: "failed", errorMessage: message, lockedAction });
           return;
         }
-        // Unknown outcome: lock to this decision unless the relay refused it,
-        // and allow nothing until a verified read says the gate is open.
-        const lockedAction = definitive ? state.lockedAction : action;
-        if (lockKey && lockedAction) locks.set(lockKey, lockedAction);
+        // Unknown outcome: allow nothing until a verified read says the gate
+        // is open.
         clearTimers();
         set({ phase: "verifying", errorMessage: message, lockedAction });
         startPolling(attempt, false);

@@ -1,5 +1,6 @@
 export const APPROVAL_DECISION_TIMEOUT_MS: number;
 export const APPROVAL_UNCERTAIN_REFETCH_MS: number;
+export const APPROVAL_VERIFY_READ_TIMEOUT_MS: number;
 export const APPROVAL_STILL_WAITING_TEXT: string;
 export const APPROVAL_VERIFYING_TEXT: string;
 export type ApprovalDecisionAction = "grant" | "deny";
@@ -34,6 +35,7 @@ export function isDefinitiveRelayRefusal(
   message: string | null | undefined,
 ): boolean;
 export const UNCERTAIN_DECISION_LOCKS: Map<string, ApprovalDecisionAction>;
+export function resetUncertainDecisionLocks(): void;
 export type ApprovalDecisionState = {
   attempt: number;
   phase: ApprovalCardPhase;
@@ -61,6 +63,8 @@ export function createApprovalDecisionController(options: {
   locks?: Map<string, ApprovalDecisionAction>;
   timeoutMs?: number;
   refetchMs?: number;
+  verifyTimeoutMs?: number;
+  isActive?: () => boolean;
 }): ApprovalDecisionController;
 export function approvalCardView(input: {
   approval: {

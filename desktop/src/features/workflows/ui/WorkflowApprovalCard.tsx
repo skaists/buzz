@@ -13,6 +13,7 @@ import {
   createApprovalDecisionController,
 } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useAppFocused } from "@/shared/lib/useDocumentVisible";
 import type { WorkflowApproval } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
@@ -26,6 +27,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
   const approvalMutation = useApprovalMutation();
   const refreshApprovalState = useRefreshApprovalState();
+  const appFocused = useAppFocused();
   const [decision, setDecision] = React.useState<ApprovalDecisionState | null>(
     null,
   );
@@ -52,15 +54,19 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     decision: view.decision,
     mutateAsync: approvalMutation.mutateAsync,
     refresh: refreshApprovalState,
+    appFocused,
   });
   latest.current = {
     approval,
     decision: view.decision,
     mutateAsync: approvalMutation.mutateAsync,
     refresh: refreshApprovalState,
+    appFocused,
   };
 
-  const lockKey = approval.approvalRef.toLowerCase();
+  // Decision records are per identity and gate (and cleared on community
+  // teardown), so they never leak across accounts or communities.
+  const lockKey = `${(identityQuery.data?.pubkey ?? "").toLowerCase()}:${approval.approvalRef.toLowerCase()}`;
   React.useEffect(() => {
     const controller = createApprovalDecisionController({
       lockKey,
@@ -79,6 +85,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       // Verified read from the relay, not the query cache.
       verify: () => fetchApprovalStatusFromRelay(latest.current.approval),
       refetch: () => latest.current.refresh(),
+      isActive: () => latest.current.appFocused,
       onChange: setDecision,
     });
     controllerRef.current = controller;
@@ -89,20 +96,24 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     };
   }, [lockKey]);
 
-  // Audit 3: after the relay answers, focus lands on the card's status line.
+  // Audit 3: once the outcome is known, focus lands on the card's status
+  // line, whether the controller or the rendered gate record settled first.
   const phase = decision?.phase ?? "idle";
+  const showsSettled = view.mode === "settled";
+  const outcomeKnown =
+    showsSettled ||
+    phase === "sent" ||
+    phase === "failed" ||
+    phase === "settled";
   React.useEffect(() => {
-    if (phase === "sent" || phase === "failed" || phase === "settled") {
-      if (focusStatusAfterDecision.current) {
-        focusStatusAfterDecision.current = false;
-        statusRef.current?.focus();
-      }
+    if (outcomeKnown && focusStatusAfterDecision.current) {
+      focusStatusAfterDecision.current = false;
+      statusRef.current?.focus();
     }
-  }, [phase]);
+  }, [outcomeKnown]);
 
   // The card shows a settled gate (seen from the relay, or expired) while a
   // decision is still unresolved: stop re-reading the gate.
-  const showsSettled = view.mode === "settled";
   React.useEffect(() => {
     if (showsSettled) controllerRef.current?.stopPolling();
   }, [showsSettled]);

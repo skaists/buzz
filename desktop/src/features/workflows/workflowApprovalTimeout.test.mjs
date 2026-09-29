@@ -408,7 +408,7 @@ test("audit 3: a verified 'pending' while the submit is unresolved does not allo
   h.controller.dispose();
 });
 
-test("audit 3: the decision lock survives a card remount", async (t) => {
+test("audit 3: the decision lock survives a card remount, which starts by verifying", async (t) => {
   enableTimers(t);
   const locks = new Map();
   const a = card({ locks });
@@ -416,13 +416,110 @@ test("audit 3: the decision lock survives a card remount", async (t) => {
   a.sends[0].reject(new Error(UNREACHABLE));
   await flush();
   a.controller.dispose();
-  // A fresh card for the same gate (remount, navigation) keeps the lock.
+  // A fresh card for the same gate (remount, navigation) keeps the lock and
+  // allows nothing until a verified read.
   const b = card({ locks });
   assert.equal(b.state.lockedAction, "grant");
+  assert.equal(b.state.phase, "verifying");
+  assert.equal(b.controller.submit("grant"), null);
+  b.verifies[0].resolve("pending");
+  await flush();
   assert.equal(b.controller.submit("deny"), null);
   assert.deepEqual(b.view().disabledActions, { grant: false, deny: true });
   assert.equal(b.controller.submit("grant"), 1);
   b.controller.dispose();
+});
+
+test("audit 3: a remount while the first submit is still in flight cannot sign the opposite decision", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const a = card({ locks });
+  a.controller.submit("grant");
+  // Navigate away and back within the Rust deadline: the submit is unresolved.
+  a.controller.dispose();
+  const b = card({ locks });
+  assert.equal(b.state.phase, "verifying");
+  assert.equal(b.controller.submit("deny"), null);
+  assert.equal(b.controller.submit("grant"), null);
+  // The original lands after all; the verified read shows it.
+  a.sends[0].resolve();
+  b.verifies[0].resolve("granted");
+  await flush();
+  assert.equal(b.view().mode, "settled");
+  assert.deepEqual(
+    [...a.sends, ...b.sends].map((x) => x.action),
+    ["grant"],
+    "only the one decision was ever signed",
+  );
+  b.controller.dispose();
+});
+
+test("audit 3: a definitive relay refusal drops the decision record", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const h = card({ locks });
+  h.controller.submit("grant");
+  assert.equal(locks.get(approval.approvalRef), "grant", "recorded when sent");
+  h.sends[0].reject(new Error(REFUSED));
+  await flush();
+  assert.equal(locks.has(approval.approvalRef), false);
+  assert.equal(h.state.lockedAction, null);
+  assert.equal(h.controller.submit("deny"), 2);
+  h.controller.dispose();
+});
+
+test("community teardown clears the decision records", () => {
+  decision.UNCERTAIN_DECISION_LOCKS.set("some-gate", "grant");
+  decision.resetUncertainDecisionLocks();
+  assert.equal(decision.UNCERTAIN_DECISION_LOCKS.size, 0);
+});
+
+test("a hung verified read is retired and retried", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  h.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(h.verifies.length, 1); // never answers
+  t.mock.timers.tick(REFETCH);
+  assert.equal(h.verifies.length, 1, "no overlap while the read is live");
+  t.mock.timers.tick(10_000);
+  assert.equal(h.verifies.length, 2, "retired after 10 s, then retried");
+  h.verifies[1].resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  h.controller.dispose();
+});
+
+test("overdue polling pauses while the app is not focused", async (t) => {
+  enableTimers(t);
+  let focused = false;
+  const h = card();
+  // Rebuild with an isActive gate (same harness, custom controller).
+  h.controller.dispose();
+  const reads = { refetch: 0, verify: 0 };
+  const c = decision.createApprovalDecisionController({
+    timeoutMs: TIMEOUT,
+    refetchMs: REFETCH,
+    locks: new Map(),
+    isActive: () => focused,
+    send: () => new Promise(() => {}),
+    verify: () => {
+      reads.verify++;
+      return new Promise(() => {});
+    },
+    refetch: () => {
+      reads.refetch++;
+    },
+    onChange: () => {},
+  });
+  c.submit("grant");
+  t.mock.timers.tick(TIMEOUT + 5 * REFETCH);
+  assert.deepEqual(reads, { refetch: 0, verify: 0 });
+  focused = true;
+  t.mock.timers.tick(REFETCH);
+  assert.deepEqual(reads, { refetch: 1, verify: 1 });
+  c.dispose();
 });
 
 test("only the relay's own accepted=false reply counts as a definitive refusal", () => {
