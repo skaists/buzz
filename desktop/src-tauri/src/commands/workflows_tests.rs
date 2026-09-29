@@ -227,3 +227,47 @@ fn run_reads_serialize_to_backend_envelopes() {
         serde_json::json!({ "approvals": [] })
     );
 }
+
+// ── Approval submit deadline ─────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn approval_submit_deadline_drops_a_hung_submit() {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let guard = SetOnDrop(dropped.clone());
+    let hung = async move {
+        let _guard = guard;
+        std::future::pending::<Result<(), String>>().await
+    };
+    let result = with_approval_submit_deadline(hung, APPROVAL_SUBMIT_DEADLINE).await;
+    assert_eq!(result, Err(APPROVAL_SUBMIT_ABANDONED.to_string()));
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the submit future must be dropped (cancelled), not left running"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_submit_deadline_passes_through_a_prompt_answer() {
+    let ok =
+        with_approval_submit_deadline(async { Ok::<_, String>(7) }, APPROVAL_SUBMIT_DEADLINE).await;
+    assert_eq!(ok, Ok(7));
+    let refused = with_approval_submit_deadline(
+        async { Err::<(), _>("relay rejected event: forbidden".to_string()) },
+        APPROVAL_SUBMIT_DEADLINE,
+    )
+    .await;
+    assert_eq!(refused, Err("relay rejected event: forbidden".to_string()));
+}
+
+#[test]
+fn approval_submit_deadline_is_below_the_card_deadline() {
+    // The card (APPROVAL_DECISION_TIMEOUT_MS = 20 s) should normally hear the
+    // command's own answer, including the abandoned error, before it gives up.
+    assert!(APPROVAL_SUBMIT_DEADLINE < std::time::Duration::from_secs(20));
+}

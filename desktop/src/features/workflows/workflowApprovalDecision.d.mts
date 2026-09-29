@@ -1,46 +1,67 @@
 export const APPROVAL_DECISION_TIMEOUT_MS: number;
 export const APPROVAL_UNCERTAIN_REFETCH_MS: number;
 export const APPROVAL_STILL_WAITING_TEXT: string;
+export const APPROVAL_VERIFYING_TEXT: string;
+export type ApprovalDecisionAction = "grant" | "deny";
 export type ApprovalCardPhase =
   | "idle"
   | "sending"
   | "uncertain"
+  | "verifying"
   | "sent"
-  | "failed";
+  | "failed"
+  | "settled";
 export type ApprovalCardView = {
   mode:
     | "settled"
     | "sending"
     | "uncertain"
+    | "verifying"
     | "unavailable"
     | "waiting"
     | "actions";
   buttonsDisabled: boolean;
+  disabledActions: { grant: boolean; deny: boolean };
   statusText: string;
-  settledStatus?: "granted" | "denied" | "expired" | "settled";
+  settledStatus?: string;
   error: string | null;
   decision?: { token: string; candidate?: string };
 };
 export function settledStatusFromRelayError(
   message: string | null | undefined,
 ): "granted" | "denied" | "expired" | "settled" | null;
-export type ApprovalDecisionUpdate = {
-  phase: "sending" | "uncertain" | "sent" | "failed";
-  errorMessage?: string;
+export function isDefinitiveRelayRefusal(
+  message: string | null | undefined,
+): boolean;
+export const UNCERTAIN_DECISION_LOCKS: Map<string, ApprovalDecisionAction>;
+export type ApprovalDecisionState = {
+  attempt: number;
+  phase: ApprovalCardPhase;
+  action?: ApprovalDecisionAction;
+  errorMessage: string | null;
+  lockedAction: ApprovalDecisionAction | null;
+  settledStatus: string | null;
 };
-export function trackApprovalDecision(
-  request: Promise<unknown>,
-  options: {
-    onPhase: (update: ApprovalDecisionUpdate) => void;
-    refetch?: () => unknown;
-    timeoutMs?: number;
-    refetchMs?: number;
-  },
-): {
-  settled: Promise<void>;
+export type ApprovalDecisionController = {
+  submit: (action: ApprovalDecisionAction) => number | null;
+  canSubmit: (action: ApprovalDecisionAction) => boolean;
+  getState: () => ApprovalDecisionState;
   stopPolling: () => void;
   dispose: () => void;
 };
+export function createApprovalDecisionController(options: {
+  send: (input: {
+    action: ApprovalDecisionAction;
+    attempt: number;
+  }) => Promise<unknown>;
+  verify: () => Promise<string>;
+  onChange: (state: ApprovalDecisionState) => void;
+  refetch?: () => unknown;
+  lockKey?: string;
+  locks?: Map<string, ApprovalDecisionAction>;
+  timeoutMs?: number;
+  refetchMs?: number;
+}): ApprovalDecisionController;
 export function approvalCardView(input: {
   approval: {
     status: string;
@@ -52,6 +73,8 @@ export function approvalCardView(input: {
   myPubkey?: string | null;
   nowMs: number;
   phase?: ApprovalCardPhase;
-  action?: "grant" | "deny";
+  action?: ApprovalDecisionAction;
   errorMessage?: string | null;
+  lockedAction?: ApprovalDecisionAction | null;
+  settledStatus?: string | null;
 }): ApprovalCardView;

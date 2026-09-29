@@ -1,10 +1,12 @@
-// Codex P1 on #10: a slow submit cannot be cancelled, so the 20 s deadline
-// must never hand the buttons back while the original grant/deny can still
-// reach the relay. Only the request's real outcome ends the wait.
+// Overdue approval decisions (Codex P1 on #10, P2s on #13, audit points).
 //
-// Namespace import on purpose: against the pre-fix module these tests fail on
-// behaviour (the "uncertain" state fell through to live buttons) rather than
-// on a missing named export at link time.
+// - The 20 s deadline never hands the buttons back while a submit is unresolved.
+// - Epoch fencing: a late answer from an abandoned attempt never changes state.
+// - No double-sign: after an unknown outcome, a second signing needs a verified
+//   relay read first, and then only the same decision (never Approve → Deny).
+//
+// Namespace import on purpose: against an older module these tests fail on
+// behaviour or a missing function, not at link time.
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -21,6 +23,8 @@ const approval = {
 };
 const TIMEOUT = 20_000;
 const REFETCH = 3_000;
+const UNREACHABLE = "relay unreachable: request timed out";
+const REFUSED = "relay rejected event: forbidden: candidate mismatch";
 
 // Drain pending promise callbacks (setImmediate is not mocked).
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -35,36 +39,63 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-/** Drive the card the way WorkflowApprovalCard does and record its views. */
-function start(request, { refetch = () => {} } = {}) {
-  const card = { phase: "idle", errorMessage: null, refetches: 0 };
-  card.view = (over = {}) =>
+/**
+ * A card harness: every send/verify call gets its own deferred so the test
+ * decides when (and in which order) the relay answers.
+ */
+function card({ locks = new Map(), lockKey = approval.approvalRef } = {}) {
+  const h = {
+    sends: [],
+    verifies: [],
+    refetches: 0,
+    refetchResult: undefined,
+    state: null,
+  };
+  h.controller = decision.createApprovalDecisionController({
+    lockKey,
+    locks,
+    timeoutMs: TIMEOUT,
+    refetchMs: REFETCH,
+    send: ({ action, attempt }) => {
+      const d = deferred();
+      h.sends.push({ action, attempt, ...d });
+      return d.promise;
+    },
+    verify: () => {
+      const d = deferred();
+      h.verifies.push(d);
+      return d.promise;
+    },
+    refetch: () => {
+      h.refetches++;
+      return h.refetchResult;
+    },
+    onChange: (state) => {
+      h.state = state;
+    },
+  });
+  h.state = h.controller.getState();
+  h.view = (over = {}) =>
     decision.approvalCardView({
       approval,
       myPubkey: ME,
       nowMs: NOW,
-      phase: card.phase,
-      action: "grant",
-      errorMessage: card.errorMessage,
+      phase: h.state.phase,
+      action: h.state.action,
+      errorMessage: h.state.errorMessage,
+      lockedAction: h.state.lockedAction,
+      settledStatus: h.state.settledStatus,
       ...over,
     });
-  card.handle = decision.trackApprovalDecision(request, {
-    timeoutMs: TIMEOUT,
-    refetchMs: REFETCH,
-    refetch: () => {
-      card.refetches++;
-      return refetch();
-    },
-    onPhase: (update) => {
-      card.phase = update.phase;
-      if (update.phase === "failed") card.errorMessage = update.errorMessage;
-    },
-  });
-  return card;
+  return h;
 }
 
+const enableTimers = (t) =>
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+
+// ── P1: the deadline never hands the buttons back ───────────────────────────
+
 test("P1: the timeout does not re-enable the buttons", (t) => {
-  // Pre-fix, the timed-out card rendered live buttons.
   const timedOut = decision.approvalCardView({
     approval,
     myPubkey: ME,
@@ -77,179 +108,332 @@ test("P1: the timeout does not re-enable the buttons", (t) => {
   assert.equal(timedOut.statusText, "Still waiting for the relay…");
   assert.equal(timedOut.error, null);
 
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const card = start(new Promise(() => {}));
-  assert.equal(card.phase, "sending");
-  assert.equal(card.view().buttonsDisabled, true);
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  assert.equal(h.state.phase, "sending");
   t.mock.timers.tick(TIMEOUT);
-  assert.equal(card.phase, "uncertain");
-  assert.equal(card.view().buttonsDisabled, true);
-  assert.equal(card.view().statusText, decision.APPROVAL_STILL_WAITING_TEXT);
-  // Still locked long after the deadline: nothing but the answer unlocks it.
+  assert.equal(h.state.phase, "uncertain");
+  assert.deepEqual(h.view().disabledActions, { grant: true, deny: true });
+  assert.equal(h.controller.canSubmit("grant"), false);
+  assert.equal(h.controller.canSubmit("deny"), false);
   t.mock.timers.tick(10 * TIMEOUT);
-  assert.equal(card.view().buttonsDisabled, true);
-  card.handle.dispose();
+  assert.equal(h.view().buttonsDisabled, true);
+  h.controller.dispose();
 });
 
 test("P1: a late success settles the card", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
   t.mock.timers.tick(TIMEOUT + 1);
-  assert.equal(card.phase, "uncertain");
-  request.resolve();
-  await card.handle.settled;
-  assert.equal(card.phase, "sent");
-  const v = card.view();
-  assert.equal(v.mode, "settled");
-  assert.equal(v.buttonsDisabled, true);
-  assert.match(v.statusText, /^Approved/);
+  h.sends[0].resolve();
+  await flush();
+  assert.equal(h.state.phase, "sent");
+  assert.equal(h.view().mode, "settled");
+  assert.match(h.view().statusText, /^Approved/);
 });
 
-test("P1: a late failure re-enables the buttons with the relay's error", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
+test("P1: a late relay refusal re-enables both buttons only after a verified read", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
   t.mock.timers.tick(TIMEOUT + 1);
-  assert.equal(card.view().buttonsDisabled, true);
-  request.reject(new Error("forbidden: candidate mismatch"));
-  await card.handle.settled;
-  assert.equal(card.phase, "failed");
-  const v = card.view();
+  h.sends[0].reject(new Error(REFUSED));
+  await flush();
+  assert.equal(h.state.phase, "verifying");
+  assert.equal(h.view().buttonsDisabled, true);
+  h.verifies.at(-1).resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  const v = h.view();
   assert.equal(v.mode, "actions");
-  assert.equal(v.buttonsDisabled, false);
-  assert.equal(v.error, "forbidden: candidate mismatch");
+  // The relay refused the grant, so it can never land: both are safe.
+  assert.deepEqual(v.disabledActions, { grant: false, deny: false });
+  assert.equal(v.error, REFUSED);
 });
 
 test("P1: a late 'already settled' refusal shows the settled state, not buttons", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
   t.mock.timers.tick(TIMEOUT + 1);
-  request.reject(new Error("forbidden: approval already denied"));
-  await card.handle.settled;
-  assert.equal(card.view().mode, "settled");
-  assert.equal(card.view().buttonsDisabled, true);
-});
-
-test("P1: approvals are re-read while waiting and the polling stops on the answer", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
-  t.mock.timers.tick(TIMEOUT - 1);
-  assert.equal(card.refetches, 0, "no extra reads before the deadline");
-  t.mock.timers.tick(1);
-  assert.equal(card.refetches, 1, "re-read immediately at the deadline");
-  for (let i = 0; i < 3; i++) {
-    await flush();
-    t.mock.timers.tick(REFETCH);
-  }
-  assert.equal(card.refetches, 4);
-  request.resolve();
-  await card.handle.settled;
-  for (let i = 0; i < 5; i++) {
-    await flush();
-    t.mock.timers.tick(REFETCH);
-  }
-  assert.equal(card.refetches, 4, "no reads after the relay answered");
-});
-
-test("P2: a slow read is never overlapped by the next tick", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const read = deferred();
-  const card = start(new Promise(() => {}), { refetch: () => read.promise });
-  t.mock.timers.tick(TIMEOUT);
-  assert.equal(card.refetches, 1);
-  for (let i = 0; i < 5; i++) {
-    await flush();
-    t.mock.timers.tick(REFETCH);
-  }
-  assert.equal(card.refetches, 1, "still waiting on the first read");
-  read.resolve();
+  h.sends[0].reject(new Error("relay rejected event: approval already denied"));
   await flush();
-  t.mock.timers.tick(REFETCH);
-  assert.equal(card.refetches, 2, "next read only after the slow one ended");
-  card.handle.dispose();
+  assert.equal(h.view().mode, "settled");
+  assert.equal(h.view().buttonsDisabled, true);
 });
 
-test("P2: a stop before the deadline keeps the deadline from starting a poll", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const card = start(new Promise(() => {}));
-  // The ordinary approvals refresh showed the gate settled at 10 s.
-  t.mock.timers.tick(TIMEOUT / 2);
-  card.handle.stopPolling();
-  t.mock.timers.tick(TIMEOUT);
+test("P1: the gate is re-read while waiting and polling stops on the answer", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  t.mock.timers.tick(TIMEOUT - 1);
+  assert.equal(h.refetches, 0, "no extra reads before the deadline");
+  assert.equal(h.verifies.length, 0);
+  t.mock.timers.tick(1);
+  assert.equal(h.refetches, 1, "re-read immediately at the deadline");
+  assert.equal(h.verifies.length, 1);
+  for (let i = 0; i < 3; i++) {
+    h.verifies.at(-1).resolve("pending");
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
+  assert.equal(h.refetches, 4);
+  assert.equal(h.verifies.length, 4);
+  // A verified "pending" while the submit is unresolved re-enables nothing.
+  assert.equal(h.state.phase, "uncertain");
+  h.sends[0].resolve();
+  await flush();
   for (let i = 0; i < 5; i++) {
     await flush();
     t.mock.timers.tick(REFETCH);
   }
-  assert.equal(card.refetches, 0);
-  card.handle.dispose();
+  assert.equal(h.refetches, 4, "no reads after the relay answered");
 });
 
-test("P2: an overdue decision on an expired gate shows Expired, not busy", () => {
-  const past = Date.parse(approval.expiresAt) + 1;
-  const v = decision.approvalCardView({
-    approval,
-    myPubkey: ME,
-    nowMs: past,
-    phase: "uncertain",
-    action: "grant",
-  });
-  assert.equal(v.mode, "settled");
-  assert.equal(v.settledStatus, "expired");
-  assert.equal(v.buttonsDisabled, true);
-  // Before expiry the same state is still the locked waiting state.
-  const before = decision.approvalCardView({
-    approval,
-    myPubkey: ME,
-    nowMs: NOW,
-    phase: "uncertain",
-    action: "grant",
-  });
-  assert.equal(before.mode, "uncertain");
-});
-
-test("P1: a settle seen from the relay while waiting settles the card", (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const card = start(new Promise(() => {}));
+test("P1: a settle seen from the relay while waiting settles the card", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
   t.mock.timers.tick(TIMEOUT);
-  for (const [status, label] of [
-    ["granted", "Approved"],
-    ["denied", "Denied"],
-  ]) {
-    const v = card.view({ approval: { ...approval, status } });
-    assert.equal(v.mode, "settled");
-    assert.equal(v.buttonsDisabled, true);
-    assert.equal(v.statusText, label);
-  }
-  // Once the record shows the settle, the card stops re-reading.
-  const before = card.refetches;
-  card.handle.stopPolling();
+  // Via the cached record…
+  const v = h.view({ approval: { ...approval, status: "denied" } });
+  assert.equal(v.mode, "settled");
+  assert.equal(v.statusText, "Denied");
+  // …and via the verified read.
+  h.verifies[0].resolve("granted");
+  await flush();
+  assert.equal(h.state.phase, "settled");
+  assert.equal(h.view().mode, "settled");
+  assert.match(h.view().statusText, /^Approved/);
+  const reads = h.refetches;
   t.mock.timers.tick(5 * REFETCH);
-  assert.equal(card.refetches, before);
-  card.handle.dispose();
+  assert.equal(h.refetches, reads, "polling stopped once settled");
 });
 
 test("an answer inside the deadline never shows the waiting state", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
-  request.resolve();
-  await card.handle.settled;
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("deny");
+  h.sends[0].resolve();
+  await flush();
   t.mock.timers.tick(2 * TIMEOUT);
-  assert.equal(card.phase, "sent");
-  assert.equal(card.refetches, 0);
+  assert.equal(h.state.phase, "sent");
+  assert.equal(h.refetches, 0);
+  assert.equal(h.verifies.length, 0);
 });
 
-test("a card that goes away ignores the late answer", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-  const request = deferred();
-  const card = start(request.promise);
-  card.handle.dispose();
-  t.mock.timers.tick(2 * TIMEOUT);
-  request.resolve();
-  await card.handle.settled;
-  assert.equal(card.phase, "sending");
-  assert.equal(card.refetches, 0);
+test("audit 4 unchanged: a relay refusal inside the deadline re-enables at once", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  h.sends[0].reject(new Error(REFUSED));
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  assert.deepEqual(h.view().disabledActions, { grant: false, deny: false });
+  assert.equal(h.verifies.length, 0, "a definitive refusal needs no re-read");
+});
+
+// ── P2s ─────────────────────────────────────────────────────────────────────
+
+test("P2: a slow cache refresh is never overlapped by the next tick", async (t) => {
+  enableTimers(t);
+  const h = card();
+  const read = deferred();
+  h.refetchResult = read.promise;
+  h.controller.submit("grant");
+  t.mock.timers.tick(TIMEOUT);
+  assert.equal(h.refetches, 1);
+  for (let i = 0; i < 5; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
+  assert.equal(h.refetches, 1, "still waiting on the first refresh");
+  read.resolve();
+  h.refetchResult = undefined;
+  await flush();
+  t.mock.timers.tick(REFETCH);
+  assert.equal(h.refetches, 2, "next refresh only after the slow one ended");
+  h.controller.dispose();
+});
+
+test("P2: a stop before the deadline keeps the deadline from starting a poll", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  t.mock.timers.tick(TIMEOUT / 2);
+  h.controller.stopPolling(); // the ordinary refresh showed the gate settled
+  t.mock.timers.tick(TIMEOUT);
+  for (let i = 0; i < 5; i++) {
+    await flush();
+    t.mock.timers.tick(REFETCH);
+  }
+  assert.equal(h.refetches, 0);
+  assert.equal(h.verifies.length, 0);
+  h.controller.dispose();
+});
+
+test("P2: an unresolved decision on an expired gate shows Expired, not busy", () => {
+  const past = Date.parse(approval.expiresAt) + 1;
+  for (const phase of ["uncertain", "verifying"]) {
+    const v = decision.approvalCardView({
+      approval,
+      myPubkey: ME,
+      nowMs: past,
+      phase,
+      action: "grant",
+    });
+    assert.equal(v.mode, "settled");
+    assert.equal(v.settledStatus, "expired");
+    assert.equal(v.buttonsDisabled, true);
+    const before = decision.approvalCardView({
+      approval,
+      myPubkey: ME,
+      nowMs: NOW,
+      phase,
+      action: "grant",
+    });
+    assert.equal(before.mode, phase);
+  }
+});
+
+// ── Audit 2: epoch fencing ──────────────────────────────────────────────────
+
+test("audit 2: attempt ids are monotonic, and a late answer from an abandoned attempt never touches the newer one", async (t) => {
+  enableTimers(t);
+  const h = card();
+  const first = h.controller.submit("grant");
+  assert.equal(first, 1);
+  // Attempt 1 goes overdue; its first verified read hangs.
+  t.mock.timers.tick(TIMEOUT);
+  const staleRead = h.verifies[0];
+  // Attempt 1's submit then fails without a definitive refusal.
+  h.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(h.state.phase, "verifying");
+  // A fresh verified read (new poll generation) says the gate is open.
+  t.mock.timers.tick(REFETCH);
+  h.verifies.at(-1).resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  const second = h.controller.submit("grant");
+  assert.equal(second, 2);
+  assert.equal(h.state.phase, "sending");
+  const before = { ...h.state };
+  // The abandoned attempt's hung read finally answers with a stale status.
+  // Honouring it would overwrite the newer attempt mid-flight. It must not be.
+  staleRead.resolve("denied");
+  await flush();
+  assert.deepEqual(h.state, before);
+  assert.equal(h.view().mode, "sending");
+  assert.equal(h.controller.canSubmit("grant"), false);
+  // The newer attempt's own answer still applies.
+  h.sends[1].resolve();
+  await flush();
+  assert.equal(h.state.phase, "sent");
+  assert.equal(h.state.attempt, 2);
+});
+
+test("audit 2: after the card goes away, a late answer never changes state", async (t) => {
+  enableTimers(t);
+  for (const late of ["success", "failure"]) {
+    const h = card();
+    h.controller.submit("grant");
+    t.mock.timers.tick(TIMEOUT);
+    const snapshot = { ...h.state };
+    h.controller.dispose();
+    if (late === "success") h.sends[0].resolve();
+    else h.sends[0].reject(new Error(UNREACHABLE));
+    h.verifies[0].resolve("granted");
+    await flush();
+    t.mock.timers.tick(5 * REFETCH);
+    assert.deepEqual(h.state, snapshot, late);
+    assert.equal(h.controller.submit("deny"), null);
+  }
+});
+
+// ── Audit 3: no double-sign ─────────────────────────────────────────────────
+
+test("audit 3: after a timeout, no second signing without a verified relay read, and never Approve then Deny", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  t.mock.timers.tick(TIMEOUT);
+  // Overdue: nothing can be signed.
+  assert.equal(h.controller.submit("deny"), null);
+  assert.equal(h.controller.submit("grant"), null);
+  // The submit fails with an unknown outcome (it may have reached the relay).
+  h.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(h.state.phase, "verifying");
+  assert.equal(h.controller.submit("deny"), null);
+  assert.equal(h.controller.submit("grant"), null);
+  // A failed read is not a verification.
+  h.verifies.at(-1).reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(h.controller.submit("grant"), null);
+  // An unknown status is not a verification either.
+  t.mock.timers.tick(REFETCH);
+  h.verifies.at(-1).resolve("unknown");
+  await flush();
+  assert.equal(h.controller.submit("grant"), null);
+  // A verified "pending" allows a second signing — of the same decision only.
+  t.mock.timers.tick(REFETCH);
+  h.verifies.at(-1).resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  assert.deepEqual(h.view().disabledActions, { grant: false, deny: true });
+  assert.match(h.view().statusText, /only Approve can be sent again/);
+  assert.equal(h.controller.submit("deny"), null);
+  assert.equal(h.controller.submit("grant"), 2);
+  assert.deepEqual(
+    h.sends.map((s) => s.action),
+    ["grant", "grant"],
+    "Deny is never signed after an unresolved Approve",
+  );
+});
+
+test("audit 3: a verified 'pending' while the submit is unresolved does not allow signing", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("deny");
+  t.mock.timers.tick(TIMEOUT);
+  h.verifies[0].resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "uncertain");
+  assert.equal(h.controller.submit("deny"), null);
+  assert.equal(h.controller.submit("grant"), null);
+  assert.equal(h.sends.length, 1);
+  h.controller.dispose();
+});
+
+test("audit 3: the decision lock survives a card remount", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const a = card({ locks });
+  a.controller.submit("grant");
+  a.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  a.controller.dispose();
+  // A fresh card for the same gate (remount, navigation) keeps the lock.
+  const b = card({ locks });
+  assert.equal(b.state.lockedAction, "grant");
+  assert.equal(b.controller.submit("deny"), null);
+  assert.deepEqual(b.view().disabledActions, { grant: false, deny: true });
+  assert.equal(b.controller.submit("grant"), 1);
+  b.controller.dispose();
+});
+
+test("only the relay's own accepted=false reply counts as a definitive refusal", () => {
+  assert.equal(decision.isDefinitiveRelayRefusal(REFUSED), true);
+  for (const message of [
+    UNREACHABLE,
+    "relay unreachable: network error",
+    "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay",
+    "HTTP 504: gateway timeout",
+    "",
+    null,
+  ])
+    assert.equal(decision.isDefinitiveRelayRefusal(message), false, message);
 });

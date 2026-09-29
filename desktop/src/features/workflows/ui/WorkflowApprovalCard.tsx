@@ -2,13 +2,15 @@ import { Check, X } from "lucide-react";
 import * as React from "react";
 
 import {
+  fetchApprovalStatusFromRelay,
   useApprovalMutation,
   useRefreshApprovalState,
 } from "@/features/workflows/hooks";
 import {
-  type ApprovalCardPhase,
+  type ApprovalDecisionController,
+  type ApprovalDecisionState,
   approvalCardView,
-  trackApprovalDecision,
+  createApprovalDecisionController,
 } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { WorkflowApproval } from "@/shared/api/types";
@@ -24,17 +26,11 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
   const approvalMutation = useApprovalMutation();
   const refreshApprovalState = useRefreshApprovalState();
-  const [phase, setPhase] = React.useState<ApprovalCardPhase>("idle");
-  const [action, setAction] = React.useState<Decision | undefined>();
-  const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
-  const [, setExpiryTick] = React.useState(0);
-  // Synchronous guard: a second click in the same frame, before React has
-  // re-rendered the disabled buttons, must not send a second decision. It is
-  // released only when the relay actually answers, never by the deadline.
-  const inFlight = React.useRef(false);
-  const tracker = React.useRef<ReturnType<typeof trackApprovalDecision> | null>(
+  const [decision, setDecision] = React.useState<ApprovalDecisionState | null>(
     null,
   );
+  const [, setExpiryTick] = React.useState(0);
+  const controllerRef = React.useRef<ApprovalDecisionController | null>(null);
   const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
@@ -42,14 +38,61 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     approval,
     myPubkey: identityQuery.data?.pubkey,
     nowMs: Date.now(),
-    phase,
-    action,
-    errorMessage,
+    phase: decision?.phase ?? "idle",
+    action: decision?.action,
+    errorMessage: decision?.errorMessage ?? null,
+    lockedAction: decision?.lockedAction ?? null,
+    settledStatus: decision?.settledStatus ?? null,
   });
 
-  // Audit 3: after the relay answers, focus lands on the card's status line.
+  // The controller is created once per gate and reads the latest values
+  // through this ref, so its fencing and locks survive re-renders.
+  const latest = React.useRef({
+    approval,
+    decision: view.decision,
+    mutateAsync: approvalMutation.mutateAsync,
+    refresh: refreshApprovalState,
+  });
+  latest.current = {
+    approval,
+    decision: view.decision,
+    mutateAsync: approvalMutation.mutateAsync,
+    refresh: refreshApprovalState,
+  };
+
+  const lockKey = approval.approvalRef.toLowerCase();
   React.useEffect(() => {
-    if (phase === "sent" || phase === "failed") {
+    const controller = createApprovalDecisionController({
+      lockKey,
+      send: ({ action }) => {
+        const target = latest.current.decision;
+        if (!target)
+          return Promise.reject(
+            new Error("This approval cannot be decided from Desktop."),
+          );
+        return latest.current.mutateAsync({
+          token: target.token,
+          candidate: target.candidate,
+          action,
+        });
+      },
+      // Verified read from the relay, not the query cache.
+      verify: () => fetchApprovalStatusFromRelay(latest.current.approval),
+      refetch: () => latest.current.refresh(),
+      onChange: setDecision,
+    });
+    controllerRef.current = controller;
+    setDecision(controller.getState());
+    return () => {
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, [lockKey]);
+
+  // Audit 3: after the relay answers, focus lands on the card's status line.
+  const phase = decision?.phase ?? "idle";
+  React.useEffect(() => {
+    if (phase === "sent" || phase === "failed" || phase === "settled") {
       if (focusStatusAfterDecision.current) {
         focusStatusAfterDecision.current = false;
         statusRef.current?.focus();
@@ -57,21 +100,18 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     }
   }, [phase]);
 
-  // Stop timers if the card goes away mid-decision.
-  React.useEffect(() => () => tracker.current?.dispose(), []);
-
-  // The card shows a settled gate (seen from the relay, or expired) while our
-  // submit is still overdue: stop re-reading the gate.
+  // The card shows a settled gate (seen from the relay, or expired) while a
+  // decision is still unresolved: stop re-reading the gate.
   const showsSettled = view.mode === "settled";
   React.useEffect(() => {
-    if (showsSettled) tracker.current?.stopPolling();
+    if (showsSettled) controllerRef.current?.stopPolling();
   }, [showsSettled]);
 
-  // An overdue decision on a gate that then expires must not stay busy:
+  // An unresolved decision on a gate that then expires must not stay busy:
   // re-render at expiry so the card shows Expired.
   const expiresAtMs = new Date(approval.expiresAt).getTime();
   React.useEffect(() => {
-    if (phase !== "uncertain") return undefined;
+    if (phase !== "uncertain" && phase !== "verifying") return undefined;
     const wait = expiresAtMs - Date.now();
     if (!(wait > 0)) return undefined;
     const timer = setTimeout(
@@ -82,34 +122,21 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   }, [phase, expiresAtMs]);
 
   const decide = (next: Decision) => {
-    if (inFlight.current || view.buttonsDisabled || !view.decision) return;
-    inFlight.current = true;
+    const controller = controllerRef.current;
+    if (!controller || view.disabledActions[next] || !view.decision) return;
+    // The controller's synchronous phase check blocks a second click in the
+    // same frame, and any signing the relay has not yet verified as safe.
     focusStatusAfterDecision.current = true;
-    setAction(next);
-    setErrorMessage(null);
-    const request = approvalMutation.mutateAsync({
-      token: view.decision.token,
-      candidate: view.decision.candidate,
-      action: next,
-    });
-    tracker.current = trackApprovalDecision(request, {
-      refetch: refreshApprovalState,
-      onPhase: (update) => {
-        if (update.phase === "sent" || update.phase === "failed") {
-          inFlight.current = false;
-          tracker.current = null;
-        }
-        if (update.phase === "failed")
-          setErrorMessage(update.errorMessage ?? null);
-        setPhase(update.phase);
-      },
-    });
+    if (controller.submit(next) === null)
+      focusStatusAfterDecision.current = false;
   };
 
-  const showButtons =
-    view.mode === "actions" ||
+  const busy =
     view.mode === "sending" ||
-    view.mode === "uncertain";
+    view.mode === "uncertain" ||
+    view.mode === "verifying";
+  const showButtons = view.mode === "actions" || busy;
+  const action = decision?.action;
 
   return (
     <div
@@ -158,30 +185,28 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
         <div
           className="flex flex-wrap gap-2"
           data-testid="workflow-approval-actions"
-          aria-busy={view.mode === "sending" || view.mode === "uncertain"}
+          aria-busy={busy}
         >
           <Button
             type="button"
             size="sm"
-            disabled={view.buttonsDisabled}
+            disabled={view.disabledActions.grant}
             onClick={() => decide("grant")}
             data-testid="workflow-approval-approve"
           >
             <Check aria-hidden="true" />
-            {view.mode !== "actions" && action === "grant"
-              ? "Approving…"
-              : "Approve"}
+            {busy && action === "grant" ? "Approving…" : "Approve"}
           </Button>
           <Button
             type="button"
             size="sm"
             variant="destructive"
-            disabled={view.buttonsDisabled}
+            disabled={view.disabledActions.deny}
             onClick={() => decide("deny")}
             data-testid="workflow-approval-deny"
           >
             <X aria-hidden="true" />
-            {view.mode !== "actions" && action === "deny" ? "Denying…" : "Deny"}
+            {busy && action === "deny" ? "Denying…" : "Deny"}
           </Button>
         </div>
       ) : null}

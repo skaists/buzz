@@ -269,6 +269,21 @@ function invalidateApprovalState(
   );
 }
 
+/** Verified read of one gate's status straight from the relay (no cache).
+ * Rejects when the relay cannot be read or does not list the gate, so the
+ * caller never mistakes "unknown" for "still pending". */
+export async function fetchApprovalStatusFromRelay(approval: {
+  workflowId: string;
+  runId: string;
+  approvalRef: string;
+}): Promise<string> {
+  const approvals = await getRunApprovals(approval.workflowId, approval.runId);
+  const ref = approval.approvalRef.toLowerCase();
+  const match = approvals.find((a) => a.approvalRef.toLowerCase() === ref);
+  if (!match) throw new Error("approval not found on the relay");
+  return match.status;
+}
+
 /** Lets the approval card re-read the gate while a decision is overdue.
  * Never cancels a read already in flight: on a slow relay, restarting it every
  * few seconds could mean the settled record never arrives. */

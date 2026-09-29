@@ -292,6 +292,34 @@ pub async fn get_run_approvals(
     .await
 }
 
+/// Hard lifetime of one approval submit. Tauri's `invoke` has no AbortSignal,
+/// so the frontend cannot cancel this command; the deadline is enforced here.
+/// Dropping the submit future cancels the HTTP request: a decision still queued
+/// behind the rate-limit gate or still connecting is never sent. A request the
+/// relay already received cannot be recalled, so the approval card re-reads the
+/// gate from the relay before it allows another signing (and then only the same
+/// decision). Kept below the card's 20 s deadline (`APPROVAL_DECISION_TIMEOUT_MS`).
+pub(crate) const APPROVAL_SUBMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Error returned when the deadline drops the submit. Not a relay refusal: the
+/// decision may or may not have reached the relay.
+pub(crate) const APPROVAL_SUBMIT_ABANDONED: &str =
+    "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay";
+
+/// Run `submit` under `deadline`, dropping (cancelling) it when time runs out.
+pub(crate) async fn with_approval_submit_deadline<T, F>(
+    submit: F,
+    deadline: std::time::Duration,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(deadline, submit).await {
+        Ok(result) => result,
+        Err(_) => Err(APPROVAL_SUBMIT_ABANDONED.to_string()),
+    }
+}
+
 #[tauri::command]
 pub async fn grant_approval(
     token: String,
@@ -300,7 +328,9 @@ pub async fn grant_approval(
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_grant(&token, note.as_deref(), candidate.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result =
+        with_approval_submit_deadline(submit_event(builder, &state), APPROVAL_SUBMIT_DEADLINE)
+            .await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 
@@ -312,7 +342,9 @@ pub async fn deny_approval(
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_deny(&token, note.as_deref(), candidate.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result =
+        with_approval_submit_deadline(submit_event(builder, &state), APPROVAL_SUBMIT_DEADLINE)
+            .await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 
