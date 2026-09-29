@@ -863,7 +863,9 @@ export function ProjectsView() {
                     <ProjectsOverviewRail
                       profiles={profiles}
                       projects={projects}
-                      repositorySummaries={repositoryActivitySummariesQuery.data}
+                      repositorySummaries={
+                        repositoryActivitySummariesQuery.data
+                      }
                       summaries={activitySummariesQuery.data}
                     />
                   }
