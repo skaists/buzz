@@ -79,41 +79,33 @@ export function approvalLockKey({ communityId, pubkey, approvalRef }) {
 }
 
 /**
- * Native submits still running, per identity + approval reference (a count).
- * Disposing a card only fences its callbacks: the Tauri command has already
- * captured the relay and identity and can still land the decision there.
- * @type {Map<string, number>}
+ * Decisions whose outcome is not yet known, per community + identity +
+ * approval reference. A key is added when its decision is signed and removed
+ * only when the outcome is known: the relay accepted it, the relay says the
+ * gate is already closed, a verified read found the gate settled, or the relay
+ * definitively refused it. Neither disposing a card nor the native submit
+ * ending (a transport error, or the 15 s abandon) resolves it: the decision
+ * may still have reached the relay.
+ * @type {Set<string>}
  */
-export const IN_FLIGHT_DECISION_SUBMITS = new Map();
+export const UNRESOLVED_DECISIONS = new Set();
 
 /**
  * Community teardown: decision locks are community-scoped state, except that
- * a record whose native submit is still running is kept. Otherwise an
- * A -> B -> A round trip inside the submit's lifetime would erase the only
- * record preventing the opposite signature. It is cleared by a later teardown
- * once that submit has ended.
+ * a record whose outcome is still unknown is kept. Otherwise an A -> B -> A
+ * round trip (while the native submit runs, or after it ended ambiguously)
+ * would erase the only record that makes the card verify first and allow
+ * only the same decision. A later teardown clears it once it is resolved.
  * @param {Map<string, "grant" | "deny">} [locks]
- * @param {Map<string, number>} [inFlight]
+ * @param {Set<string>} [unresolved]
  */
 export function resetUncertainDecisionLocks(
   locks = UNCERTAIN_DECISION_LOCKS,
-  inFlight = IN_FLIGHT_DECISION_SUBMITS,
+  unresolved = UNRESOLVED_DECISIONS,
 ) {
   for (const key of [...locks.keys()]) {
-    if (!inFlight.has(key)) locks.delete(key);
+    if (!unresolved.has(key)) locks.delete(key);
   }
-}
-
-/** @param {Map<string, number>} inFlight @param {string} key */
-function beginNativeSubmit(inFlight, key) {
-  inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
-}
-
-/** @param {Map<string, number>} inFlight @param {string} key */
-function endNativeSubmit(inFlight, key) {
-  const left = (inFlight.get(key) ?? 0) - 1;
-  if (left > 0) inFlight.set(key, left);
-  else inFlight.delete(key);
 }
 
 const ALL_OFF = Object.freeze({ grant: true, deny: true });
@@ -145,7 +137,7 @@ const ALL_OFF = Object.freeze({ grant: true, deny: true });
  *   refetch?: () => unknown,
  *   lockKey?: string,
  *   locks?: Map<string, "grant" | "deny">,
- *   inFlight?: Map<string, number>,
+ *   unresolved?: Set<string>,
  *   timeoutMs?: number,
  *   refetchMs?: number,
  *   verifyTimeoutMs?: number,
@@ -168,7 +160,7 @@ export function createApprovalDecisionController({
   refetch,
   lockKey,
   locks = UNCERTAIN_DECISION_LOCKS,
-  inFlight = IN_FLIGHT_DECISION_SUBMITS,
+  unresolved = UNRESOLVED_DECISIONS,
   timeoutMs = APPROVAL_DECISION_TIMEOUT_MS,
   refetchMs = APPROVAL_UNCERTAIN_REFETCH_MS,
   verifyTimeoutMs = APPROVAL_VERIFY_READ_TIMEOUT_MS,
@@ -261,6 +253,8 @@ export function createApprovalDecisionController({
         if (fenced()) return;
         const s = `${status ?? ""}`.toLowerCase();
         if (s === "granted" || s === "denied" || s === "expired") {
+          // Verified settled: nothing about this gate is unknown any more.
+          if (lockKey) unresolved.delete(lockKey);
           clearTimers();
           set({ phase: "settled", settledStatus: s });
         } else if (s === "pending" && !settleOnly) {
@@ -338,20 +332,25 @@ export function createApprovalDecisionController({
     }, timeoutMs);
 
     // Tracked outside the card: the native submit outlives a dispose, and
-    // community teardown must keep this record until the submit has ended.
-    if (lockKey) beginNativeSubmit(inFlight, lockKey);
+    // community teardown must keep this record until its outcome is known.
+    if (lockKey) unresolved.add(lockKey);
     let request;
     try {
       request = Promise.resolve(send({ action, attempt }));
     } catch (error) {
       request = Promise.reject(error);
     }
+    // Known outcomes resolve the record even after the card went away: the
+    // relay accepted the decision, or says the gate is already closed. An
+    // ambiguous end (transport error, abandon) leaves it unresolved.
     request.then(
       () => {
-        if (lockKey) endNativeSubmit(inFlight, lockKey);
+        if (lockKey) unresolved.delete(lockKey);
       },
-      () => {
-        if (lockKey) endNativeSubmit(inFlight, lockKey);
+      (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (lockKey && settledStatusFromRelayError(message))
+          unresolved.delete(lockKey);
       },
     );
     // Once a verified read has made this attempt terminal, the submit's own
@@ -380,7 +379,11 @@ export function createApprovalDecisionController({
         const lockedAction = definitive ? previousLock : action;
         if (lockKey) {
           if (lockedAction) locks.set(lockKey, lockedAction);
-          else locks.delete(lockKey);
+          else {
+            // Refused, and nothing earlier is outstanding: resolved.
+            locks.delete(lockKey);
+            unresolved.delete(lockKey);
+          }
         }
         if (definitive && !timedOut) {
           clearTimers();

@@ -45,7 +45,7 @@ function deferred() {
  */
 function card({
   locks = new Map(),
-  inFlight = new Map(),
+  unresolved = new Set(),
   lockKey = approval.approvalRef,
 } = {}) {
   const h = {
@@ -58,7 +58,7 @@ function card({
   h.controller = decision.createApprovalDecisionController({
     lockKey,
     locks,
-    inFlight,
+    unresolved,
     timeoutMs: TIMEOUT,
     refetchMs: REFETCH,
     send: ({ action, attempt }) => {
@@ -479,22 +479,22 @@ test("community teardown clears the decision records", () => {
   assert.equal(decision.UNCERTAIN_DECISION_LOCKS.size, 0);
 });
 
-test("audit 3: a community round trip keeps the record while the native submit runs", async (t) => {
+test("audit 3: a community round trip keeps a record until its outcome is known", async (t) => {
   enableTimers(t);
   const locks = new Map();
-  const inFlight = new Map();
+  const unresolved = new Set();
   // Community A: sign Approve, then switch away while the submit is running.
-  const a = card({ locks, inFlight });
+  const a = card({ locks, unresolved });
   a.controller.submit("grant");
   a.controller.dispose();
-  decision.resetUncertainDecisionLocks(locks, inFlight); // A -> B
+  decision.resetUncertainDecisionLocks(locks, unresolved); // A -> B
   assert.equal(
     locks.get(approval.approvalRef),
     "grant",
     "kept while in flight",
   );
   // Back in A: the fresh card starts by verifying and allows only Approve.
-  const back = card({ locks, inFlight });
+  const back = card({ locks, unresolved });
   assert.equal(back.state.phase, "verifying");
   assert.equal(back.controller.submit("deny"), null);
   back.verifies[0].resolve("pending");
@@ -502,19 +502,42 @@ test("audit 3: a community round trip keeps the record while the native submit r
   assert.equal(back.state.lockedAction, "grant");
   assert.equal(back.controller.submit("deny"), null, "never the opposite");
   back.controller.dispose();
-  // The native submit ends (after the card went away): a later teardown
-  // may now clear the record.
+  // The native submit ends ambiguously while the user is away (a transport
+  // error, or the 15 s abandon): it may still have reached the relay.
   a.sends[0].reject(new Error(UNREACHABLE));
   await flush();
-  assert.equal(inFlight.size, 0, "the in-flight count ends with the submit");
-  decision.resetUncertainDecisionLocks(locks, inFlight);
+  decision.resetUncertainDecisionLocks(locks, unresolved); // A -> B again
+  assert.equal(locks.get(approval.approvalRef), "grant", "kept: still unknown");
+  const again = card({ locks, unresolved });
+  assert.equal(again.state.phase, "verifying");
+  assert.equal(again.controller.submit("deny"), null);
+  // A verified read finds the gate settled: now the record is resolved.
+  again.verifies[0].resolve("granted");
+  await flush();
+  assert.equal(again.state.phase, "settled");
+  again.controller.dispose();
+  decision.resetUncertainDecisionLocks(locks, unresolved);
+  assert.equal(locks.size, 0, "a later teardown clears the resolved record");
+});
+
+test("audit 3: an accepted decision resolves its record even after the card went away", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const unresolved = new Set();
+  const h = card({ locks, unresolved });
+  h.controller.submit("grant");
+  h.controller.dispose();
+  h.sends[0].resolve({ event_id: "e1" });
+  await flush();
+  assert.equal(unresolved.size, 0);
+  decision.resetUncertainDecisionLocks(locks, unresolved);
   assert.equal(locks.size, 0);
 });
 
 test("audit 3: a record kept for one community never locks a colliding gate in another", async (t) => {
   enableTimers(t);
   const locks = new Map();
-  const inFlight = new Map();
+  const unresolved = new Set();
   const key = (communityId) =>
     decision.approvalLockKey({
       communityId,
@@ -523,13 +546,13 @@ test("audit 3: a record kept for one community never locks a colliding gate in a
     });
   assert.notEqual(key("community-a"), key("community-b"));
   // Community A signs Approve; the switch to B keeps A's in-flight record.
-  const a = card({ locks, inFlight, lockKey: key("community-a") });
+  const a = card({ locks, unresolved, lockKey: key("community-a") });
   a.controller.submit("grant");
   a.controller.dispose();
-  decision.resetUncertainDecisionLocks(locks, inFlight);
+  decision.resetUncertainDecisionLocks(locks, unresolved);
   assert.equal(locks.get(key("community-a")), "grant");
   // Same identity, identical approval reference bytes in B: B's own gate.
-  const b = card({ locks, inFlight, lockKey: key("community-b") });
+  const b = card({ locks, unresolved, lockKey: key("community-b") });
   assert.equal(b.state.phase, "idle");
   assert.equal(b.state.lockedAction, null);
   assert.deepEqual(b.view().disabledActions, { grant: false, deny: false });

@@ -45,8 +45,8 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const focusStatusAfterDecision = React.useRef(false);
 
   // Decision records are per community, identity and gate. A record whose
-  // native submit is still running survives community teardown, so the
-  // community is part of the key: a colliding gate elsewhere never inherits it.
+  // outcome is still unknown survives community teardown, so the community
+  // is part of the key: a colliding gate elsewhere never inherits it.
   const lockKey = approvalLockKey({
     communityId: activeCommunity?.id ?? null,
     pubkey: identityQuery.data?.pubkey,

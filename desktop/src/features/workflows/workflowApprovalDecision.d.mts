@@ -40,10 +40,10 @@ export function approvalLockKey(input: {
   pubkey?: string | null;
   approvalRef: string;
 }): string;
-export const IN_FLIGHT_DECISION_SUBMITS: Map<string, number>;
+export const UNRESOLVED_DECISIONS: Set<string>;
 export function resetUncertainDecisionLocks(
   locks?: Map<string, ApprovalDecisionAction>,
-  inFlight?: Map<string, number>,
+  unresolved?: Set<string>,
 ): void;
 export type ApprovalDecisionState = {
   attempt: number;
@@ -71,7 +71,7 @@ export function createApprovalDecisionController(options: {
   refetch?: () => unknown;
   lockKey?: string;
   locks?: Map<string, ApprovalDecisionAction>;
-  inFlight?: Map<string, number>;
+  unresolved?: Set<string>;
   timeoutMs?: number;
   refetchMs?: number;
   verifyTimeoutMs?: number;
