@@ -45,6 +45,7 @@ export type ApprovalDecisionState = {
   settledStatus: string | null;
 };
 export type ApprovalDecisionController = {
+  lockKey: string | null;
   submit: (action: ApprovalDecisionAction) => number | null;
   canSubmit: (action: ApprovalDecisionAction) => boolean;
   getState: () => ApprovalDecisionState;
@@ -82,3 +83,17 @@ export function approvalCardView(input: {
   lockedAction?: ApprovalDecisionAction | null;
   settledStatus?: string | null;
 }): ApprovalCardView;
+export function submitForKey(
+  controller:
+    | Pick<ApprovalDecisionController, "lockKey" | "submit">
+    | null
+    | undefined,
+  currentKey: string,
+  action: ApprovalDecisionAction,
+): number | null;
+export function gateViewForKey<
+  V extends {
+    buttonsDisabled: boolean;
+    disabledActions: { grant: boolean; deny: boolean };
+  },
+>(view: V, controllerKey: string | null, currentKey: string): V;

@@ -336,6 +336,8 @@ export function createApprovalDecisionController({
   };
 
   return {
+    /** The identity-plus-gate key this controller was created for. */
+    lockKey: lockKey ?? null,
     submit,
     canSubmit,
     getState: view,
@@ -351,6 +353,35 @@ export function createApprovalDecisionController({
       clearTimers();
     },
   };
+}
+
+/**
+ * Submit through `controller` only if it was created for `currentKey`.
+ * Between an identity (or gate) change and the effect that replaces the
+ * controller, the old controller is still attached; a click in that window
+ * must not sign under, or record against, the wrong identity-plus-gate key.
+ * @param {{ lockKey: string | null, submit: (action: "grant" | "deny") => number | null } | null | undefined} controller
+ * @param {string} currentKey
+ * @param {"grant" | "deny"} action
+ * @returns {number | null}
+ */
+export function submitForKey(controller, currentKey, action) {
+  if (!controller || controller.lockKey !== currentKey) return null;
+  return controller.submit(action);
+}
+
+/**
+ * Keep both buttons disabled while the attached controller belongs to another
+ * identity-plus-gate key (see submitForKey).
+ * @template {{ buttonsDisabled: boolean, disabledActions: { grant: boolean, deny: boolean } }} V
+ * @param {V} view
+ * @param {string | null} controllerKey
+ * @param {string} currentKey
+ * @returns {V}
+ */
+export function gateViewForKey(view, controllerKey, currentKey) {
+  if (controllerKey === currentKey) return view;
+  return { ...view, buttonsDisabled: true, disabledActions: ALL_OFF };
 }
 
 /**

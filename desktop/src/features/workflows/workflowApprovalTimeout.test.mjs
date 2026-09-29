@@ -557,6 +557,49 @@ test("overdue polling pauses while the app is not focused", async (t) => {
   c.dispose();
 });
 
+test("identity key: a click is ignored while the attached controller belongs to another key", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  // The controller still attached was created before the identity loaded
+  // (or before an identity switch).
+  const stale = card({ locks, lockKey: `:${approval.approvalRef}` });
+  const currentKey = `${ME}:${approval.approvalRef}`;
+  assert.equal(stale.controller.lockKey, `:${approval.approvalRef}`);
+  assert.equal(
+    decision.submitForKey(stale.controller, currentKey, "deny"),
+    null,
+  );
+  assert.equal(decision.submitForKey(null, currentKey, "grant"), null);
+  assert.equal(stale.sends.length, 0, "nothing signed under the wrong key");
+  assert.equal(locks.size, 0, "nothing recorded under the wrong key");
+  stale.controller.dispose();
+  // Once the controller for the current key is attached, clicks go through.
+  const fresh = card({ locks, lockKey: currentKey });
+  assert.equal(decision.submitForKey(fresh.controller, currentKey, "grant"), 1);
+  assert.equal(locks.get(currentKey), "grant");
+  fresh.controller.dispose();
+});
+
+test("identity key: both buttons stay disabled until the controller for the current key is attached", () => {
+  const live = decision.approvalCardView({
+    approval,
+    myPubkey: ME,
+    nowMs: NOW,
+  });
+  assert.deepEqual(live.disabledActions, { grant: false, deny: false });
+  const currentKey = `${ME}:${approval.approvalRef}`;
+  for (const controllerKey of [
+    null,
+    `:${approval.approvalRef}`,
+    `other:${approval.approvalRef}`,
+  ]) {
+    const gated = decision.gateViewForKey(live, controllerKey, currentKey);
+    assert.equal(gated.buttonsDisabled, true, String(controllerKey));
+    assert.deepEqual(gated.disabledActions, { grant: true, deny: true });
+  }
+  assert.equal(decision.gateViewForKey(live, currentKey, currentKey), live);
+});
+
 test("only the relay's own accepted=false reply counts as a definitive refusal", () => {
   assert.equal(decision.isDefinitiveRelayRefusal(REFUSED), true);
   for (const message of [

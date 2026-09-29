@@ -11,6 +11,8 @@ import {
   type ApprovalDecisionState,
   approvalCardView,
   createApprovalDecisionController,
+  gateViewForKey,
+  submitForKey,
 } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useAppFocused } from "@/shared/lib/useDocumentVisible";
@@ -32,20 +34,33 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     null,
   );
   const [, setExpiryTick] = React.useState(0);
+  // The identity-plus-gate key of the attached controller (set when the
+  // effect below creates it).
+  const [controllerKey, setControllerKey] = React.useState<string | null>(null);
   const controllerRef = React.useRef<ApprovalDecisionController | null>(null);
   const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
-  const view = approvalCardView({
-    approval,
-    myPubkey: identityQuery.data?.pubkey,
-    nowMs: Date.now(),
-    phase: decision?.phase ?? "idle",
-    action: decision?.action,
-    errorMessage: decision?.errorMessage ?? null,
-    lockedAction: decision?.lockedAction ?? null,
-    settledStatus: decision?.settledStatus ?? null,
-  });
+  // Decision records are per identity and gate (and cleared on community
+  // teardown), so they never leak across accounts or communities.
+  const lockKey = `${(identityQuery.data?.pubkey ?? "").toLowerCase()}:${approval.approvalRef.toLowerCase()}`;
+  // Until the controller for this exact key is attached, its state and its
+  // buttons are not this card's: show nothing from it and keep both disabled.
+  const current = controllerKey === lockKey ? decision : null;
+  const view = gateViewForKey(
+    approvalCardView({
+      approval,
+      myPubkey: identityQuery.data?.pubkey,
+      nowMs: Date.now(),
+      phase: current?.phase ?? "idle",
+      action: current?.action,
+      errorMessage: current?.errorMessage ?? null,
+      lockedAction: current?.lockedAction ?? null,
+      settledStatus: current?.settledStatus ?? null,
+    }),
+    controllerKey,
+    lockKey,
+  );
 
   // The controller is created once per gate and reads the latest values
   // through this ref, so its fencing and locks survive re-renders.
@@ -64,9 +79,6 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     appFocused,
   };
 
-  // Decision records are per identity and gate (and cleared on community
-  // teardown), so they never leak across accounts or communities.
-  const lockKey = `${(identityQuery.data?.pubkey ?? "").toLowerCase()}:${approval.approvalRef.toLowerCase()}`;
   React.useEffect(() => {
     const controller = createApprovalDecisionController({
       lockKey,
@@ -90,6 +102,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     });
     controllerRef.current = controller;
     setDecision(controller.getState());
+    setControllerKey(lockKey);
     return () => {
       controller.dispose();
       if (controllerRef.current === controller) controllerRef.current = null;
@@ -98,7 +111,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
 
   // Audit 3: once the outcome is known, focus lands on the card's status
   // line, whether the controller or the rendered gate record settled first.
-  const phase = decision?.phase ?? "idle";
+  const phase = current?.phase ?? "idle";
   const showsSettled = view.mode === "settled";
   const outcomeKnown =
     showsSettled ||
@@ -133,12 +146,13 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   }, [phase, expiresAtMs]);
 
   const decide = (next: Decision) => {
-    const controller = controllerRef.current;
-    if (!controller || view.disabledActions[next] || !view.decision) return;
-    // The controller's synchronous phase check blocks a second click in the
-    // same frame, and any signing the relay has not yet verified as safe.
+    if (view.disabledActions[next] || !view.decision) return;
+    // submitForKey ignores the click unless the attached controller was
+    // created for the current identity-plus-gate key. The controller's own
+    // synchronous phase check blocks a second click in the same frame, and
+    // any signing the relay has not yet verified as safe.
     focusStatusAfterDecision.current = true;
-    if (controller.submit(next) === null)
+    if (submitForKey(controllerRef.current, lockKey, next) === null)
       focusStatusAfterDecision.current = false;
   };
 
@@ -147,7 +161,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     view.mode === "uncertain" ||
     view.mode === "verifying";
   const showButtons = view.mode === "actions" || busy;
-  const action = decision?.action;
+  const action = current?.action;
 
   return (
     <div
