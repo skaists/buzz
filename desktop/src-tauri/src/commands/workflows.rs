@@ -285,9 +285,15 @@ pub async fn get_run_approvals(
         uuid::Uuid::parse_str(&workflow_id).map_err(|_| "invalid workflow id".to_string())?;
     let run_id =
         uuid::Uuid::parse_str(&run_id).map_err(|_| "invalid workflow run id".to_string())?;
-    get_relay_json(
-        &state,
-        &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
+    // Bounded like the submit: a hung read must end, so the approval card's
+    // verified re-reads cannot pile up native requests.
+    with_approval_deadline(
+        get_relay_json(
+            &state,
+            &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
+        ),
+        APPROVAL_READ_DEADLINE,
+        APPROVAL_READ_ABANDONED,
     )
     .await
 }
@@ -306,6 +312,29 @@ pub(crate) const APPROVAL_SUBMIT_DEADLINE: std::time::Duration = std::time::Dura
 pub(crate) const APPROVAL_SUBMIT_ABANDONED: &str =
     "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay";
 
+/// Hard lifetime of one approvals read (`get_run_approvals`), matching the
+/// card's verified-read retire timeout (`APPROVAL_VERIFY_READ_TIMEOUT_MS`).
+pub(crate) const APPROVAL_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Error returned when the read deadline drops a hung approvals read.
+pub(crate) const APPROVAL_READ_ABANDONED: &str =
+    "approvals read abandoned: no relay answer within 10 s";
+
+/// Run `work` under `deadline`, dropping (cancelling) it when time runs out.
+pub(crate) async fn with_approval_deadline<T, F>(
+    work: F,
+    deadline: std::time::Duration,
+    abandoned: &str,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(deadline, work).await {
+        Ok(result) => result,
+        Err(_) => Err(abandoned.to_string()),
+    }
+}
+
 /// Run `submit` under `deadline`, dropping (cancelling) it when time runs out.
 pub(crate) async fn with_approval_submit_deadline<T, F>(
     submit: F,
@@ -314,10 +343,7 @@ pub(crate) async fn with_approval_submit_deadline<T, F>(
 where
     F: std::future::Future<Output = Result<T, String>>,
 {
-    match tokio::time::timeout(deadline, submit).await {
-        Ok(result) => result,
-        Err(_) => Err(APPROVAL_SUBMIT_ABANDONED.to_string()),
-    }
+    with_approval_deadline(submit, deadline, APPROVAL_SUBMIT_ABANDONED).await
 }
 
 #[tauri::command]

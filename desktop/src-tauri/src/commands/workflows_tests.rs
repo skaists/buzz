@@ -271,3 +271,15 @@ fn approval_submit_deadline_is_below_the_card_deadline() {
     // command's own answer, including the abandoned error, before it gives up.
     assert!(APPROVAL_SUBMIT_DEADLINE < std::time::Duration::from_secs(20));
 }
+
+#[tokio::test(start_paused = true)]
+async fn approvals_read_deadline_drops_a_hung_read() {
+    let result = with_approval_deadline(
+        std::future::pending::<Result<(), String>>(),
+        APPROVAL_READ_DEADLINE,
+        APPROVAL_READ_ABANDONED,
+    )
+    .await;
+    assert_eq!(result, Err(APPROVAL_READ_ABANDONED.to_string()));
+    assert_eq!(APPROVAL_READ_DEADLINE, std::time::Duration::from_secs(10));
+}

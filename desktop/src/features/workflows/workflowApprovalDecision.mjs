@@ -200,7 +200,10 @@ export function createApprovalDecisionController({
     } catch (error) {
       read = Promise.reject(error);
     }
-    const fenced = () => !current(attempt) || generation !== pollGeneration;
+    // Only the newest read may speak: a retired (timed-out) or superseded
+    // read's late answer is dropped, even if it says "pending".
+    const fenced = () =>
+      !current(attempt) || generation !== pollGeneration || readId !== readSeq;
     read.then(
       (status) => {
         release();
@@ -289,16 +292,19 @@ export function createApprovalDecisionController({
     } catch (error) {
       request = Promise.reject(error);
     }
+    // Once a verified read has made this attempt terminal, the submit's own
+    // late answer must not reopen it.
+    const terminal = () => state.phase === "settled";
     request.then(
       () => {
         transportDone = true;
-        if (!current(attempt)) return;
+        if (!current(attempt) || terminal()) return;
         clearTimers();
         set({ phase: "sent" });
       },
       (error) => {
         transportDone = true;
-        if (!current(attempt)) return;
+        if (!current(attempt) || terminal()) return;
         const message = error instanceof Error ? error.message : String(error);
         if (settledStatusFromRelayError(message)) {
           // The relay says the gate is already closed: show that.

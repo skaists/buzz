@@ -491,6 +491,41 @@ test("a hung verified read is retired and retried", async (t) => {
   h.controller.dispose();
 });
 
+test("a retired verified read's late answer is dropped", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  h.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  t.mock.timers.tick(10_000 + REFETCH); // first read retired, second issued
+  assert.equal(h.verifies.length, 2);
+  // The retired read wakes up with "pending": it must not unlock anything
+  // while the newer read is still underway.
+  h.verifies[0].resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "verifying");
+  assert.equal(h.controller.submit("grant"), null);
+  h.verifies[1].resolve("pending");
+  await flush();
+  assert.equal(h.state.phase, "failed");
+  h.controller.dispose();
+});
+
+test("a verified terminal state survives the submit's late failure", async (t) => {
+  enableTimers(t);
+  const h = card();
+  h.controller.submit("grant");
+  t.mock.timers.tick(TIMEOUT);
+  h.verifies[0].resolve("granted");
+  await flush();
+  assert.equal(h.state.phase, "settled");
+  h.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(h.state.phase, "settled");
+  t.mock.timers.tick(5 * REFETCH);
+  assert.equal(h.verifies.length, 1, "no polling restarted");
+});
+
 test("overdue polling pauses while the app is not focused", async (t) => {
   enableTimers(t);
   let focused = false;
