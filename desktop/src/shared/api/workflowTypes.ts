@@ -53,7 +53,9 @@ export type WorkflowApprovalStatus =
   | "expired";
 
 export type WorkflowApproval = {
-  /** Opaque, non-actionable identifier for display/correlation only. */
+  /** Hex SHA-256 of the approval token: the relay's lookup key for a decision
+   * (`d` tag). Not a bearer secret; the relay only honours the designated
+   * approver's signature (and the bound candidate, when there is one). */
   approvalRef: string;
   workflowId: string;
   runId: string;
