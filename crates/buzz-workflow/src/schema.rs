@@ -131,13 +131,21 @@ pub enum ActionDef {
     },
     /// Suspend execution and request approval.
     RequestApproval {
-        /// User mention or role (e.g. `"@release-manager"`).
+        /// Designated approver: a 64-char hex pubkey, or `"any"`. Templates
+        /// are resolved before the gate is minted; role mentions such as
+        /// `"@release-manager"` are rejected at mint time (fail closed).
         from: String,
         /// Message shown to the approver.
         message: String,
         /// Duration string (e.g. `"24h"`). Defaults to 24h.
         #[serde(default)]
         timeout: Option<String>,
+        /// Exact candidate the approval is bound to (template, e.g.
+        /// `"{{trigger.candidate_commit}}"`). When set, a grant must name the
+        /// same value or it is rejected — a stale approval for candidate A can
+        /// never approve corrected candidate B.
+        #[serde(default)]
+        candidate: Option<String>,
     },
     /// Pause execution for a duration (e.g. `"5m"`, `"1h"`).
     Delay {
@@ -654,6 +662,32 @@ mod tests {
                 WorkflowError::InvalidYaml(_) | WorkflowError::InvalidDefinition(_)
             ),
             "expected parse error, got: {err}"
+        );
+    }
+
+    // -- WF-08 RED→GREEN (compiles on base 191a577; FAILS there) -----------
+    //
+    // On base, `ActionDef::RequestApproval` has no `candidate` field and serde
+    // silently drops unknown keys, so the binding a definition asks for
+    // vanishes on save — the stale-candidate rule cannot even be expressed.
+    // On the candidate the field round-trips through YAML → JSON → YAML.
+    #[test]
+    fn request_approval_candidate_binding_survives_round_trip() {
+        let yaml = concat!(
+            "name: gate\ntrigger:\n  on: webhook\nsteps:\n",
+            "  - id: review\n    action: request_approval\n    from: \"any\"\n",
+            "    message: review\n    candidate: \"{{trigger.candidate_commit}}\"\n",
+        );
+        let (_def, json) = parse_yaml(yaml).expect("parse");
+        assert!(
+            json.contains("\"candidate\":\"{{trigger.candidate_commit}}\""),
+            "canonical JSON must keep the candidate binding, got: {json}"
+        );
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("reparse");
+        let yaml_out = serde_yaml::to_string(&reparsed).expect("to yaml");
+        assert!(
+            yaml_out.contains("candidate:") && yaml_out.contains("{{trigger.candidate_commit}}"),
+            "YAML export must keep the candidate binding, got: {yaml_out}"
         );
     }
 

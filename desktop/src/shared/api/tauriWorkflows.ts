@@ -68,6 +68,8 @@ type RawWorkflowApproval = {
   status: WorkflowApproval["status"];
   approver_pubkey: string | null;
   note: string | null;
+  /** Present on relays with WF-08; absent on older relays — treated as unbound. */
+  candidate_ref?: string | null;
   expires_at: string;
   created_at: number;
 };
@@ -148,6 +150,7 @@ export function fromRawApproval(raw: RawWorkflowApproval): WorkflowApproval {
     status: raw.status,
     approverPubkey: raw.approver_pubkey,
     note: raw.note,
+    candidateRef: raw.candidate_ref ?? null,
     expiresAt: raw.expires_at,
     createdAt: raw.created_at,
   };
@@ -270,10 +273,12 @@ export async function triggerWorkflow(
 export async function grantApproval(
   token: string,
   note?: string,
+  candidate?: string,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("grant_approval", {
     token,
     note: note ?? null,
+    candidate: candidate ?? null,
   });
   return fromRawApprovalResponse(raw);
 }
@@ -281,10 +286,12 @@ export async function grantApproval(
 export async function denyApproval(
   token: string,
   note?: string,
+  candidate?: string,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("deny_approval", {
     token,
     note: note ?? null,
+    candidate: candidate ?? null,
   });
   return fromRawApprovalResponse(raw);
 }

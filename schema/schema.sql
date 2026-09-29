@@ -421,6 +421,9 @@ CREATE TABLE workflow_approvals (
     status          approval_status NOT NULL DEFAULT 'pending',
     approver_pubkey BYTEA,
     note            TEXT,
+    -- WF-08 (migration 0047): the exact candidate a pending approval was
+    -- requested for; NULL for gates minted without one.
+    candidate_ref   TEXT,
     granted_at      TIMESTAMPTZ,
     denied_at       TIMESTAMPTZ,
     expires_at      TIMESTAMPTZ NOT NULL,

@@ -66,4 +66,27 @@ pub trait ActionSink: Send + Sync {
         text: &str,
         author_pubkey: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+
+    /// Publish a relay-signed workflow lifecycle event (kinds 46001–46012)
+    /// into a channel (WF-08: 46010 approval requested, 46011 granted,
+    /// 46012 denied).
+    ///
+    /// - `kind`: the workflow-execution kind to publish
+    /// - `content`: JSON payload carrying the run/step/candidate binding
+    /// - `notify_pubkeys`: hex pubkeys that receive a `p` tag (the designated
+    ///   approver and the workflow owner) so mention-gated agents and the
+    ///   needs-action feed pick the event up
+    ///
+    /// The event is tagged `buzz:workflow` and its kind is a workflow-execution
+    /// kind, so it can never trigger a workflow itself.
+    ///
+    /// Returns the event ID hex string on success.
+    fn emit_workflow_event(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        kind: u32,
+        content: &str,
+        notify_pubkeys: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
 }

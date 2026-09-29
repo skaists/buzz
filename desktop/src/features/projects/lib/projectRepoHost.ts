@@ -1,3 +1,5 @@
+import { truncatePubkey } from "@/shared/lib/pubkey";
+
 import { effectiveCloneUrls } from "./projectCloneUrl";
 
 export type ProjectRepoHost =
@@ -74,7 +76,7 @@ export function repositoryDisplayPath(
   if (!cloneUrl) return null;
 
   if (projectRepoHost(cloneUrl, relayOrigin).kind === "buzz") {
-    const owner = ownerLabel?.trim() || `${repository.owner.slice(0, 8)}…`;
+    const owner = ownerLabel?.trim() || truncatePubkey(repository.owner);
     return `${owner}/${repository.dtag}`;
   }
 

@@ -296,9 +296,10 @@ pub async fn get_run_approvals(
 pub async fn grant_approval(
     token: String,
     note: Option<String>,
+    candidate: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    let builder = events::build_approval_grant(&token, note.as_deref())?;
+    let builder = events::build_approval_grant(&token, note.as_deref(), candidate.as_deref())?;
     let result = submit_event(builder, &state).await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
@@ -307,9 +308,10 @@ pub async fn grant_approval(
 pub async fn deny_approval(
     token: String,
     note: Option<String>,
+    candidate: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    let builder = events::build_approval_deny(&token, note.as_deref())?;
+    let builder = events::build_approval_deny(&token, note.as_deref(), candidate.as_deref())?;
     let result = submit_event(builder, &state).await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }

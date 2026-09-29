@@ -137,7 +137,7 @@ test("repositoryDisplayPath falls back to a shortened pubkey owner", () => {
       { cloneUrls: [], dtag: "buzz", owner: OWNER },
       ORIGIN,
     ),
-    `${"a".repeat(8)}…/buzz`,
+    `${"a".repeat(8)}…${"a".repeat(4)}/buzz`,
   );
 });
 

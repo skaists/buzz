@@ -30,7 +30,7 @@ pub const LIST_MAX_LIMIT: i64 = 1000;
 ///
 /// Approval tokens are stored hashed so that a DB read does not expose
 /// the raw token (same pattern as API tokens in buzz-auth).
-fn hash_approval_token(token: &str) -> Vec<u8> {
+pub fn hash_approval_token(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
@@ -263,6 +263,10 @@ pub struct ApprovalRecord {
     pub approver_pubkey: Option<Vec<u8>>,
     /// Optional note left by the approver.
     pub note: Option<String>,
+    /// Exact candidate this approval was requested for (e.g. a commit sha).
+    /// `None` for gates that did not name a candidate. A grant must name the
+    /// same candidate or it is rejected (WF-08 stale-candidate rule).
+    pub candidate_ref: Option<String>,
     /// When this approval request expires.
     pub expires_at: DateTime<Utc>,
     /// When the approval record was created.
@@ -979,6 +983,8 @@ pub struct CreateApprovalParams<'a> {
     pub step_index: i32,
     /// Who may approve (user mention or role spec).
     pub approver_spec: &'a str,
+    /// Exact candidate the approval is bound to (`None` = unbound gate).
+    pub candidate_ref: Option<&'a str>,
     /// When this approval request expires.
     pub expires_at: DateTime<Utc>,
 }
@@ -996,6 +1002,7 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
         step_id,
         step_index,
         approver_spec,
+        candidate_ref,
         expires_at,
     } = params;
     let token_hash = hash_approval_token(token);
@@ -1003,8 +1010,8 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
     sqlx::query(
         r#"
         INSERT INTO workflow_approvals
-            (community_id, token, workflow_id, run_id, step_id, step_index, approver_spec, status, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+            (community_id, token, workflow_id, run_id, step_id, step_index, approver_spec, candidate_ref, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
         "#,
     )
     .bind(community_id.as_uuid())
@@ -1014,6 +1021,7 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
     .bind(step_id)
     .bind(step_index)
     .bind(approver_spec)
+    .bind(candidate_ref)
     .bind(expires_at)
     .execute(pool)
     .await?;
@@ -1050,7 +1058,7 @@ pub async fn get_approval_by_stored_hash(
     let row = sqlx::query(
         r#"
         SELECT token, workflow_id, run_id, step_id, step_index, approver_spec,
-               status::text AS status, approver_pubkey, note, expires_at, created_at
+               status::text AS status, approver_pubkey, note, candidate_ref, expires_at, created_at
         FROM workflow_approvals
         WHERE community_id = $1 AND token = $2
         "#,
@@ -1074,7 +1082,7 @@ pub async fn get_run_approvals(
     let rows = sqlx::query(
         r#"
         SELECT token, workflow_id, run_id, step_id, step_index, approver_spec,
-               status::text AS status, approver_pubkey, note, expires_at, created_at
+               status::text AS status, approver_pubkey, note, candidate_ref, expires_at, created_at
         FROM workflow_approvals
         WHERE community_id = $1 AND run_id = $2 AND workflow_id = $3
         ORDER BY step_index, created_at
@@ -1232,6 +1240,7 @@ fn row_to_approval_record(row: sqlx::postgres::PgRow) -> Result<ApprovalRecord> 
         status,
         approver_pubkey: row.try_get("approver_pubkey")?,
         note: row.try_get("note")?,
+        candidate_ref: row.try_get("candidate_ref")?,
         expires_at: row.try_get("expires_at")?,
         created_at: row.try_get("created_at")?,
     })
@@ -1653,6 +1662,7 @@ mod tests {
             status: ApprovalStatus::Pending,
             approver_pubkey: None,
             note: None,
+            candidate_ref: None,
             expires_at,
             created_at: now,
         };
@@ -1683,6 +1693,7 @@ mod tests {
             status: ApprovalStatus::Granted,
             approver_pubkey: Some(approver_pubkey.clone()),
             note: Some("Looks good, approved.".to_owned()),
+            candidate_ref: None,
             expires_at: now,
             created_at: now,
         };
@@ -1706,6 +1717,7 @@ mod tests {
             status: ApprovalStatus::Denied,
             approver_pubkey: Some(vec![0xbb; 32]),
             note: Some("Not ready for production.".to_owned()),
+            candidate_ref: None,
             expires_at: now,
             created_at: now,
         };
@@ -1727,6 +1739,7 @@ mod tests {
             status: ApprovalStatus::Pending,
             approver_pubkey: None,
             note: None,
+            candidate_ref: None,
             expires_at: now,
             created_at: now,
         };
@@ -2292,6 +2305,7 @@ mod tests {
                 step_id: "gate",
                 step_index: 0,
                 approver_spec: "@anyone",
+                candidate_ref: None,
                 expires_at: expires,
             },
         )
@@ -2307,6 +2321,7 @@ mod tests {
                 step_id: "gate",
                 step_index: 0,
                 approver_spec: "@anyone",
+                candidate_ref: None,
                 expires_at: expires,
             },
         )
