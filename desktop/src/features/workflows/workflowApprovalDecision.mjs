@@ -62,9 +62,42 @@ export function isDefinitiveRelayRefusal(message) {
  */
 export const UNCERTAIN_DECISION_LOCKS = new Map();
 
-/** Community teardown: decision locks are community-scoped state. */
-export function resetUncertainDecisionLocks() {
-  UNCERTAIN_DECISION_LOCKS.clear();
+/**
+ * Native submits still running, per identity + approval reference (a count).
+ * Disposing a card only fences its callbacks: the Tauri command has already
+ * captured the relay and identity and can still land the decision there.
+ * @type {Map<string, number>}
+ */
+export const IN_FLIGHT_DECISION_SUBMITS = new Map();
+
+/**
+ * Community teardown: decision locks are community-scoped state, except that
+ * a record whose native submit is still running is kept. Otherwise an
+ * A -> B -> A round trip inside the submit's lifetime would erase the only
+ * record preventing the opposite signature. It is cleared by a later teardown
+ * once that submit has ended.
+ * @param {Map<string, "grant" | "deny">} [locks]
+ * @param {Map<string, number>} [inFlight]
+ */
+export function resetUncertainDecisionLocks(
+  locks = UNCERTAIN_DECISION_LOCKS,
+  inFlight = IN_FLIGHT_DECISION_SUBMITS,
+) {
+  for (const key of [...locks.keys()]) {
+    if (!inFlight.has(key)) locks.delete(key);
+  }
+}
+
+/** @param {Map<string, number>} inFlight @param {string} key */
+function beginNativeSubmit(inFlight, key) {
+  inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
+}
+
+/** @param {Map<string, number>} inFlight @param {string} key */
+function endNativeSubmit(inFlight, key) {
+  const left = (inFlight.get(key) ?? 0) - 1;
+  if (left > 0) inFlight.set(key, left);
+  else inFlight.delete(key);
 }
 
 const ALL_OFF = Object.freeze({ grant: true, deny: true });
@@ -96,6 +129,7 @@ const ALL_OFF = Object.freeze({ grant: true, deny: true });
  *   refetch?: () => unknown,
  *   lockKey?: string,
  *   locks?: Map<string, "grant" | "deny">,
+ *   inFlight?: Map<string, number>,
  *   timeoutMs?: number,
  *   refetchMs?: number,
  *   verifyTimeoutMs?: number,
@@ -118,6 +152,7 @@ export function createApprovalDecisionController({
   refetch,
   lockKey,
   locks = UNCERTAIN_DECISION_LOCKS,
+  inFlight = IN_FLIGHT_DECISION_SUBMITS,
   timeoutMs = APPROVAL_DECISION_TIMEOUT_MS,
   refetchMs = APPROVAL_UNCERTAIN_REFETCH_MS,
   verifyTimeoutMs = APPROVAL_VERIFY_READ_TIMEOUT_MS,
@@ -286,12 +321,23 @@ export function createApprovalDecisionController({
       startPolling(attempt, true);
     }, timeoutMs);
 
+    // Tracked outside the card: the native submit outlives a dispose, and
+    // community teardown must keep this record until the submit has ended.
+    if (lockKey) beginNativeSubmit(inFlight, lockKey);
     let request;
     try {
       request = Promise.resolve(send({ action, attempt }));
     } catch (error) {
       request = Promise.reject(error);
     }
+    request.then(
+      () => {
+        if (lockKey) endNativeSubmit(inFlight, lockKey);
+      },
+      () => {
+        if (lockKey) endNativeSubmit(inFlight, lockKey);
+      },
+    );
     // Once a verified read has made this attempt terminal, the submit's own
     // late answer must not reopen it.
     const terminal = () => state.phase === "settled";

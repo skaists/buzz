@@ -279,23 +279,33 @@ pub async fn trigger_workflow(
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
+    verify: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<WorkflowApprovalsWire, String> {
     let workflow_id =
         uuid::Uuid::parse_str(&workflow_id).map_err(|_| "invalid workflow id".to_string())?;
     let run_id =
         uuid::Uuid::parse_str(&run_id).map_err(|_| "invalid workflow run id".to_string())?;
-    // Bounded like the submit: a hung read must end, so the approval card's
-    // verified re-reads cannot pile up native requests.
-    with_approval_deadline(
-        get_relay_json(
-            &state,
-            &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
-        ),
-        APPROVAL_READ_DEADLINE,
-        APPROVAL_READ_ABANDONED,
-    )
-    .await
+    let path = format!("/workflows/{workflow_id}/runs/{run_id}/approvals");
+    let read = get_relay_json(&state, &path);
+    match approvals_read_deadline(verify) {
+        // The approval card's verified re-reads are bounded like the submit: a
+        // hung read must end, so they cannot pile up native requests.
+        Some(deadline) => with_approval_deadline(read, deadline, APPROVAL_READ_ABANDONED).await,
+        // The ordinary approvals query keeps waiting: a slow but working relay
+        // must still be able to populate the approval cards.
+        None => read.await,
+    }
+}
+
+/// The hard deadline for an approvals read: only the approval card's verified
+/// re-reads (`verify: true`) get one. The ordinary approvals query has none.
+pub(crate) fn approvals_read_deadline(verify: Option<bool>) -> Option<std::time::Duration> {
+    if verify == Some(true) {
+        Some(APPROVAL_READ_DEADLINE)
+    } else {
+        None
+    }
 }
 
 /// Hard lifetime of one approval submit. Tauri's `invoke` has no AbortSignal,
@@ -312,8 +322,9 @@ pub(crate) const APPROVAL_SUBMIT_DEADLINE: std::time::Duration = std::time::Dura
 pub(crate) const APPROVAL_SUBMIT_ABANDONED: &str =
     "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay";
 
-/// Hard lifetime of one approvals read (`get_run_approvals`), matching the
-/// card's verified-read retire timeout (`APPROVAL_VERIFY_READ_TIMEOUT_MS`).
+/// Hard lifetime of one verified approvals read (`get_run_approvals` with
+/// `verify: true`), matching the card's verified-read retire timeout
+/// (`APPROVAL_VERIFY_READ_TIMEOUT_MS`).
 pub(crate) const APPROVAL_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Error returned when the read deadline drops a hung approvals read.

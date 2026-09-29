@@ -277,7 +277,9 @@ export async function fetchApprovalStatusFromRelay(approval: {
   runId: string;
   approvalRef: string;
 }): Promise<string> {
-  const approvals = await getRunApprovals(approval.workflowId, approval.runId);
+  const approvals = await getRunApprovals(approval.workflowId, approval.runId, {
+    verify: true,
+  });
   const ref = approval.approvalRef.toLowerCase();
   const match = approvals.find((a) => a.approvalRef.toLowerCase() === ref);
   if (!match) throw new Error("approval not found on the relay");

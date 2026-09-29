@@ -43,7 +43,11 @@ function deferred() {
  * A card harness: every send/verify call gets its own deferred so the test
  * decides when (and in which order) the relay answers.
  */
-function card({ locks = new Map(), lockKey = approval.approvalRef } = {}) {
+function card({
+  locks = new Map(),
+  inFlight = new Map(),
+  lockKey = approval.approvalRef,
+} = {}) {
   const h = {
     sends: [],
     verifies: [],
@@ -54,6 +58,7 @@ function card({ locks = new Map(), lockKey = approval.approvalRef } = {}) {
   h.controller = decision.createApprovalDecisionController({
     lockKey,
     locks,
+    inFlight,
     timeoutMs: TIMEOUT,
     refetchMs: REFETCH,
     send: ({ action, attempt }) => {
@@ -472,6 +477,38 @@ test("community teardown clears the decision records", () => {
   decision.UNCERTAIN_DECISION_LOCKS.set("some-gate", "grant");
   decision.resetUncertainDecisionLocks();
   assert.equal(decision.UNCERTAIN_DECISION_LOCKS.size, 0);
+});
+
+test("audit 3: a community round trip keeps the record while the native submit runs", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const inFlight = new Map();
+  // Community A: sign Approve, then switch away while the submit is running.
+  const a = card({ locks, inFlight });
+  a.controller.submit("grant");
+  a.controller.dispose();
+  decision.resetUncertainDecisionLocks(locks, inFlight); // A -> B
+  assert.equal(
+    locks.get(approval.approvalRef),
+    "grant",
+    "kept while in flight",
+  );
+  // Back in A: the fresh card starts by verifying and allows only Approve.
+  const back = card({ locks, inFlight });
+  assert.equal(back.state.phase, "verifying");
+  assert.equal(back.controller.submit("deny"), null);
+  back.verifies[0].resolve("pending");
+  await flush();
+  assert.equal(back.state.lockedAction, "grant");
+  assert.equal(back.controller.submit("deny"), null, "never the opposite");
+  back.controller.dispose();
+  // The native submit ends (after the card went away): a later teardown
+  // may now clear the record.
+  a.sends[0].reject(new Error(UNREACHABLE));
+  await flush();
+  assert.equal(inFlight.size, 0, "the in-flight count ends with the submit");
+  decision.resetUncertainDecisionLocks(locks, inFlight);
+  assert.equal(locks.size, 0);
 });
 
 test("a hung verified read is retired and retried", async (t) => {

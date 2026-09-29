@@ -283,3 +283,15 @@ async fn approvals_read_deadline_drops_a_hung_read() {
     assert_eq!(result, Err(APPROVAL_READ_ABANDONED.to_string()));
     assert_eq!(APPROVAL_READ_DEADLINE, std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn only_verified_approvals_reads_get_the_deadline() {
+    // The ordinary approvals query must keep waiting on a slow relay.
+    assert_eq!(approvals_read_deadline(None), None);
+    assert_eq!(approvals_read_deadline(Some(false)), None);
+    // The approval card's verified re-reads are bounded.
+    assert_eq!(
+        approvals_read_deadline(Some(true)),
+        Some(APPROVAL_READ_DEADLINE)
+    );
+}
