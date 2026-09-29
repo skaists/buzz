@@ -1,10 +1,14 @@
 import { Check, X } from "lucide-react";
 import * as React from "react";
 
-import { useApprovalMutation } from "@/features/workflows/hooks";
+import {
+  useApprovalMutation,
+  useRefreshApprovalState,
+} from "@/features/workflows/hooks";
 import {
   type ApprovalCardPhase,
   approvalCardView,
+  trackApprovalDecision,
 } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { WorkflowApproval } from "@/shared/api/types";
@@ -19,12 +23,17 @@ type Decision = "grant" | "deny";
 export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
   const approvalMutation = useApprovalMutation();
+  const refreshApprovalState = useRefreshApprovalState();
   const [phase, setPhase] = React.useState<ApprovalCardPhase>("idle");
   const [action, setAction] = React.useState<Decision | undefined>();
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   // Synchronous guard: a second click in the same frame, before React has
-  // re-rendered the disabled buttons, must not send a second decision.
+  // re-rendered the disabled buttons, must not send a second decision. It is
+  // released only when the relay actually answers, never by the deadline.
   const inFlight = React.useRef(false);
+  const tracker = React.useRef<ReturnType<typeof trackApprovalDecision> | null>(
+    null,
+  );
   const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
@@ -47,35 +56,44 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
     }
   }, [phase]);
 
+  // Stop timers if the card goes away mid-decision.
+  React.useEffect(() => () => tracker.current?.dispose(), []);
+
+  // The gate record settled (seen from the relay) while our submit is still
+  // overdue: the card already shows it, so stop re-reading the gate.
+  React.useEffect(() => {
+    if (approval.status !== "pending") tracker.current?.stopPolling();
+  }, [approval.status]);
+
   const decide = (next: Decision) => {
     if (inFlight.current || view.buttonsDisabled || !view.decision) return;
     inFlight.current = true;
     focusStatusAfterDecision.current = true;
     setAction(next);
     setErrorMessage(null);
-    setPhase("sending");
-    approvalMutation.mutate(
-      {
-        token: view.decision.token,
-        candidate: view.decision.candidate,
-        action: next,
-      },
-      {
-        onSuccess: () => setPhase("sent"),
-        onError: (error) => {
-          setErrorMessage(
-            error instanceof Error ? error.message : String(error),
-          );
-          setPhase("failed");
-        },
-        onSettled: () => {
+    const request = approvalMutation.mutateAsync({
+      token: view.decision.token,
+      candidate: view.decision.candidate,
+      action: next,
+    });
+    tracker.current = trackApprovalDecision(request, {
+      refetch: refreshApprovalState,
+      onPhase: (update) => {
+        if (update.phase === "sent" || update.phase === "failed") {
           inFlight.current = false;
-        },
+          tracker.current = null;
+        }
+        if (update.phase === "failed")
+          setErrorMessage(update.errorMessage ?? null);
+        setPhase(update.phase);
       },
-    );
+    });
   };
 
-  const showButtons = view.mode === "actions" || view.mode === "sending";
+  const showButtons =
+    view.mode === "actions" ||
+    view.mode === "sending" ||
+    view.mode === "uncertain";
 
   return (
     <div
@@ -124,7 +142,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
         <div
           className="flex flex-wrap gap-2"
           data-testid="workflow-approval-actions"
-          aria-busy={view.mode === "sending"}
+          aria-busy={view.mode === "sending" || view.mode === "uncertain"}
         >
           <Button
             type="button"
@@ -134,7 +152,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
             data-testid="workflow-approval-approve"
           >
             <Check aria-hidden="true" />
-            {view.mode === "sending" && action === "grant"
+            {view.mode !== "actions" && action === "grant"
               ? "Approving…"
               : "Approve"}
           </Button>
@@ -147,7 +165,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
             data-testid="workflow-approval-deny"
           >
             <X aria-hidden="true" />
-            {view.mode === "sending" && action === "deny" ? "Denying…" : "Deny"}
+            {view.mode !== "actions" && action === "deny" ? "Denying…" : "Deny"}
           </Button>
         </div>
       ) : null}

@@ -8,10 +8,11 @@
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
-/** How long the card waits for the relay before it gives control back. */
+/** How long the card waits for the relay before it says so on the card. */
 export const APPROVAL_DECISION_TIMEOUT_MS = 20_000;
-export const APPROVAL_TIMEOUT_MESSAGE =
-  "The relay did not answer in time. Nothing was settled; try again.";
+/** While an answer is overdue, how often the card re-reads the gate. */
+export const APPROVAL_UNCERTAIN_REFETCH_MS = 3_000;
+export const APPROVAL_STILL_WAITING_TEXT = "Still waiting for the relay…";
 
 const SETTLED_LABELS = {
   granted: "Approved",
@@ -37,21 +38,74 @@ export function settledStatusFromRelayError(message) {
 }
 
 /**
- * Resolve `promise`, or reject with APPROVAL_TIMEOUT_MESSAGE after `ms`.
- * @template T
- * @param {Promise<T>} promise
- * @param {number} [ms]
- * @returns {Promise<T>}
+ * Follow one submitted decision until the relay actually answers.
+ *
+ * A slow submit cannot be cancelled: the grant or denial may still reach the
+ * relay after any deadline. So the deadline never hands the buttons back.
+ * After `timeoutMs` the card goes "uncertain" (buttons stay disabled) and
+ * re-reads the gate every `refetchMs`, so a settle seen from the relay also
+ * settles the card. Only the original request's own outcome ends the wait:
+ * success → "sent", failure → "failed" (which makes the card actionable).
+ *
+ * @param {Promise<unknown>} request the real submit, not a raced copy
+ * @param {{
+ *   onPhase: (update: { phase: "sending" | "uncertain" | "sent" | "failed",
+ *                       errorMessage?: string }) => void,
+ *   refetch?: () => void,
+ *   timeoutMs?: number,
+ *   refetchMs?: number,
+ * }} options
  */
-export function withApprovalTimeout(
-  promise,
-  ms = APPROVAL_DECISION_TIMEOUT_MS,
+export function trackApprovalDecision(
+  request,
+  {
+    onPhase,
+    refetch,
+    timeoutMs = APPROVAL_DECISION_TIMEOUT_MS,
+    refetchMs = APPROVAL_UNCERTAIN_REFETCH_MS,
+  },
 ) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(APPROVAL_TIMEOUT_MESSAGE)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  let done = false;
+  let poll = null;
+  const stopPolling = () => {
+    if (poll !== null) clearInterval(poll);
+    poll = null;
+  };
+  onPhase({ phase: "sending" });
+  const deadline = setTimeout(() => {
+    if (done) return;
+    onPhase({ phase: "uncertain" });
+    refetch?.();
+    poll = setInterval(() => {
+      if (!done) refetch?.();
+    }, refetchMs);
+  }, timeoutMs);
+  const finish = (update) => {
+    if (done) return;
+    done = true;
+    clearTimeout(deadline);
+    stopPolling();
+    onPhase(update);
+  };
+  const settled = Promise.resolve(request).then(
+    () => finish({ phase: "sent" }),
+    (error) =>
+      finish({
+        phase: "failed",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }),
+  );
+  return {
+    settled,
+    /** Stop re-reading the gate (it is already settled) but keep listening. */
+    stopPolling,
+    /** The card went away: stop timers and ignore the late answer. */
+    dispose() {
+      done = true;
+      clearTimeout(deadline);
+      stopPolling();
+    },
+  };
 }
 
 /**
@@ -60,7 +114,7 @@ export function withApprovalTimeout(
  *               approvalRef: string, candidateRef: string | null },
  *   myPubkey?: string | null,
  *   nowMs: number,
- *   phase?: "idle" | "sending" | "sent" | "failed",
+ *   phase?: "idle" | "sending" | "uncertain" | "sent" | "failed",
  *   action?: "grant" | "deny",
  *   errorMessage?: string | null,
  * }} input
@@ -100,6 +154,16 @@ export function approvalCardView({
       mode: "sending",
       buttonsDisabled: true,
       statusText: action === "deny" ? "Denying…" : "Approving…",
+      error: null,
+      decision,
+    };
+  }
+  if (phase === "uncertain") {
+    // The submit is overdue but may still land: never re-enable here.
+    return {
+      mode: "uncertain",
+      buttonsDisabled: true,
+      statusText: APPROVAL_STILL_WAITING_TEXT,
       error: null,
       decision,
     };
