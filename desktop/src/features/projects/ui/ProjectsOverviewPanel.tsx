@@ -5,6 +5,7 @@ import type {
   Project,
   ProjectActivitySummary,
 } from "@/features/projects/hooks";
+import { projectsOverviewTotals } from "@/features/projects/lib/projectsOverviewTotals";
 
 export type ProjectsOverviewSection =
   | "projects"
@@ -17,24 +18,9 @@ type ProjectsOverviewPanelProps = {
   metadata: React.ReactNode;
   onSelectSection: (section: ProjectsOverviewSection) => void;
   projects: Project[];
-  summaries?: Record<string, ProjectActivitySummary>;
+  /** Activity keyed by repository address, not by project. */
+  repositorySummaries?: Record<string, ProjectActivitySummary>;
 };
-
-function overviewStats(
-  projects: Project[],
-  summaries: Record<string, ProjectActivitySummary> | undefined,
-) {
-  return projects.reduce(
-    (stats, project) => {
-      const summary = summaries?.[project.id];
-      return {
-        issues: stats.issues + (summary?.issueCount ?? 0),
-        prs: stats.prs + (summary?.prCount ?? 0),
-      };
-    },
-    { issues: 0, prs: 0 },
-  );
-}
 
 function StatPill({
   count,
@@ -72,9 +58,9 @@ export function ProjectsOverviewPanel({
   metadata,
   onSelectSection,
   projects,
-  summaries,
+  repositorySummaries,
 }: ProjectsOverviewPanelProps) {
-  const stats = overviewStats(projects, summaries);
+  const totals = projectsOverviewTotals(projects, repositorySummaries);
 
   // The feed owns the full left column; the stat counters live at the top
   // of the side rail as compact cards, above People and Contribution
@@ -92,28 +78,25 @@ export function ProjectsOverviewPanel({
         <div className="order-2 flex min-w-0 flex-col gap-3 px-4 pb-4 pt-2 xl:order-none xl:col-start-2 xl:row-start-1">
           <div className="grid grid-cols-2 gap-2">
             <StatPill
-              count={projects.length}
+              count={totals.projects}
               icon={Folders}
               label="Projects"
               onClick={() => onSelectSection("projects")}
             />
             <StatPill
-              count={projects.reduce(
-                (count, project) => count + project.repositories.length,
-                0,
-              )}
+              count={totals.repositories}
               icon={FolderGit2}
               label="Repositories"
               onClick={() => onSelectSection("repositories")}
             />
             <StatPill
-              count={stats.prs}
+              count={totals.prs}
               icon={GitPullRequest}
               label="Pull requests"
               onClick={() => onSelectSection("prs")}
             />
             <StatPill
-              count={stats.issues}
+              count={totals.issues}
               icon={CircleDot}
               label="Issues"
               onClick={() => onSelectSection("issues")}

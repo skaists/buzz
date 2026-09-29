@@ -152,8 +152,10 @@ export function ProjectsView() {
       ? []
       : projects,
   );
+  // The overview tiles total by repository too, so a repository listed in
+  // two projects is counted once.
   const repositoryActivitySummariesQuery = useRepositoryActivitySummariesQuery(
-    filter === "repositories" ? projects : [],
+    filter === "repositories" || filter === "all" ? projects : [],
   );
   const [repositoryScope, setRepositoryScope] =
     React.useState<ProjectsRepositoryScope>(() => {
@@ -868,7 +870,7 @@ export function ProjectsView() {
                     handleFilterChange(section);
                   }}
                   projects={projects}
-                  summaries={activitySummariesQuery.data}
+                  repositorySummaries={repositoryActivitySummariesQuery.data}
                 >
                   <section className="space-y-3">{activityFeed}</section>
                 </ProjectsOverviewPanel>
