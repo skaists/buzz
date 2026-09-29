@@ -25,6 +25,9 @@ const TIMEOUT = 20_000;
 const REFETCH = 3_000;
 const UNREACHABLE = "relay unreachable: request timed out";
 const REFUSED = "relay rejected event: forbidden: candidate mismatch";
+// The relay's HTTP 400 for a rejected event, as relay_error_message renders it.
+const HTTP_REFUSED =
+  "relay returned 400 Bad Request: forbidden: candidate mismatch — this approval is bound to a different candidate";
 
 // Drain pending promise callbacks (setImmediate is not mocked).
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -566,6 +569,45 @@ test("audit 3: a record kept for one community never locks a colliding gate in a
   await flush();
 });
 
+test("audit 3: the relay's HTTP 400 refusal re-enables both buttons at once", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const unresolved = new Set();
+  const h = card({ locks, unresolved });
+  h.controller.submit("grant");
+  h.sends[0].reject(new Error(HTTP_REFUSED));
+  await flush();
+  assert.equal(
+    h.state.phase,
+    "failed",
+    "no verify loop for a definitive refusal",
+  );
+  assert.equal(h.state.lockedAction, null);
+  assert.equal(h.verifies.length, 0);
+  assert.equal(locks.size, 0);
+  assert.equal(unresolved.size, 0);
+  assert.deepEqual(h.view().disabledActions, { grant: false, deny: false });
+  assert.equal(h.controller.submit("deny"), 2);
+  h.controller.dispose();
+});
+
+test("audit 3: a gate the card shows settled or expired resolves its record", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const unresolved = new Set();
+  const h = card({ locks, unresolved });
+  h.controller.submit("grant");
+  h.sends[0].reject(new Error(UNREACHABLE)); // ambiguous end
+  await flush();
+  assert.equal(unresolved.size, 1);
+  // The gate expires locally; the relay keeps listing it as pending.
+  h.controller.stopPolling();
+  assert.equal(unresolved.size, 0);
+  h.controller.dispose();
+  decision.resetUncertainDecisionLocks(locks, unresolved);
+  assert.equal(locks.size, 0, "teardown can discard it");
+});
+
 test("a hung verified read is retired and retried", async (t) => {
   enableTimers(t);
   const h = card();
@@ -692,9 +734,19 @@ test("identity key: both buttons stay disabled until the controller for the curr
   assert.equal(decision.gateViewForKey(live, currentKey, currentKey), live);
 });
 
-test("only the relay's own accepted=false reply counts as a definitive refusal", () => {
+test("only the relay's own refusals count as definitive", () => {
   assert.equal(decision.isDefinitiveRelayRefusal(REFUSED), true);
   for (const message of [
+    // What relay_error_message yields for POST /events refusals.
+    HTTP_REFUSED,
+    "relay returned 401 Unauthorized: auth: invalid NIP-98 header",
+    "relay returned 403 Forbidden: forbidden: not a member",
+  ])
+    assert.equal(decision.isDefinitiveRelayRefusal(message), true, message);
+  for (const message of [
+    "relay returned 500 Internal Server Error: internal server error",
+    "relay returned 502 Bad Gateway",
+    "relay returned 4000 odd",
     UNREACHABLE,
     "relay unreachable: network error",
     "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay",

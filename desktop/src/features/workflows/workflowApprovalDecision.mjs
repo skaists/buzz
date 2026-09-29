@@ -43,14 +43,22 @@ export function settledStatusFromRelayError(message) {
 
 /**
  * A relay answer that proves this signed decision was refused and can never be
- * accepted later ("relay rejected event: …" is the relay's own accepted=false
- * reply). Transport errors, gateway errors and the Rust-side abandon are not
- * definitive: the decision may or may not have reached the relay.
+ * accepted later:
+ * - "relay rejected event: …", the relay's own accepted=false reply;
+ * - "relay returned 400/401/403 …", the relay's HTTP refusal of the event
+ *   (`POST /events` answers 400 for a rejected event, such as a candidate
+ *   mismatch, and 401/403 when authentication fails). Nothing was stored.
+ * Transport errors, gateway and server errors (a 500 can follow a stored
+ * update), and the Rust-side abandon are not definitive: the decision may or
+ * may not have reached the relay.
  * @param {string | null | undefined} message
  */
 export function isDefinitiveRelayRefusal(message) {
   const m = `${message ?? ""}`.toLowerCase();
-  return m.startsWith("relay rejected event:");
+  return (
+    m.startsWith("relay rejected event:") ||
+    /^relay returned (400|401|403)\b/.test(m)
+  );
 }
 
 /**
@@ -406,8 +414,14 @@ export function createApprovalDecisionController({
     submit,
     canSubmit,
     getState: view,
-    /** The card already shows a settled gate: stop re-reading the relay. */
+    /**
+     * The card already shows a settled gate (from the relay's record, or
+     * expired locally, after which the relay refuses any decision): stop
+     * re-reading the relay. Nothing more can be signed for this gate, so its
+     * record is resolved and a later community teardown may discard it.
+     */
     stopPolling() {
+      if (lockKey) unresolved.delete(lockKey);
       pollStopped = true;
       if (poll !== null) clearInterval(poll);
       poll = null;
