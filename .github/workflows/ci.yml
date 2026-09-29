@@ -722,6 +722,20 @@ jobs:
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+      - name: Workflow enabled-flag trigger gate tests
+        # A definition saved with `enabled: false` must refuse the manual
+        # trigger (kind:46020) and its webhook, across updates, and an
+        # owner-removal revocation must survive an `enabled: true` re-save.
+        # Drives the real save/trigger/webhook paths against real Postgres.
+        # #[ignore]d in the default suite, selected explicitly here — see
+        # handlers::command_executor::tests.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and test(/handlers::command_executor::tests/)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: NIP-ER reminder e2e
         # Feature e2e for NIP-ER (Event Reminders, kind:30300): write-path
         # validation, author-only read filtering, and scheduler delivery against

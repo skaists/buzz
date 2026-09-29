@@ -880,6 +880,16 @@ async fn handle_workflow_trigger(
     }
     let def: buzz_workflow::WorkflowDef = serde_json::from_value(workflow.definition.clone())
         .map_err(|e| IngestError::Internal(format!("error: corrupt workflow definition: {e}")))?;
+    // The column above is the revocation switch (owner removal clears it);
+    // `upsert_workflow` writes TRUE on create and never touches it on update.
+    // The definition's own `enabled: false` is the author's switch, so it must
+    // stop a manual trigger too — the automatic event and cron paths already
+    // honor it.
+    if !def.enabled {
+        return Err(IngestError::Rejected(
+            "forbidden: workflow is disabled or inactive".into(),
+        ));
+    }
     let Some(wf_channel_id) = workflow.channel_id else {
         // No channel scope means no channel authority to verify — fail closed.
         return Err(IngestError::Rejected(
@@ -1384,4 +1394,329 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    // B8: a workflow whose definition says `enabled: false` must not run from
+    // a manual trigger (kind:46020) or its webhook. Before the fix both gates
+    // read only the `workflows.enabled` column, which `upsert_workflow` writes
+    // TRUE on create and never updates, so the definition's flag was ignored.
+    //
+    // These drive the real save path (kind:30620 through `handle_command`), the
+    // real manual trigger, and the real webhook handler against Postgres, so
+    // the wiring is pinned, not a predicate. Selected explicitly in CI's
+    // Backend Integration job; they hard-fail when Postgres is unreachable.
+    use super::*;
+    use axum::extract::{Path, Query, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use buzz_auth::Scope;
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    use crate::handlers::ingest::HttpAuthMethod;
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+    const DISABLED: &str = "forbidden: workflow is disabled or inactive";
+
+    /// Real `AppState` + tenant for a fresh community on `host`. Mirrors
+    /// `handlers::relay_admin::tests::workspace_profile_test_state`.
+    async fn trigger_gate_state(host: &str) -> (Arc<AppState>, TenantContext) {
+        let mut config = crate::config::Config::from_env().expect("config from env");
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_string());
+        config.database_url = database_url.clone();
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.relay_url = format!("wss://{host}");
+
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("requires reachable Postgres");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let record = db
+            .ensure_configured_community(host)
+            .await
+            .expect("ensure community");
+        let tenant = TenantContext::resolved(record.id, host);
+
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool config");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            Keys::generate(),
+            media_storage,
+        );
+        (Arc::new(state), tenant)
+    }
+
+    /// One owner, one channel they created (so they hold the `owner` role),
+    /// and one workflow id that every save in a test re-uses.
+    struct Fixture {
+        state: Arc<AppState>,
+        tenant: TenantContext,
+        host: String,
+        owner: Keys,
+        channel_id: Uuid,
+        workflow_id: Uuid,
+        clock: u64,
+    }
+
+    impl Fixture {
+        async fn new(label: &str) -> Self {
+            let host = format!("b8-{label}-{}.example", Uuid::new_v4().simple());
+            let (state, tenant) = trigger_gate_state(&host).await;
+            let owner = Keys::generate();
+            let owner_pk = owner.public_key().to_bytes().to_vec();
+            state
+                .db
+                .ensure_user(tenant.community(), &owner_pk)
+                .await
+                .expect("owner user");
+            let channel_id = Uuid::new_v4();
+            state
+                .db
+                .create_channel_with_id(
+                    tenant.community(),
+                    channel_id,
+                    &format!("b8-{}", channel_id.simple()),
+                    buzz_db::channel::ChannelType::Stream,
+                    buzz_db::channel::ChannelVisibility::Open,
+                    None,
+                    &owner_pk,
+                    None,
+                )
+                .await
+                .expect("channel");
+            Self {
+                state,
+                tenant,
+                host,
+                owner,
+                channel_id,
+                workflow_id: Uuid::new_v4(),
+                clock: Timestamp::now().as_secs(),
+            }
+        }
+
+        /// Strictly increasing timestamps, so a re-save is never dominated
+        /// by the previous save of the same NIP-33 coordinate.
+        fn tick(&mut self) -> Timestamp {
+            self.clock += 1;
+            Timestamp::from_secs(self.clock)
+        }
+
+        fn auth(&self) -> IngestAuth {
+            IngestAuth::Http {
+                pubkey: self.owner.public_key(),
+                scopes: Scope::all_known(),
+                auth_method: HttpAuthMethod::Nip98,
+            }
+        }
+
+        /// Save the workflow through the real kind:30620 path. The definition
+        /// has a webhook trigger, so one workflow exercises both gates.
+        async fn save(&mut self, enabled: bool) {
+            let yaml = format!(
+                "name: b8 gate\nenabled: {enabled}\ntrigger:\n  on: webhook\nsteps:\n  - id: say\n    action: send_message\n    text: b8\n"
+            );
+            let event = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_DEF as u16), yaml)
+                .tags(vec![
+                    Tag::parse(["h", &self.channel_id.to_string()]).expect("h tag"),
+                    Tag::parse(["d", &self.workflow_id.to_string()]).expect("d tag"),
+                ])
+                .custom_created_at(self.tick())
+                .sign_with_keys(&self.owner)
+                .expect("sign 30620");
+            let saved = handle_command(&self.tenant, &self.state, event, self.auth())
+                .await
+                .expect("the owner's save must be accepted");
+            assert!(
+                saved.message.starts_with("response:"),
+                "the save must execute, not dedupe: {}",
+                saved.message
+            );
+            let stored = self.workflow().await;
+            let stored_def: buzz_workflow::WorkflowDef =
+                serde_json::from_value(stored.definition).expect("stored definition");
+            assert_eq!(
+                stored_def.enabled, enabled,
+                "the stored definition must carry the saved flag"
+            );
+        }
+
+        async fn workflow(&self) -> buzz_db::workflow::WorkflowRecord {
+            self.state
+                .db
+                .get_workflow(self.tenant.community(), self.workflow_id)
+                .await
+                .expect("workflow row")
+        }
+
+        /// Fire the real manual trigger (kind:46020) as the owner.
+        async fn trigger(&mut self) -> Result<IngestResult, IngestError> {
+            let event = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER as u16), "")
+                .tags(vec![
+                    Tag::parse(["d", &self.workflow_id.to_string()]).expect("d tag")
+                ])
+                .custom_created_at(self.tick())
+                .sign_with_keys(&self.owner)
+                .expect("sign 46020");
+            handle_command(&self.tenant, &self.state, event, self.auth()).await
+        }
+
+        /// POST the workflow's webhook with its real secret and Host binding.
+        async fn webhook(&self) -> StatusCode {
+            let secret = webhook_secret::extract_secret(&self.workflow().await.definition)
+                .expect("a webhook workflow carries a secret");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::HOST,
+                HeaderValue::from_str(&self.host).expect("host header"),
+            );
+            headers.insert(
+                "x-webhook-secret",
+                HeaderValue::from_str(&secret).expect("secret header"),
+            );
+            match crate::api::bridge::workflow_webhook(
+                State(Arc::clone(&self.state)),
+                Path(self.workflow_id.to_string()),
+                Query(crate::api::bridge::WebhookQuery { secret: None }),
+                headers,
+                axum::body::Bytes::new(),
+            )
+            .await
+            {
+                Ok((status, _)) | Err((status, _)) => status,
+            }
+        }
+
+        async fn runs(&self) -> usize {
+            self.state
+                .db
+                .list_workflow_runs(self.tenant.community(), self.workflow_id, 100)
+                .await
+                .expect("list runs")
+                .len()
+        }
+    }
+
+    fn refusal(result: Result<IngestResult, IngestError>) -> String {
+        match result {
+            Err(IngestError::Rejected(message)) => message,
+            Err(other) => panic!("expected a rejection, got {other:?}"),
+            Ok(accepted) => panic!("expected a rejection, got accepted: {}", accepted.message),
+        }
+    }
+
+    /// Created with `enabled: false`: the manual trigger is refused and no run
+    /// is created, while the column still reads TRUE, so the refusal can only
+    /// come from the definition.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manual_trigger_refuses_a_workflow_created_disabled() {
+        let mut f = Fixture::new("created-disabled").await;
+        f.save(false).await;
+        assert!(
+            f.workflow().await.enabled,
+            "create writes the column TRUE whatever the YAML says"
+        );
+
+        assert_eq!(refusal(f.trigger().await), DISABLED);
+        assert_eq!(f.runs().await, 0, "a refused trigger must not create a run");
+    }
+
+    /// Control plus the update path: enabled runs; re-saved disabled is
+    /// refused; re-saved enabled runs again. The column never changes, since
+    /// `upsert_workflow` does not touch it on update.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manual_trigger_follows_the_definition_across_updates() {
+        let mut f = Fixture::new("updates").await;
+        f.save(true).await;
+        let accepted = f.trigger().await.expect("an enabled workflow must run");
+        assert!(accepted.accepted);
+        assert_eq!(f.runs().await, 1);
+
+        f.save(false).await;
+        assert!(f.workflow().await.enabled, "update leaves the column TRUE");
+        assert_eq!(refusal(f.trigger().await), DISABLED);
+        assert_eq!(f.runs().await, 1, "a refused trigger must not create a run");
+
+        f.save(true).await;
+        f.trigger()
+            .await
+            .expect("re-enabled workflow must run again");
+        assert_eq!(f.runs().await, 2);
+    }
+
+    /// The webhook gate (`api::bridge::workflow_webhook`) honors the same flag
+    /// and keeps its generic 404 for a disabled workflow.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_follows_the_definition_enabled_flag() {
+        let mut f = Fixture::new("webhook").await;
+        f.save(false).await;
+        assert_eq!(f.webhook().await, StatusCode::NOT_FOUND);
+        assert_eq!(f.runs().await, 0, "a refused webhook must not create a run");
+
+        f.save(true).await;
+        assert_eq!(f.webhook().await, StatusCode::ACCEPTED);
+        assert_eq!(f.runs().await, 1);
+
+        f.save(false).await;
+        assert_eq!(f.webhook().await, StatusCode::NOT_FOUND);
+        assert_eq!(f.runs().await, 1, "a refused webhook must not create a run");
+    }
+
+    /// Owner-removal arm: the column write the removal path makes
+    /// (`disable_workflows_for_owner_in_channel`, called from
+    /// `side_effects::disable_departed_member_workflows`) keeps both gates
+    /// shut even after the definition is re-saved with `enabled: true`.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_removal_revocation_survives_an_enabled_resave() {
+        let mut f = Fixture::new("revoked").await;
+        f.save(true).await;
+        f.trigger().await.expect("an enabled workflow must run");
+        assert_eq!(f.runs().await, 1);
+
+        let owner_pk = f.owner.public_key().to_bytes().to_vec();
+        let disabled = f
+            .state
+            .db
+            .disable_workflows_for_owner_in_channel(f.tenant.community(), f.channel_id, &owner_pk)
+            .await
+            .expect("owner-removal disable");
+        assert_eq!(disabled, 1, "the removal write must hit this workflow");
+
+        f.save(true).await;
+        assert!(
+            !f.workflow().await.enabled,
+            "a re-save must not switch a revoked workflow back on"
+        );
+        assert_eq!(refusal(f.trigger().await), DISABLED);
+        assert_eq!(f.webhook().await, StatusCode::NOT_FOUND);
+        assert_eq!(f.runs().await, 1, "a refused trigger must not create a run");
+    }
 }
