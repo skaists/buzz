@@ -20,6 +20,7 @@ import {
   useUnarchiveChannelMutation,
   useUpdateChannelMutation,
 } from "@/features/channels/hooks";
+import { canEditChannelSettings } from "@/features/channels/lib/channelSettingsAccess";
 import { compareMembersByRole } from "@/features/channels/lib/memberUtils";
 import {
   DEFAULT_EPHEMERAL_TTL_SECONDS,
@@ -131,6 +132,7 @@ export function ChannelManagementSheet({
   const { canDeleteChannel, canManageChannel } =
     useChannelModerationCapabilities(membersQuery.data, currentPubkey, open);
   const canEditChannel = canManageChannel && detail?.channelType !== "dm";
+  const canEditSettings = canEditChannelSettings(detail, canManageChannel);
   const canEditNarrative =
     canManageChannel && selfMember !== null && detail?.channelType !== "dm";
   const isArchived =
@@ -363,7 +365,7 @@ export function ChannelManagementSheet({
             memberCount={memberCount}
             members={members}
             membersError={membersQuery.error}
-            onOpenEdit={openEditDialog}
+            onOpenEdit={canEditSettings ? openEditDialog : undefined}
             onOpenMembers={onOpenMembers ? openMembersDialog : undefined}
             onOpenChange={handlePanelOpenChange}
             resolvedChannel={resolvedChannel}
@@ -411,7 +413,7 @@ export function ChannelManagementSheet({
               memberCount={memberCount}
               members={members}
               membersError={membersQuery.error}
-              onOpenEdit={openEditDialog}
+              onOpenEdit={canEditSettings ? openEditDialog : undefined}
               onOpenMembers={onOpenMembers ? openMembersDialog : undefined}
               onOpenChange={handlePanelOpenChange}
               resolvedChannel={resolvedChannel}
@@ -422,7 +424,7 @@ export function ChannelManagementSheet({
         </DialogPrimitive.Portal>
       )}
 
-      {canEditChannel ? (
+      {canEditSettings ? (
         <Dialog
           onOpenChange={handleEditDialogOpenChange}
           open={isEditDialogOpen}
@@ -594,7 +596,7 @@ type ChannelManagementPanelContentProps = {
   memberCount: number;
   members: ChannelMember[];
   membersError: unknown;
-  onOpenEdit: () => void;
+  onOpenEdit?: () => void;
   onOpenMembers?: () => void;
   onOpenChange: (open: boolean) => void;
   resolvedChannel: Channel;
@@ -685,10 +687,7 @@ function ChannelManagementPanelContent({
       >
         {activeView === "summary" ? (
           <div className="space-y-6 pt-3">
-            <ChannelHero
-              channel={resolvedChannel}
-              onEdit={canEditChannel ? onOpenEdit : undefined}
-            />
+            <ChannelHero channel={resolvedChannel} onEdit={onOpenEdit} />
 
             {detailsError instanceof Error ? (
               <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -708,7 +707,7 @@ function ChannelManagementPanelContent({
                   <EditableInfoFieldRow
                     editTestId="channel-management-edit-channel-type"
                     label="Channel type"
-                    onEdit={canEditChannel ? onOpenEdit : undefined}
+                    onEdit={onOpenEdit}
                     testId="channel-management-type"
                     value={
                       resolvedChannel.ttlSeconds === null
@@ -719,7 +718,7 @@ function ChannelManagementPanelContent({
                   <EditableInfoFieldRow
                     editTestId="channel-management-edit-visibility"
                     label="Visibility"
-                    onEdit={canEditChannel ? onOpenEdit : undefined}
+                    onEdit={onOpenEdit}
                     testId="channel-management-visibility"
                     value={
                       resolvedChannel.visibility === "private"
