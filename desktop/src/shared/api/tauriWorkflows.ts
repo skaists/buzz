@@ -273,10 +273,12 @@ export async function triggerWorkflow(
 export async function grantApproval(
   token: string,
   note?: string,
+  candidate?: string,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("grant_approval", {
     token,
     note: note ?? null,
+    candidate: candidate ?? null,
   });
   return fromRawApprovalResponse(raw);
 }
@@ -284,10 +286,12 @@ export async function grantApproval(
 export async function denyApproval(
   token: string,
   note?: string,
+  candidate?: string,
 ): Promise<ApprovalActionResponse> {
   const raw = await invokeTauri<RawApprovalActionResponse>("deny_approval", {
     token,
     note: note ?? null,
+    candidate: candidate ?? null,
   });
   return fromRawApprovalResponse(raw);
 }

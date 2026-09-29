@@ -161,6 +161,9 @@ export function WorkflowRunTrace({
         );
         const stepApproval =
           approvals.find((a) => a.stepId === step.stepId) ?? null;
+        // Keep the card mounted (same key) once a gate settles, so the
+        // decider's focus and the settled state survive the refetch.
+        const cardApproval = pendingApproval ?? stepApproval;
         const gate = describeReviewGate(step, stepApproval);
 
         return (
@@ -201,12 +204,15 @@ export function WorkflowRunTrace({
                 </pre>
               </div>
             ) : null}
-            {pendingApproval ? (
+            {cardApproval ? (
               <div className="mt-3">
                 <p className="mb-2 text-2xs font-medium uppercase tracking-[0.16em] text-amber-600">
-                  Pending approval
+                  {pendingApproval ? "Pending approval" : "Approval"}
                 </p>
-                <WorkflowApprovalCard approval={pendingApproval} />
+                <WorkflowApprovalCard
+                  key={cardApproval.approvalRef}
+                  approval={cardApproval}
+                />
               </div>
             ) : null}
           </div>
