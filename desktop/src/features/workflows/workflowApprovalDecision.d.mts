@@ -12,7 +12,10 @@ export type ApprovalCardView = {
 export function settledStatusFromRelayError(
   message: string | null | undefined,
 ): "granted" | "denied" | "expired" | "settled" | null;
-export function withApprovalTimeout<T>(promise: Promise<T>, ms?: number): Promise<T>;
+export function withApprovalTimeout<T>(
+  promise: Promise<T>,
+  ms?: number,
+): Promise<T>;
 export function approvalCardView(input: {
   approval: {
     status: string;

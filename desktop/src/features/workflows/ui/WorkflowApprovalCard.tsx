@@ -25,7 +25,7 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   // Synchronous guard: a second click in the same frame, before React has
   // re-rendered the disabled buttons, must not send a second decision.
   const inFlight = React.useRef(false);
-  const statusRef = React.useRef<HTMLDivElement>(null);
+  const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
   const view = approvalCardView({
@@ -100,25 +100,24 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       <p className="mb-2 text-xs text-muted-foreground">
         Expires: {new Date(approval.expiresAt).toLocaleString()}
       </p>
-      <div
+      <output
         ref={statusRef}
         tabIndex={-1}
-        role="status"
         aria-live="polite"
-        className="mb-2 rounded text-xs font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+        className="mb-2 block rounded text-xs font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
         data-testid="workflow-approval-status"
       >
         {view.statusText}
         {view.error ? (
-          <p
-            className="mt-1 font-normal text-destructive"
+          <span
+            className="mt-1 block font-normal text-destructive"
             role="alert"
             data-testid="workflow-approval-error"
           >
             {view.error}
-          </p>
+          </span>
         ) : null}
-      </div>
+      </output>
       {showButtons ? (
         // Plain buttons, no <form>: Enter never submits a decision by default,
         // and nothing is auto-focused.

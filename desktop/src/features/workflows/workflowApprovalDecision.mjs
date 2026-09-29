@@ -28,7 +28,8 @@ const SETTLED_LABELS = {
  */
 export function settledStatusFromRelayError(message) {
   const m = `${message ?? ""}`.toLowerCase();
-  if (/approval token has expired|approval already expired/.test(m)) return "expired";
+  if (/approval token has expired|approval already expired/.test(m))
+    return "expired";
   if (/approval already granted/.test(m)) return "granted";
   if (/approval already denied/.test(m)) return "denied";
   if (/approval already acted on/.test(m)) return "settled";
@@ -42,7 +43,10 @@ export function settledStatusFromRelayError(message) {
  * @param {number} [ms]
  * @returns {Promise<T>}
  */
-export function withApprovalTimeout(promise, ms = APPROVAL_DECISION_TIMEOUT_MS) {
+export function withApprovalTimeout(
+  promise,
+  ms = APPROVAL_DECISION_TIMEOUT_MS,
+) {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(APPROVAL_TIMEOUT_MESSAGE)), ms);
@@ -61,21 +65,34 @@ export function withApprovalTimeout(promise, ms = APPROVAL_DECISION_TIMEOUT_MS) 
  *   errorMessage?: string | null,
  * }} input
  */
-export function approvalCardView({ approval, myPubkey, nowMs, phase = "idle", action, errorMessage }) {
+export function approvalCardView({
+  approval,
+  myPubkey,
+  nowMs,
+  phase = "idle",
+  action,
+  errorMessage,
+}) {
   const decision = HEX64.test(approval.approvalRef ?? "")
-    ? { token: approval.approvalRef.toLowerCase(), candidate: approval.candidateRef?.trim() || undefined }
+    ? {
+        token: approval.approvalRef.toLowerCase(),
+        candidate: approval.candidateRef?.trim() || undefined,
+      }
     : undefined;
   const settled = (status, detail) => ({
     mode: "settled",
     buttonsDisabled: true,
-    statusText: detail ? `${SETTLED_LABELS[status] ?? "Settled"} · ${detail}` : SETTLED_LABELS[status] ?? "Settled",
+    statusText: detail
+      ? `${SETTLED_LABELS[status] ?? "Settled"} · ${detail}`
+      : (SETTLED_LABELS[status] ?? "Settled"),
     settledStatus: status,
     error: null,
     decision,
   });
 
   // 1. The record itself says the gate is closed (someone already settled it).
-  if (approval.status in SETTLED_LABELS && approval.status !== "pending") return settled(approval.status);
+  if (approval.status in SETTLED_LABELS && approval.status !== "pending")
+    return settled(approval.status);
 
   // 2. This card's own decision.
   if (phase === "sending") {
@@ -87,7 +104,11 @@ export function approvalCardView({ approval, myPubkey, nowMs, phase = "idle", ac
       decision,
     };
   }
-  if (phase === "sent") return settled(action === "deny" ? "denied" : "granted", "sent, waiting for the run");
+  if (phase === "sent")
+    return settled(
+      action === "deny" ? "denied" : "granted",
+      "sent, waiting for the run",
+    );
   if (phase === "failed") {
     const closed = settledStatusFromRelayError(errorMessage);
     if (closed) return settled(closed, "already settled elsewhere");
@@ -95,9 +116,18 @@ export function approvalCardView({ approval, myPubkey, nowMs, phase = "idle", ac
 
   // 3. Open gate.
   if (new Date(approval.expiresAt).getTime() < nowMs) return settled("expired");
-  const error = phase === "failed" ? errorMessage || "The relay refused this decision." : null;
+  const error =
+    phase === "failed"
+      ? errorMessage || "The relay refused this decision."
+      : null;
   if (!decision) {
-    return { mode: "unavailable", buttonsDisabled: true, statusText: "This approval cannot be decided from Desktop.", error, decision };
+    return {
+      mode: "unavailable",
+      buttonsDisabled: true,
+      statusText: "This approval cannot be decided from Desktop.",
+      error,
+      decision,
+    };
   }
   const spec = (approval.approverSpec ?? "").trim().toLowerCase();
   const me = (myPubkey ?? "").trim().toLowerCase();
@@ -105,7 +135,19 @@ export function approvalCardView({ approval, myPubkey, nowMs, phase = "idle", ac
   // live buttons. Any other spec form is left to the relay, which enforces it.
   const isApprover = HEX64.test(spec) ? spec === me : me.length > 0;
   if (!isApprover) {
-    return { mode: "waiting", buttonsDisabled: true, statusText: "Waiting on the designated approver.", error, decision };
+    return {
+      mode: "waiting",
+      buttonsDisabled: true,
+      statusText: "Waiting on the designated approver.",
+      error,
+      decision,
+    };
   }
-  return { mode: "actions", buttonsDisabled: false, statusText: "Your decision is needed.", error, decision };
+  return {
+    mode: "actions",
+    buttonsDisabled: false,
+    statusText: "Your decision is needed.",
+    error,
+    decision,
+  };
 }
