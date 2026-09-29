@@ -1,0 +1,146 @@
+# Build CI's MinIO images from pinned upstream source.
+#
+#   upstream release tag → verified commit → reproducible build → ghcr digest → compose pin
+#
+# Upstream no longer serves the prebuilt digests docker-compose.yml pins
+# (quay.io, Docker Hub and mirror.gcr.io all refuse them; see PR #9), so no
+# mirror can preserve them. For each entry in .github/ci-images.json this
+# workflow:
+#   1. checks that the release tag still points at the pinned commit;
+#   2. builds ci/images/minio-from-source.Dockerfile for amd64 and arm64
+#      (toolchain, runtime base and BuildKit pinned by digest; modules by go.sum;
+#      timestamps pinned to the release tag via SOURCE_DATE_EPOCH) and pushes
+#      it to ghcr, then rebuilds with no cache and requires the same digest;
+#   3. verifies that the manifest served for the pushed digest hashes to it;
+#   4. runs ci/images/smoke.sh against the pushed images: compose's server
+#      command, healthcheck and minio-init script, plus an object round trip;
+#   5. only then records provenance (tag, commit, Dockerfile hash, image
+#      digest, run URL) in the job summary and an artifact.
+#
+# CI switches to these images in a separate commit, after a green run.
+
+name: CI images
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/ci-images.json"
+      - ".github/workflows/ci-images.yml"
+      - "ci/images/**"
+
+permissions: {}
+
+concurrency:
+  group: ci-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, verify and smoke-test from source
+    # Same-repo only: fork PRs get no package write access.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Build, push, verify, smoke-test, record provenance
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILDKIT_IMAGE: moby/buildkit:buildx-stable-1@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+        run: |
+          set -euo pipefail
+          manifest=.github/ci-images.json
+          dockerfile=ci/images/minio-from-source.Dockerfile
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          docker buildx create --name ci-images --driver docker-container \
+            --driver-opt "image=${BUILDKIT_IMAGE}" --use >/dev/null
+          owner="${OWNER,,}"
+          dockerfile_sha="sha256:$(sha256sum "$dockerfile" | cut -d' ' -f1)"
+          declare -A refs records
+
+          for name in $(jq -r '.images[].name' "$manifest"); do
+            field() { jq -r --arg n "$name" --arg f "$1" '.images[] | select(.name == $n) | .[$f]' "$manifest"; }
+            repo="$(field repo)"; tag="$(field release_tag)"; commit="$(field commit)"
+            bin="$(field bin)"; platforms="$(field platforms)"
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::$name: commit must be a full SHA"; exit 1; }
+
+            tagged="$(git ls-remote "https://github.com/${repo}" "refs/tags/${tag}^{}" | cut -f1)"
+            if [ "$tagged" != "$commit" ]; then
+              echo "::error::$name: ${repo} tag ${tag} points at '${tagged}', manifest pins ${commit}"
+              exit 1
+            fi
+
+            image="ghcr.io/${owner}/buzz-ci-images/${name}"
+            # Reproducible output: every timestamp is pinned to the release
+            # tag's own time (RELEASE.2025-08-13T08-35-41Z -> 2025-08-13T08:35:41Z),
+            # and no provenance attestation (which embeds build times) is attached.
+            epoch="$(date -u -d "$(echo "${tag#RELEASE.}" | sed -E 's/T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/T\1:\2:\3Z/')" +%s)"
+            build() {
+              docker buildx build --no-cache --platform "$platforms" --provenance=false \
+                --build-arg "REPO=${repo}" --build-arg "COMMIT=${commit}" \
+                --build-arg "RELEASE_TAG=${tag}" --build-arg "BIN=${bin}" \
+                --build-arg "SOURCE_DATE_EPOCH=${epoch}" \
+                --output "type=registry,name=$1,rewrite-timestamp=true" \
+                --metadata-file "$2" -f "$dockerfile" ci/images
+            }
+            build "${image}:${tag}-src" "meta-${name}.json"
+            digest="$(jq -r '."containerimage.digest"' "meta-${name}.json")"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::$name: no digest from build"; exit 1; }
+
+            # Reproducibility check: an independent no-cache rebuild must
+            # produce the identical digest.
+            build "${image}:${tag}-repro-check" "meta-${name}-repro.json"
+            repro="$(jq -r '."containerimage.digest"' "meta-${name}-repro.json")"
+            if [ "$repro" != "$digest" ]; then
+              echo "::error::$name: not reproducible: rebuild gave ${repro}, first build ${digest}"
+              exit 1
+            fi
+
+            # Verify what the registry serves for that digest, independently of the build.
+            served="sha256:$(docker buildx imagetools inspect --raw "${image}@${digest}" | sha256sum | cut -d' ' -f1)"
+            if [ "$served" != "$digest" ]; then
+              echo "::error::$name: registry serves ${served} for ${digest}"
+              exit 1
+            fi
+
+            refs[$name]="${image}@${digest}"
+            records[$name]="$(jq -cn \
+              --arg name "$name" --arg source "https://github.com/${repo}" --arg release_tag "$tag" \
+              --arg commit "$commit" --arg dockerfile "$dockerfile" --arg dockerfile_sha256 "$dockerfile_sha" \
+              --arg platforms "$platforms" --arg image "${image}:${tag}-src@${digest}" \
+              --arg replaces "$(field replaces)" --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg run "$RUN_URL" \
+              --arg equivalence "Not byte-identical to 'replaces'. Rebuilt from the pinned upstream release commit with the recorded Dockerfile, base-image digests and go.sum; equivalent in source and release, not in bytes. Reproducible: an independent no-cache rebuild in this run produced the identical digest." \
+              --arg source_date_epoch "$epoch" \
+              '{name: $name, source: $source, release_tag: $release_tag, commit: $commit, dockerfile: $dockerfile, dockerfile_sha256: $dockerfile_sha256, platforms: $platforms, image: $image, replaces: $replaces, equivalence: $equivalence, source_date_epoch: $source_date_epoch, built_at: $built_at, run: $run}')"
+            echo "built and verified $name: ${refs[$name]}"
+          done
+
+          # Behaviour check against the pushed digests before recording anything.
+          ci/images/smoke.sh "${refs[minio]}" "${refs[mc]}"
+
+          : > provenance.jsonl
+          for name in "${!records[@]}"; do echo "${records[$name]}" >> provenance.jsonl; done
+          {
+            echo "### CI images built from source"
+            echo '```json'
+            cat provenance.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload provenance
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ci-images-provenance
+          path: provenance.jsonl
+          if-no-files-found: ignore
