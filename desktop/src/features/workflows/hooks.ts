@@ -261,10 +261,11 @@ export function useApprovalMutation() {
       token: string;
       action: "grant" | "deny";
       note?: string;
+      candidate?: string;
     }) =>
       input.action === "grant"
-        ? grantApproval(input.token, input.note)
-        : denyApproval(input.token, input.note),
+        ? grantApproval(input.token, input.note, input.candidate)
+        : denyApproval(input.token, input.note, input.candidate),
     onSuccess: (_data, _variables) => {
       void queryClient.invalidateQueries({
         predicate: (query) =>
