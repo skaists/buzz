@@ -35,6 +35,11 @@ export function isDefinitiveRelayRefusal(
   message: string | null | undefined,
 ): boolean;
 export const UNCERTAIN_DECISION_LOCKS: Map<string, ApprovalDecisionAction>;
+export function approvalLockKey(input: {
+  communityId?: string | null;
+  pubkey?: string | null;
+  approvalRef: string;
+}): string;
 export const IN_FLIGHT_DECISION_SUBMITS: Map<string, number>;
 export function resetUncertainDecisionLocks(
   locks?: Map<string, ApprovalDecisionAction>,

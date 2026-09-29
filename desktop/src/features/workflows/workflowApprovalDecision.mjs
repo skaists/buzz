@@ -54,13 +54,29 @@ export function isDefinitiveRelayRefusal(message) {
 }
 
 /**
- * Per-session record of signed decisions, keyed by identity + approval
- * reference. A decision is recorded the moment it is signed and dropped only
+ * Per-session record of signed decisions, keyed by community + identity +
+ * approval reference (`approvalLockKey`). A decision is recorded the moment it is signed and dropped only
  * when the relay definitively refuses it, so a card remount (even while the
  * original submit is still running) cannot be used to sign the opposite one.
  * @type {Map<string, "grant" | "deny">}
  */
 export const UNCERTAIN_DECISION_LOCKS = new Map();
+
+/**
+ * The record key for one gate: community + identity + approval reference.
+ * Approval references are scoped by community, and identical bytes in two
+ * communities are legal, so a record kept for community A (its native submit
+ * still running) must not lock a colliding gate in community B.
+ * @param {{ communityId?: string | null, pubkey?: string | null, approvalRef: string }} input
+ * @returns {string}
+ */
+export function approvalLockKey({ communityId, pubkey, approvalRef }) {
+  return JSON.stringify([
+    communityId ?? "",
+    `${pubkey ?? ""}`.toLowerCase(),
+    `${approvalRef ?? ""}`.toLowerCase(),
+  ]);
+}
 
 /**
  * Native submits still running, per identity + approval reference (a count).

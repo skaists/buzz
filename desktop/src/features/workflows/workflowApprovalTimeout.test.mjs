@@ -511,6 +511,38 @@ test("audit 3: a community round trip keeps the record while the native submit r
   assert.equal(locks.size, 0);
 });
 
+test("audit 3: a record kept for one community never locks a colliding gate in another", async (t) => {
+  enableTimers(t);
+  const locks = new Map();
+  const inFlight = new Map();
+  const key = (communityId) =>
+    decision.approvalLockKey({
+      communityId,
+      pubkey: ME,
+      approvalRef: approval.approvalRef,
+    });
+  assert.notEqual(key("community-a"), key("community-b"));
+  // Community A signs Approve; the switch to B keeps A's in-flight record.
+  const a = card({ locks, inFlight, lockKey: key("community-a") });
+  a.controller.submit("grant");
+  a.controller.dispose();
+  decision.resetUncertainDecisionLocks(locks, inFlight);
+  assert.equal(locks.get(key("community-a")), "grant");
+  // Same identity, identical approval reference bytes in B: B's own gate.
+  const b = card({ locks, inFlight, lockKey: key("community-b") });
+  assert.equal(b.state.phase, "idle");
+  assert.equal(b.state.lockedAction, null);
+  assert.deepEqual(b.view().disabledActions, { grant: false, deny: false });
+  assert.equal(
+    b.controller.submit("deny"),
+    1,
+    "B's opposite decision is legal",
+  );
+  b.controller.dispose();
+  a.sends[0].resolve({});
+  await flush();
+});
+
 test("a hung verified read is retired and retried", async (t) => {
   enableTimers(t);
   const h = card();

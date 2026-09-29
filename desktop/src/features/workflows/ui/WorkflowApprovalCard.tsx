@@ -1,6 +1,7 @@
 import { Check, X } from "lucide-react";
 import * as React from "react";
 
+import { useCommunities } from "@/features/communities/useCommunities";
 import {
   fetchApprovalStatusFromRelay,
   useApprovalMutation,
@@ -10,6 +11,7 @@ import {
   type ApprovalDecisionController,
   type ApprovalDecisionState,
   approvalCardView,
+  approvalLockKey,
   createApprovalDecisionController,
   gateViewForKey,
   submitForKey,
@@ -27,6 +29,7 @@ type Decision = "grant" | "deny";
 
 export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
+  const { activeCommunity } = useCommunities();
   const approvalMutation = useApprovalMutation();
   const refreshApprovalState = useRefreshApprovalState();
   const appFocused = useAppFocused();
@@ -41,9 +44,14 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
-  // Decision records are per identity and gate (and cleared on community
-  // teardown), so they never leak across accounts or communities.
-  const lockKey = `${(identityQuery.data?.pubkey ?? "").toLowerCase()}:${approval.approvalRef.toLowerCase()}`;
+  // Decision records are per community, identity and gate. A record whose
+  // native submit is still running survives community teardown, so the
+  // community is part of the key: a colliding gate elsewhere never inherits it.
+  const lockKey = approvalLockKey({
+    communityId: activeCommunity?.id ?? null,
+    pubkey: identityQuery.data?.pubkey,
+    approvalRef: approval.approvalRef,
+  });
   // Until the controller for this exact key is attached, its state and its
   // buttons are not this card's: show nothing from it and keep both disabled.
   const current = controllerKey === lockKey ? decision : null;
