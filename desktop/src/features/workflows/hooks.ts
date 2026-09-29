@@ -6,6 +6,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 
+import { withApprovalTimeout } from "@/features/workflows/workflowApprovalDecision.mjs";
 import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
 import {
   useAppFocused,
@@ -263,10 +264,14 @@ export function useApprovalMutation() {
       note?: string;
       candidate?: string;
     }) =>
-      input.action === "grant"
-        ? grantApproval(input.token, input.note, input.candidate)
-        : denyApproval(input.token, input.note, input.candidate),
-    onSuccess: (_data, _variables) => {
+      // A hung submit must give the card back (audit 4), so bound the wait.
+      withApprovalTimeout(
+        input.action === "grant"
+          ? grantApproval(input.token, input.note, input.candidate)
+          : denyApproval(input.token, input.note, input.candidate),
+      ),
+    // Refresh on refusal too: a race refusal means another seat settled it.
+    onSettled: () => {
       void queryClient.invalidateQueries({
         predicate: (query) =>
           query.queryKey[0] === "workflow-runs" ||

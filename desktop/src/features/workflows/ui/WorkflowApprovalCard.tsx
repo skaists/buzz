@@ -1,5 +1,11 @@
+import { Check, X } from "lucide-react";
+import * as React from "react";
+
 import { useApprovalMutation } from "@/features/workflows/hooks";
-import { workflowApprovalDecisionState } from "@/features/workflows/workflowApprovalDecision.mjs";
+import {
+  type ApprovalCardPhase,
+  approvalCardView,
+} from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { WorkflowApproval } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
@@ -8,37 +14,78 @@ type WorkflowApprovalCardProps = {
   approval: WorkflowApproval;
 };
 
+type Decision = "grant" | "deny";
+
 export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
   const approvalMutation = useApprovalMutation();
-  const state = workflowApprovalDecisionState(
+  const [phase, setPhase] = React.useState<ApprovalCardPhase>("idle");
+  const [action, setAction] = React.useState<Decision | undefined>();
+  const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
+  // Synchronous guard: a second click in the same frame, before React has
+  // re-rendered the disabled buttons, must not send a second decision.
+  const inFlight = React.useRef(false);
+  const statusRef = React.useRef<HTMLDivElement>(null);
+  const focusStatusAfterDecision = React.useRef(false);
+
+  const view = approvalCardView({
     approval,
-    identityQuery.data?.pubkey,
-    Date.now(),
-  );
+    myPubkey: identityQuery.data?.pubkey,
+    nowMs: Date.now(),
+    phase,
+    action,
+    errorMessage,
+  });
 
-  if (!state.visible) {
-    return null;
-  }
+  // Audit 3: after the relay answers, focus lands on the card's status line.
+  React.useEffect(() => {
+    if (phase === "sent" || phase === "failed") {
+      if (focusStatusAfterDecision.current) {
+        focusStatusAfterDecision.current = false;
+        statusRef.current?.focus();
+      }
+    }
+  }, [phase]);
 
-  const decide = (action: "grant" | "deny") => {
-    if (!state.decision) return;
-    approvalMutation.mutate({
-      token: state.decision.token,
-      candidate: state.decision.candidate,
-      action,
-    });
+  const decide = (next: Decision) => {
+    if (inFlight.current || view.buttonsDisabled || !view.decision) return;
+    inFlight.current = true;
+    focusStatusAfterDecision.current = true;
+    setAction(next);
+    setErrorMessage(null);
+    setPhase("sending");
+    approvalMutation.mutate(
+      {
+        token: view.decision.token,
+        candidate: view.decision.candidate,
+        action: next,
+      },
+      {
+        onSuccess: () => setPhase("sent"),
+        onError: (error) => {
+          setErrorMessage(
+            error instanceof Error ? error.message : String(error),
+          );
+          setPhase("failed");
+        },
+        onSettled: () => {
+          inFlight.current = false;
+        },
+      },
+    );
   };
-  const pendingAction = approvalMutation.isPending
-    ? approvalMutation.variables?.action
-    : undefined;
+
+  const showButtons = view.mode === "actions" || view.mode === "sending";
 
   return (
     <div
       className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
       data-testid="workflow-approval-card"
+      data-approval-mode={view.mode}
     >
-      <p className="mb-2 text-sm font-medium">Approval Required</p>
+      <p className="mb-2 text-sm font-medium">
+        {view.mode === "settled" ? "Approval" : "Approval Required"}
+      </p>
       <p className="mb-2 text-xs text-muted-foreground">
         Approver: {approval.approverSpec}
       </p>
@@ -53,45 +100,57 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
       <p className="mb-2 text-xs text-muted-foreground">
         Expires: {new Date(approval.expiresAt).toLocaleString()}
       </p>
-      {state.canDecide ? (
-        <div className="flex gap-2" data-testid="workflow-approval-actions">
+      <div
+        ref={statusRef}
+        tabIndex={-1}
+        role="status"
+        aria-live="polite"
+        className="mb-2 rounded text-xs font-medium focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+        data-testid="workflow-approval-status"
+      >
+        {view.statusText}
+        {view.error ? (
+          <p
+            className="mt-1 font-normal text-destructive"
+            role="alert"
+            data-testid="workflow-approval-error"
+          >
+            {view.error}
+          </p>
+        ) : null}
+      </div>
+      {showButtons ? (
+        // Plain buttons, no <form>: Enter never submits a decision by default,
+        // and nothing is auto-focused.
+        <div
+          className="flex flex-wrap gap-2"
+          data-testid="workflow-approval-actions"
+          aria-busy={view.mode === "sending"}
+        >
           <Button
             type="button"
             size="sm"
-            disabled={approvalMutation.isPending}
+            disabled={view.buttonsDisabled}
             onClick={() => decide("grant")}
             data-testid="workflow-approval-approve"
           >
-            {pendingAction === "grant" ? "Approving…" : "Approve"}
+            <Check aria-hidden="true" />
+            {view.mode === "sending" && action === "grant"
+              ? "Approving…"
+              : "Approve"}
           </Button>
           <Button
             type="button"
             size="sm"
-            variant="outline"
-            disabled={approvalMutation.isPending}
+            variant="destructive"
+            disabled={view.buttonsDisabled}
             onClick={() => decide("deny")}
             data-testid="workflow-approval-deny"
           >
-            {pendingAction === "deny" ? "Denying…" : "Deny"}
+            <X aria-hidden="true" />
+            {view.mode === "sending" && action === "deny" ? "Denying…" : "Deny"}
           </Button>
         </div>
-      ) : (
-        <p className="text-xs text-muted-foreground" role="status">
-          {state.reason === "no-reference"
-            ? "This approval cannot be decided from Desktop."
-            : "Waiting on the designated approver."}
-        </p>
-      )}
-      {approvalMutation.isError ? (
-        <p
-          className="mt-2 text-xs text-destructive"
-          role="alert"
-          data-testid="workflow-approval-error"
-        >
-          {approvalMutation.error instanceof Error
-            ? approvalMutation.error.message
-            : String(approvalMutation.error)}
-        </p>
       ) : null}
     </div>
   );
