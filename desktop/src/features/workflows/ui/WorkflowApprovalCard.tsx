@@ -1,12 +1,23 @@
 import { Check, X } from "lucide-react";
 import * as React from "react";
 
-import { useApprovalMutation } from "@/features/workflows/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import {
-  type ApprovalCardPhase,
+  fetchApprovalStatusFromRelay,
+  useApprovalMutation,
+  useRefreshApprovalState,
+} from "@/features/workflows/hooks";
+import {
+  type ApprovalDecisionController,
+  type ApprovalDecisionState,
   approvalCardView,
+  approvalLockKey,
+  createApprovalDecisionController,
+  gateViewForKey,
+  submitForKey,
 } from "@/features/workflows/workflowApprovalDecision.mjs";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useAppFocused } from "@/shared/lib/useDocumentVisible";
 import type { WorkflowApproval } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 
@@ -18,64 +29,147 @@ type Decision = "grant" | "deny";
 
 export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
   const identityQuery = useIdentityQuery();
+  const { activeCommunity } = useCommunities();
   const approvalMutation = useApprovalMutation();
-  const [phase, setPhase] = React.useState<ApprovalCardPhase>("idle");
-  const [action, setAction] = React.useState<Decision | undefined>();
-  const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
-  // Synchronous guard: a second click in the same frame, before React has
-  // re-rendered the disabled buttons, must not send a second decision.
-  const inFlight = React.useRef(false);
+  const refreshApprovalState = useRefreshApprovalState();
+  const appFocused = useAppFocused();
+  const [decision, setDecision] = React.useState<ApprovalDecisionState | null>(
+    null,
+  );
+  const [, setExpiryTick] = React.useState(0);
+  // The identity-plus-gate key of the attached controller (set when the
+  // effect below creates it).
+  const [controllerKey, setControllerKey] = React.useState<string | null>(null);
+  const controllerRef = React.useRef<ApprovalDecisionController | null>(null);
   const statusRef = React.useRef<HTMLOutputElement>(null);
   const focusStatusAfterDecision = React.useRef(false);
 
-  const view = approvalCardView({
-    approval,
-    myPubkey: identityQuery.data?.pubkey,
-    nowMs: Date.now(),
-    phase,
-    action,
-    errorMessage,
+  // Decision records are per community, identity and gate. A record whose
+  // outcome is still unknown survives community teardown, so the community
+  // is part of the key: a colliding gate elsewhere never inherits it.
+  const lockKey = approvalLockKey({
+    communityId: activeCommunity?.id ?? null,
+    pubkey: identityQuery.data?.pubkey,
+    approvalRef: approval.approvalRef,
   });
+  // Until the controller for this exact key is attached, its state and its
+  // buttons are not this card's: show nothing from it and keep both disabled.
+  const current = controllerKey === lockKey ? decision : null;
+  const view = gateViewForKey(
+    approvalCardView({
+      approval,
+      myPubkey: identityQuery.data?.pubkey,
+      nowMs: Date.now(),
+      phase: current?.phase ?? "idle",
+      action: current?.action,
+      errorMessage: current?.errorMessage ?? null,
+      lockedAction: current?.lockedAction ?? null,
+      settledStatus: current?.settledStatus ?? null,
+    }),
+    controllerKey,
+    lockKey,
+  );
 
-  // Audit 3: after the relay answers, focus lands on the card's status line.
-  React.useEffect(() => {
-    if (phase === "sent" || phase === "failed") {
-      if (focusStatusAfterDecision.current) {
-        focusStatusAfterDecision.current = false;
-        statusRef.current?.focus();
-      }
-    }
-  }, [phase]);
-
-  const decide = (next: Decision) => {
-    if (inFlight.current || view.buttonsDisabled || !view.decision) return;
-    inFlight.current = true;
-    focusStatusAfterDecision.current = true;
-    setAction(next);
-    setErrorMessage(null);
-    setPhase("sending");
-    approvalMutation.mutate(
-      {
-        token: view.decision.token,
-        candidate: view.decision.candidate,
-        action: next,
-      },
-      {
-        onSuccess: () => setPhase("sent"),
-        onError: (error) => {
-          setErrorMessage(
-            error instanceof Error ? error.message : String(error),
-          );
-          setPhase("failed");
-        },
-        onSettled: () => {
-          inFlight.current = false;
-        },
-      },
-    );
+  // The controller is created once per gate and reads the latest values
+  // through this ref, so its fencing and locks survive re-renders.
+  const latest = React.useRef({
+    approval,
+    decision: view.decision,
+    mutateAsync: approvalMutation.mutateAsync,
+    refresh: refreshApprovalState,
+    appFocused,
+  });
+  latest.current = {
+    approval,
+    decision: view.decision,
+    mutateAsync: approvalMutation.mutateAsync,
+    refresh: refreshApprovalState,
+    appFocused,
   };
 
-  const showButtons = view.mode === "actions" || view.mode === "sending";
+  React.useEffect(() => {
+    const controller = createApprovalDecisionController({
+      lockKey,
+      send: ({ action }) => {
+        const target = latest.current.decision;
+        if (!target)
+          return Promise.reject(
+            new Error("This approval cannot be decided from Desktop."),
+          );
+        return latest.current.mutateAsync({
+          token: target.token,
+          candidate: target.candidate,
+          action,
+        });
+      },
+      // Verified read from the relay, not the query cache.
+      verify: () => fetchApprovalStatusFromRelay(latest.current.approval),
+      refetch: () => latest.current.refresh(),
+      isActive: () => latest.current.appFocused,
+      onChange: setDecision,
+    });
+    controllerRef.current = controller;
+    setDecision(controller.getState());
+    setControllerKey(lockKey);
+    return () => {
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, [lockKey]);
+
+  // Audit 3: once the outcome is known, focus lands on the card's status
+  // line, whether the controller or the rendered gate record settled first.
+  const phase = current?.phase ?? "idle";
+  const showsSettled = view.mode === "settled";
+  const outcomeKnown =
+    showsSettled ||
+    phase === "sent" ||
+    phase === "failed" ||
+    phase === "settled";
+  React.useEffect(() => {
+    if (outcomeKnown && focusStatusAfterDecision.current) {
+      focusStatusAfterDecision.current = false;
+      statusRef.current?.focus();
+    }
+  }, [outcomeKnown]);
+
+  // The card shows a settled gate (seen from the relay, or expired) while a
+  // decision is still unresolved: stop re-reading the gate.
+  React.useEffect(() => {
+    if (showsSettled) controllerRef.current?.stopPolling();
+  }, [showsSettled]);
+
+  // An unresolved decision on a gate that then expires must not stay busy:
+  // re-render at expiry so the card shows Expired.
+  const expiresAtMs = new Date(approval.expiresAt).getTime();
+  React.useEffect(() => {
+    if (phase !== "uncertain" && phase !== "verifying") return undefined;
+    const wait = expiresAtMs - Date.now();
+    if (!(wait > 0)) return undefined;
+    const timer = setTimeout(
+      () => setExpiryTick((tick) => tick + 1),
+      Math.min(wait + 50, 2_147_483_647),
+    );
+    return () => clearTimeout(timer);
+  }, [phase, expiresAtMs]);
+
+  const decide = (next: Decision) => {
+    if (view.disabledActions[next] || !view.decision) return;
+    // submitForKey ignores the click unless the attached controller was
+    // created for the current identity-plus-gate key. The controller's own
+    // synchronous phase check blocks a second click in the same frame, and
+    // any signing the relay has not yet verified as safe.
+    focusStatusAfterDecision.current = true;
+    if (submitForKey(controllerRef.current, lockKey, next) === null)
+      focusStatusAfterDecision.current = false;
+  };
+
+  const busy =
+    view.mode === "sending" ||
+    view.mode === "uncertain" ||
+    view.mode === "verifying";
+  const showButtons = view.mode === "actions" || busy;
+  const action = current?.action;
 
   return (
     <div
@@ -124,30 +218,28 @@ export function WorkflowApprovalCard({ approval }: WorkflowApprovalCardProps) {
         <div
           className="flex flex-wrap gap-2"
           data-testid="workflow-approval-actions"
-          aria-busy={view.mode === "sending"}
+          aria-busy={busy}
         >
           <Button
             type="button"
             size="sm"
-            disabled={view.buttonsDisabled}
+            disabled={view.disabledActions.grant}
             onClick={() => decide("grant")}
             data-testid="workflow-approval-approve"
           >
             <Check aria-hidden="true" />
-            {view.mode === "sending" && action === "grant"
-              ? "Approving…"
-              : "Approve"}
+            {busy && action === "grant" ? "Approving…" : "Approve"}
           </Button>
           <Button
             type="button"
             size="sm"
             variant="destructive"
-            disabled={view.buttonsDisabled}
+            disabled={view.disabledActions.deny}
             onClick={() => decide("deny")}
             data-testid="workflow-approval-deny"
           >
             <X aria-hidden="true" />
-            {view.mode === "sending" && action === "deny" ? "Denying…" : "Deny"}
+            {busy && action === "deny" ? "Denying…" : "Deny"}
           </Button>
         </div>
       ) : null}

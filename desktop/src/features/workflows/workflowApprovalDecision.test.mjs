@@ -2,10 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  APPROVAL_TIMEOUT_MESSAGE,
   approvalCardView,
   settledStatusFromRelayError,
-  withApprovalTimeout,
 } from "./workflowApprovalDecision.mjs";
 
 const ME = "56694530e53104c824408896ebb78751de7d2894800308369f463feff4a8bd27";
@@ -92,21 +90,6 @@ test("audit 4: a relay refusal reverts to actionable with the inline error", () 
   assert.equal(v.mode, "actions");
   assert.equal(v.buttonsDisabled, false);
   assert.equal(v.error, "forbidden: candidate mismatch");
-});
-
-test("audit 4: a timeout reverts to actionable with the timeout message", async () => {
-  const never = new Promise(() => {});
-  await assert.rejects(withApprovalTimeout(never, 10), {
-    message: APPROVAL_TIMEOUT_MESSAGE,
-  });
-  const v = view({
-    phase: "failed",
-    action: "grant",
-    errorMessage: APPROVAL_TIMEOUT_MESSAGE,
-  });
-  assert.equal(v.mode, "actions");
-  assert.equal(v.error, APPROVAL_TIMEOUT_MESSAGE);
-  assert.equal(await withApprovalTimeout(Promise.resolve("ok"), 10), "ok");
 });
 
 test("relay settle messages are classified; other refusals are not", () => {

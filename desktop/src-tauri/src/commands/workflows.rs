@@ -279,17 +279,82 @@ pub async fn trigger_workflow(
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
+    verify: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<WorkflowApprovalsWire, String> {
     let workflow_id =
         uuid::Uuid::parse_str(&workflow_id).map_err(|_| "invalid workflow id".to_string())?;
     let run_id =
         uuid::Uuid::parse_str(&run_id).map_err(|_| "invalid workflow run id".to_string())?;
-    get_relay_json(
-        &state,
-        &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
-    )
-    .await
+    let path = format!("/workflows/{workflow_id}/runs/{run_id}/approvals");
+    let read = get_relay_json(&state, &path);
+    match approvals_read_deadline(verify) {
+        // The approval card's verified re-reads are bounded like the submit: a
+        // hung read must end, so they cannot pile up native requests.
+        Some(deadline) => with_approval_deadline(read, deadline, APPROVAL_READ_ABANDONED).await,
+        // The ordinary approvals query keeps waiting: a slow but working relay
+        // must still be able to populate the approval cards.
+        None => read.await,
+    }
+}
+
+/// The hard deadline for an approvals read: only the approval card's verified
+/// re-reads (`verify: true`) get one. The ordinary approvals query has none.
+pub(crate) fn approvals_read_deadline(verify: Option<bool>) -> Option<std::time::Duration> {
+    if verify == Some(true) {
+        Some(APPROVAL_READ_DEADLINE)
+    } else {
+        None
+    }
+}
+
+/// Hard lifetime of one approval submit. Tauri's `invoke` has no AbortSignal,
+/// so the frontend cannot cancel this command; the deadline is enforced here.
+/// Dropping the submit future cancels the HTTP request: a decision still queued
+/// behind the rate-limit gate or still connecting is never sent. A request the
+/// relay already received cannot be recalled, so the approval card re-reads the
+/// gate from the relay before it allows another signing (and then only the same
+/// decision). Kept below the card's 20 s deadline (`APPROVAL_DECISION_TIMEOUT_MS`).
+pub(crate) const APPROVAL_SUBMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Error returned when the deadline drops the submit. Not a relay refusal: the
+/// decision may or may not have reached the relay.
+pub(crate) const APPROVAL_SUBMIT_ABANDONED: &str =
+    "approval submit abandoned: no relay answer within 15 s; it may or may not have reached the relay";
+
+/// Hard lifetime of one verified approvals read (`get_run_approvals` with
+/// `verify: true`), matching the card's verified-read retire timeout
+/// (`APPROVAL_VERIFY_READ_TIMEOUT_MS`).
+pub(crate) const APPROVAL_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Error returned when the read deadline drops a hung approvals read.
+pub(crate) const APPROVAL_READ_ABANDONED: &str =
+    "approvals read abandoned: no relay answer within 10 s";
+
+/// Run `work` under `deadline`, dropping (cancelling) it when time runs out.
+pub(crate) async fn with_approval_deadline<T, F>(
+    work: F,
+    deadline: std::time::Duration,
+    abandoned: &str,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match tokio::time::timeout(deadline, work).await {
+        Ok(result) => result,
+        Err(_) => Err(abandoned.to_string()),
+    }
+}
+
+/// Run `submit` under `deadline`, dropping (cancelling) it when time runs out.
+pub(crate) async fn with_approval_submit_deadline<T, F>(
+    submit: F,
+    deadline: std::time::Duration,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    with_approval_deadline(submit, deadline, APPROVAL_SUBMIT_ABANDONED).await
 }
 
 #[tauri::command]
@@ -300,7 +365,9 @@ pub async fn grant_approval(
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_grant(&token, note.as_deref(), candidate.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result =
+        with_approval_submit_deadline(submit_event(builder, &state), APPROVAL_SUBMIT_DEADLINE)
+            .await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 
@@ -312,7 +379,9 @@ pub async fn deny_approval(
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_deny(&token, note.as_deref(), candidate.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result =
+        with_approval_submit_deadline(submit_event(builder, &state), APPROVAL_SUBMIT_DEADLINE)
+            .await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 

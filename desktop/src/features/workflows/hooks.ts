@@ -6,7 +6,6 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 
-import { withApprovalTimeout } from "@/features/workflows/workflowApprovalDecision.mjs";
 import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
 import {
   useAppFocused,
@@ -254,30 +253,68 @@ export function useTriggerWorkflowMutation(workflowId: string) {
   });
 }
 
+/** Re-read everything an approval decision can change. */
+function invalidateApprovalState(
+  queryClient: ReturnType<typeof useQueryClient>,
+  cancelRefetch = true,
+) {
+  return queryClient.invalidateQueries(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === "workflow-runs" ||
+        query.queryKey[0] === "workflow" ||
+        query.queryKey[0] === "run-approvals",
+    },
+    { cancelRefetch },
+  );
+}
+
+/** Verified read of one gate's status straight from the relay (no cache).
+ * Rejects when the relay cannot be read or does not list the gate, so the
+ * caller never mistakes "unknown" for "still pending". */
+export async function fetchApprovalStatusFromRelay(approval: {
+  workflowId: string;
+  runId: string;
+  approvalRef: string;
+}): Promise<string> {
+  const approvals = await getRunApprovals(approval.workflowId, approval.runId, {
+    verify: true,
+  });
+  const ref = approval.approvalRef.toLowerCase();
+  const match = approvals.find((a) => a.approvalRef.toLowerCase() === ref);
+  if (!match) throw new Error("approval not found on the relay");
+  return match.status;
+}
+
+/** Lets the approval card re-read the gate while a decision is overdue.
+ * Never cancels a read already in flight: on a slow relay, restarting it every
+ * few seconds could mean the settled record never arrives. */
+export function useRefreshApprovalState() {
+  const queryClient = useQueryClient();
+  return React.useCallback(
+    () => invalidateApprovalState(queryClient, false),
+    [queryClient],
+  );
+}
+
 export function useApprovalMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
+    // No deadline here: a submit cannot be cancelled once sent, so the card
+    // waits for the real outcome (see trackApprovalDecision).
     mutationFn: (input: {
       token: string;
       action: "grant" | "deny";
       note?: string;
       candidate?: string;
     }) =>
-      // A hung submit must give the card back (audit 4), so bound the wait.
-      withApprovalTimeout(
-        input.action === "grant"
-          ? grantApproval(input.token, input.note, input.candidate)
-          : denyApproval(input.token, input.note, input.candidate),
-      ),
+      input.action === "grant"
+        ? grantApproval(input.token, input.note, input.candidate)
+        : denyApproval(input.token, input.note, input.candidate),
     // Refresh on refusal too: a race refusal means another seat settled it.
     onSettled: () => {
-      void queryClient.invalidateQueries({
-        predicate: (query) =>
-          query.queryKey[0] === "workflow-runs" ||
-          query.queryKey[0] === "workflow" ||
-          query.queryKey[0] === "run-approvals",
-      });
+      void invalidateApprovalState(queryClient);
     },
   });
 }

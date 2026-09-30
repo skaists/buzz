@@ -246,15 +246,20 @@ export async function getWorkflowRuns(
   return raw.runs.map(fromRawWorkflowRun);
 }
 
+/** `verify: true` marks the approval card's verified re-read: only that read
+ * gets the native 10 s deadline. The ordinary approvals query has none, so a
+ * slow but working relay can still populate the cards. */
 export async function getRunApprovals(
   workflowId: string,
   runId: string,
+  options?: { verify?: boolean },
 ): Promise<WorkflowApproval[]> {
   const raw = await invokeTauri<RawWorkflowApprovalsResponse>(
     "get_run_approvals",
     {
       workflowId,
       runId,
+      verify: options?.verify ?? null,
     },
   );
   return raw.approvals.map(fromRawApproval);
