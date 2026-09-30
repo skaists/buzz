@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::DedupMode;
+use crate::recovery::{RecoveryEvent, RecoveryJournal};
 
 /// Maximum events queued per channel before oldest events are dropped.
 const MAX_PENDING_PER_CHANNEL: usize = 500;
@@ -168,6 +169,19 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    recovery: Option<RecoveryJournal>,
+    recovery_error: Option<String>,
+    recovery_seen: HashSet<String>,
+    recovery_in_flight: HashMap<Uuid, HashSet<String>>,
+    recovery_steers: HashMap<Uuid, HashSet<String>>,
+    // Detached requests remain durable after a deadline expiry. A later
+    // batch or acknowledgment must not manufacture their completion.
+    recovery_orphaned: HashSet<String>,
+    // Steers from a failed turn require normal fresh-session delivery. Late
+    // acknowledgments from the failed session cannot consume their replay.
+    recovery_redispatch: HashSet<String>,
+    recovery_generation: HashMap<Uuid, Uuid>,
+    recovery_steer_owner: HashMap<String, Uuid>,
 }
 
 impl EventQueue {
@@ -189,9 +203,202 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            recovery: None,
+            recovery_error: None,
+            recovery_seen: HashSet::new(),
+            recovery_in_flight: HashMap::new(),
+            recovery_steers: HashMap::new(),
+            recovery_orphaned: HashSet::new(),
+            recovery_redispatch: HashSet::new(),
+            recovery_generation: HashMap::new(),
+            recovery_steer_owner: HashMap::new(),
         }
     }
 
+    /// Attach a locked journal before accepting or dispatching work.
+    pub(crate) fn with_recovery(mut self, recovery: RecoveryJournal) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
+
+    /// Pending records must pass current authorization before re-enqueueing.
+    pub(crate) fn recovery_pending(&self) -> Vec<RecoveryEvent> {
+        self.recovery
+            .as_ref()
+            .map_or_else(Vec::new, RecoveryJournal::pending)
+    }
+
+    /// Durable write failures stop acceptance and dispatch until restart.
+    pub(crate) fn check_recovery(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.recovery_error {
+            anyhow::bail!("agent request recovery journal failed: {error}");
+        }
+        Ok(())
+    }
+
+    fn recovery_failed(&mut self, error: anyhow::Error) {
+        tracing::error!(error = %error, "request journal failed; stopping dispatch");
+        self.recovery_error = Some(error.to_string());
+    }
+
+    fn settle_recovery(&mut self, ids: Vec<String>) {
+        if ids.is_empty() || self.recovery_error.is_some() {
+            return;
+        }
+        if let Some(recovery) = &mut self.recovery {
+            match recovery.settle(ids.iter().cloned()) {
+                Ok(()) => {
+                    for id in ids {
+                        self.recovery_seen.remove(&id);
+                        self.recovery_orphaned.remove(&id);
+                        self.recovery_redispatch.remove(&id);
+                        self.recovery_steer_owner.remove(&id);
+                    }
+                }
+                Err(error) => self.recovery_failed(error),
+            }
+        }
+    }
+
+    fn settle_evicted(&mut self, ids: Vec<String>) {
+        let ids = ids
+            .into_iter()
+            .filter(|id| {
+                !self.recovery_in_flight.values().any(|set| set.contains(id))
+                    && !self.recovery_steers.values().any(|set| set.contains(id))
+                    && !self.recovery_orphaned.contains(id)
+            })
+            .collect();
+        self.settle_recovery(ids);
+    }
+
+    fn track_recovery_batch(
+        &mut self,
+        channel: Uuid,
+        events: &[BatchEvent],
+        cancelled: &[BatchEvent],
+    ) {
+        if self.recovery.is_some() {
+            self.recovery_generation.insert(channel, Uuid::new_v4());
+            // Each terminal result can retire only the payload actually sent
+            // in that turn, including its annotated cancellation context.
+            self.recovery_in_flight.insert(
+                channel,
+                events
+                    .iter()
+                    .chain(cancelled)
+                    .map(|event| event.event.id.to_hex())
+                    .filter(|id| !self.recovery_orphaned.contains(id))
+                    .collect(),
+            );
+        }
+    }
+
+    fn detach_orphaned_recovery(&mut self, channel_id: Uuid) {
+        self.recovery_generation.remove(&channel_id);
+        if let Some(ids) = self.recovery_in_flight.remove(&channel_id) {
+            self.recovery_orphaned.extend(ids);
+        }
+        if let Some(ids) = self.recovery_steers.remove(&channel_id) {
+            self.recovery_orphaned.extend(ids);
+        }
+    }
+
+    fn surviving_recovery_ids(&self, channel_id: Uuid) -> HashSet<String> {
+        self.queues
+            .get(&channel_id)
+            .into_iter()
+            .flatten()
+            .map(|event| event.event.id.to_hex())
+            .chain(
+                self.cancelled_batches
+                    .get(&channel_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|event| event.event.id.to_hex()),
+            )
+            .chain(
+                self.withheld_native_steer
+                    .get(&channel_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|event| event.event.id.to_hex()),
+            )
+            .collect()
+    }
+
+    fn restore_retry_steers(&mut self, channel_id: Uuid, mut ids: HashSet<String>) {
+        let generation = self.recovery_generation.get(&channel_id).copied();
+        let mut released = Vec::new();
+        if let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) {
+            let mut retained = Vec::new();
+            for event in entries.drain(..) {
+                let id = event.event.id.to_hex();
+                if generation.is_some() && self.recovery_steer_owner.get(&id) == generation.as_ref()
+                {
+                    ids.insert(id);
+                    released.push(event);
+                } else {
+                    retained.push(event);
+                }
+            }
+            *entries = retained;
+        }
+        if self
+            .withheld_native_steer
+            .get(&channel_id)
+            .is_some_and(Vec::is_empty)
+        {
+            self.withheld_native_steer.remove(&channel_id);
+        }
+        if ids.is_empty() {
+            return;
+        }
+        self.recovery_redispatch.extend(ids.iter().cloned());
+        let mut survivors = self.surviving_recovery_ids(channel_id);
+        let queue = self.queues.entry(channel_id).or_default();
+        for event in released {
+            survivors.insert(event.event.id.to_hex());
+            queue.push_back(event);
+        }
+        // A successful native ACK removed the in-memory event. Reconstruct
+        // its original signed payload so the replacement session sees it.
+        for entry in self.recovery_pending() {
+            let id = entry.event.id.to_hex();
+            if entry.channel_id == channel_id && ids.contains(&id) && survivors.insert(id) {
+                self.queues
+                    .entry(channel_id)
+                    .or_default()
+                    .push_back(QueuedEvent {
+                        channel_id,
+                        event: entry.event,
+                        prompt_tag: entry.prompt_tag,
+                        received_at: Instant::now(),
+                    });
+            }
+        }
+        let mut evicted = Vec::new();
+        if let Some(queue) = self.queues.get_mut(&channel_id) {
+            while queue.len() > MAX_PENDING_PER_CHANNEL {
+                if let Some(event) = queue.pop_back() {
+                    evicted.push(event.event.id.to_hex());
+                }
+            }
+        }
+        self.settle_evicted(evicted);
+    }
+
+    fn preserve_cancelled_context(&mut self, batch: &mut FlushBatch) {
+        if !batch.cancelled_events.is_empty() {
+            self.cancelled_batches
+                .entry(batch.channel_id)
+                .or_default()
+                .append(&mut batch.cancelled_events);
+            if let Some(reason) = batch.cancel_reason {
+                self.cancel_reasons.insert(batch.channel_id, reason);
+            }
+        }
+    }
     /// Set the in-flight backstop deadline from the configured max turn
     /// duration, preserving the 100s buffer for cancel-drain grace + respawn.
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
@@ -228,6 +435,9 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
+        if self.recovery_error.is_some() {
+            return false;
+        }
         if matches!(self.dedup_mode, DedupMode::Drop)
             && self.in_flight_channels.contains(&event.channel_id)
         {
@@ -237,10 +447,29 @@ impl EventQueue {
             );
             return false;
         }
+        let id = event.event.id.to_hex();
+        if let Some(recovery) = &mut self.recovery {
+            if self.recovery_seen.contains(&id) {
+                return false;
+            }
+            match recovery.record(event.channel_id, &event.event, &event.prompt_tag) {
+                Ok(true) => {
+                    self.recovery_seen.insert(id);
+                }
+                Ok(false) => return false,
+                Err(error) => {
+                    self.recovery_failed(error);
+                    return false;
+                }
+            }
+        }
         let queue = self.queues.entry(event.channel_id).or_default();
+        let mut evicted = Vec::new();
         // Enforce per-channel depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
-            queue.pop_front();
+            if let Some(event) = queue.pop_front() {
+                evicted.push(event.event.id.to_hex());
+            }
             tracing::warn!(
                 channel_id = %event.channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
@@ -248,7 +477,8 @@ impl EventQueue {
             );
         }
         queue.push_back(event);
-        true
+        self.settle_evicted(evicted);
+        self.recovery_error.is_none()
     }
 
     /// Try to flush the next batch.
@@ -258,6 +488,9 @@ impl EventQueue {
     /// across channels), drains ALL events for that channel into a single batch,
     /// inserts into `in_flight_channels`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
+        if self.recovery_error.is_some() {
+            return None;
+        }
         let now = Instant::now();
 
         // Auto-expire any stuck in-flight entries that missed mark_complete.
@@ -274,10 +507,20 @@ impl EventQueue {
                 lost_events,
                 deadline_secs = self.in_flight_deadline.as_secs(),
                 "BUG: in-flight channel expired without mark_complete — \
-                 auto-releasing; {lost_events} dispatched event(s) orphaned"
+                 {lost_events} dispatched event(s) have unknown outcomes"
             );
+            if self.recovery.is_some() {
+                // The old task can still return with only its channel ID.
+                // Stop dispatch rather than let that result retire a newer
+                // turn's requests. Every accepted record remains durable.
+                self.recovery_failed(anyhow::anyhow!(
+                    "in-flight turn expired with unknown outcome; restart required"
+                ));
+                return None;
+            }
             self.in_flight_channels.remove(&id);
             self.in_flight_deadlines.remove(&id);
+            self.detach_orphaned_recovery(id);
             // Recover any withheld goose-native steer events for the expired
             // channel back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -308,7 +551,10 @@ impl EventQueue {
                 let cancelled_id = self
                     .cancelled_batches
                     .keys()
-                    .find(|id| !self.in_flight_channels.contains(id))
+                    .find(|id| {
+                        !self.in_flight_channels.contains(id)
+                            && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                    })
                     .copied();
                 match cancelled_id {
                     Some(id) => {
@@ -320,6 +566,7 @@ impl EventQueue {
                         self.in_flight_deadlines
                             .insert(id, now + self.in_flight_deadline);
                         self.in_flight_batch_sizes.insert(id, cancelled.len());
+                        self.track_recovery_batch(id, &cancelled, &[]);
                         return Some(FlushBatch {
                             channel_id: id,
                             events: cancelled,
@@ -371,6 +618,7 @@ impl EventQueue {
             self.cancel_reasons.remove(&channel_id)
         };
 
+        self.track_recovery_batch(channel_id, &events, &cancelled_events);
         Some(FlushBatch {
             channel_id,
             events,
@@ -390,6 +638,22 @@ impl EventQueue {
     ///
     /// Also cleans up any already-expired `retry_after` entry.
     pub fn mark_complete(&mut self, channel_id: Uuid) {
+        if let Some(mut ids) = self.recovery_in_flight.remove(&channel_id) {
+            let survivors = self.surviving_recovery_ids(channel_id);
+            let retrying = ids.iter().any(|id| survivors.contains(id));
+            let steers = self.recovery_steers.remove(&channel_id).unwrap_or_default();
+            if retrying {
+                self.restore_retry_steers(channel_id, steers.clone());
+            }
+            ids.extend(steers);
+            let survivors = self.surviving_recovery_ids(channel_id);
+            self.settle_recovery(
+                ids.into_iter()
+                    .filter(|id| !survivors.contains(id))
+                    .collect(),
+            );
+        }
+        self.recovery_generation.remove(&channel_id);
         self.in_flight_channels.remove(&channel_id);
         self.in_flight_deadlines.remove(&channel_id);
         self.in_flight_batch_sizes.remove(&channel_id);
@@ -426,7 +690,7 @@ impl EventQueue {
     ///
     /// Note: does NOT remove from `in_flight_channels` — caller must call
     /// `mark_complete` separately.
-    pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
+    pub fn requeue(&mut self, mut batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
         let attempt = {
             let count = self.retry_counts.entry(channel_id).or_insert(0);
@@ -472,6 +736,7 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
+        self.preserve_cancelled_context(&mut batch);
         let queue = self.queues.entry(channel_id).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
@@ -485,14 +750,18 @@ impl EventQueue {
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
         // the queue over the limit. Without this, repeated requeue+push cycles
         // can grow the queue unboundedly.
+        let mut evicted = Vec::new();
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            if let Some(event) = queue.pop_back() {
+                evicted.push(event.event.id.to_hex());
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "requeue overflow — dropped oldest event to enforce cap"
             );
         }
+        self.settle_evicted(evicted);
         self.retry_after.insert(channel_id, Instant::now() + delay);
         None
     }
@@ -505,8 +774,9 @@ impl EventQueue {
     ///
     /// Does NOT set `retry_after`. Does NOT remove from `in_flight_channels` —
     /// caller must call `mark_complete` separately.
-    pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
+    pub fn requeue_preserve_timestamps(&mut self, mut batch: FlushBatch) {
         let channel_id = batch.channel_id;
+        self.preserve_cancelled_context(&mut batch);
         let queue = self.queues.entry(channel_id).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
@@ -518,14 +788,18 @@ impl EventQueue {
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
+        let mut evicted = Vec::new();
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            if let Some(event) = queue.pop_back() {
+                evicted.push(event.event.id.to_hex());
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "requeue_preserve overflow — dropped newest event to enforce cap"
             );
         }
+        self.settle_evicted(evicted);
     }
 
     /// Requeue a cancelled batch so its events appear as `cancelled_events`
@@ -554,6 +828,9 @@ impl EventQueue {
     /// This is a `&mut self` method so expiry can happen without requiring a
     /// full `flush_next` call.
     pub fn has_flushable_work(&mut self) -> bool {
+        if self.recovery_error.is_some() {
+            return false;
+        }
         let now = Instant::now();
 
         // Auto-expire stuck in-flight entries (same logic as flush_next).
@@ -570,10 +847,20 @@ impl EventQueue {
                 lost_events,
                 deadline_secs = self.in_flight_deadline.as_secs(),
                 "BUG: in-flight channel expired without mark_complete — \
-                 auto-releasing; {lost_events} dispatched event(s) orphaned"
+                 {lost_events} dispatched event(s) have unknown outcomes"
             );
+            if self.recovery.is_some() {
+                // The old task can still return with only its channel ID.
+                // Stop dispatch rather than let that result retire a newer
+                // turn's requests. Every accepted record remains durable.
+                self.recovery_failed(anyhow::anyhow!(
+                    "in-flight turn expired with unknown outcome; restart required"
+                ));
+                return false;
+            }
             self.in_flight_channels.remove(&id);
             self.in_flight_deadlines.remove(&id);
+            self.detach_orphaned_recovery(id);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired channel so they are
             // not permanently orphaned in the side table.
@@ -584,10 +871,10 @@ impl EventQueue {
             !q.is_empty()
                 && !self.in_flight_channels.contains(id)
                 && self.retry_after.get(id).is_none_or(|&t| t <= now)
-        }) || self
-            .cancelled_batches
-            .keys()
-            .any(|id| !self.in_flight_channels.contains(id))
+        }) || self.cancelled_batches.keys().any(|id| {
+            !self.in_flight_channels.contains(id)
+                && self.retry_after.get(id).is_none_or(|&t| t <= now)
+        })
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -656,6 +943,28 @@ impl EventQueue {
     /// Returns the event IDs of dropped events so the caller can clean up
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
+        if let Some(recovery) = &mut self.recovery {
+            let retired_ids: Vec<_> = recovery
+                .pending()
+                .into_iter()
+                .filter(|entry| entry.channel_id == channel_id)
+                .map(|entry| entry.event.id.to_hex())
+                .collect();
+            match recovery.settle_channel(channel_id) {
+                Ok(()) => {
+                    for id in retired_ids {
+                        self.recovery_seen.remove(&id);
+                        self.recovery_orphaned.remove(&id);
+                        self.recovery_redispatch.remove(&id);
+                        self.recovery_steer_owner.remove(&id);
+                    }
+                }
+                Err(error) => self.recovery_failed(error),
+            }
+        }
+        self.recovery_in_flight.remove(&channel_id);
+        self.recovery_steers.remove(&channel_id);
+        self.recovery_generation.remove(&channel_id);
         let ids = self
             .queues
             .remove(&channel_id)
@@ -725,6 +1034,10 @@ impl EventQueue {
             .entry(channel_id)
             .or_default()
             .push(qe);
+        if let Some(generation) = self.recovery_generation.get(&channel_id) {
+            self.recovery_steer_owner
+                .insert(event_id.to_owned(), *generation);
+        }
         true
     }
 
@@ -749,6 +1062,7 @@ impl EventQueue {
             return;
         };
         let qe = entries.remove(pos);
+        self.recovery_steer_owner.remove(event_id);
         if entries.is_empty() {
             self.withheld_native_steer.remove(&channel_id);
         }
@@ -757,14 +1071,18 @@ impl EventQueue {
         // a flood of events arrived during the ack window.
         let queue = self.queues.entry(channel_id).or_default();
         queue.push_front(qe);
+        let mut evicted = Vec::new();
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            if let Some(event) = queue.pop_back() {
+                evicted.push(event.event.id.to_hex());
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "release_native_steer overflow — dropped newest event to enforce cap"
             );
         }
+        self.settle_evicted(evicted);
     }
 
     /// Drop a specific event by id from both the side table and the main
@@ -774,6 +1092,34 @@ impl EventQueue {
     /// event has been "delivered" via the non-cancelling path and must not
     /// be redelivered via normal dispatch. Idempotent across both stores.
     pub fn remove_event(&mut self, channel_id: Uuid, event_id: &str) {
+        if let Some(recovery) = &self.recovery {
+            if self.recovery_orphaned.contains(event_id)
+                || self.recovery_redispatch.contains(event_id)
+                || recovery.is_completed(event_id)
+            {
+                return;
+            }
+            let owner = self.recovery_steer_owner.remove(event_id);
+            match owner {
+                Some(generation)
+                    if self.recovery_generation.get(&channel_id) == Some(&generation) =>
+                {
+                    self.recovery_steers
+                        .entry(channel_id)
+                        .or_default()
+                        .insert(event_id.to_owned());
+                }
+                Some(_) => {
+                    // The earlier turn finished before this ACK arrived. An
+                    // accepted steer is not proof that that turn handled it:
+                    // deliver its payload in a later turn before retiring it.
+                    self.recovery_redispatch.insert(event_id.to_owned());
+                    self.release_native_steer(channel_id, event_id);
+                    return;
+                }
+                None => return,
+            }
+        }
         if let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) {
             entries.retain(|qe| qe.event.id.to_hex() != event_id);
             if entries.is_empty() {
@@ -808,16 +1154,23 @@ impl EventQueue {
         let n = entries.len();
         let queue = self.queues.entry(channel_id).or_default();
         for qe in entries.into_iter().rev() {
+            if self.recovery.is_some() {
+                self.recovery_redispatch.insert(qe.event.id.to_hex());
+            }
             queue.push_front(qe);
         }
+        let mut evicted = Vec::new();
         while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
+            if let Some(event) = queue.pop_back() {
+                evicted.push(event.event.id.to_hex());
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "withheld-steer recovery overflow — dropped newest event to enforce cap"
             );
         }
+        self.settle_evicted(evicted);
         tracing::warn!(
             channel_id = %channel_id,
             recovered = n,
@@ -5390,5 +5743,537 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::path::PathBuf;
+
+    struct Fixture {
+        path: PathBuf,
+        pubkey: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("buzz-queue-recovery-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).expect("create test directory");
+            Self {
+                path: directory.join("requests.json"),
+                pubkey: Keys::generate().public_key().to_hex(),
+            }
+        }
+        fn queue(&self) -> EventQueue {
+            EventQueue::new(DedupMode::Queue).with_recovery(
+                RecoveryJournal::open(&self.path, "wss://relay.example", &self.pubkey)
+                    .expect("open journal"),
+            )
+        }
+        fn restore(&self) -> EventQueue {
+            let mut queue = self.queue();
+            for entry in queue.recovery_pending() {
+                assert!(queue.push(QueuedEvent {
+                    channel_id: entry.channel_id,
+                    event: entry.event,
+                    prompt_tag: entry.prompt_tag,
+                    received_at: Instant::now()
+                }));
+            }
+            queue
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.path.parent().expect("owned parent"));
+        }
+    }
+    fn request(channel_id: Uuid, content: &str) -> QueuedEvent {
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .tags([Tag::parse(["h".to_owned(), channel_id.to_string()]).expect("h tag")])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign request");
+        QueuedEvent {
+            channel_id,
+            event,
+            prompt_tag: "@mention".into(),
+            received_at: Instant::now(),
+        }
+    }
+    fn pending_ids(queue: &EventQueue) -> HashSet<String> {
+        queue
+            .recovery_pending()
+            .into_iter()
+            .map(|entry| entry.event.id.to_hex())
+            .collect()
+    }
+
+    #[test]
+    fn crash_recovers_active_accepted_steer_and_pending_work_once() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let finished = request(channel, "finished before crash");
+        let original = request(channel, "active original");
+        let steer = request(channel, "accepted mid-turn steer");
+        let pending = request(other, "pending second channel");
+        let expected: HashSet<_> = [&original, &steer, &pending]
+            .iter()
+            .map(|q| q.event.id.to_hex())
+            .collect();
+        {
+            let mut queue = fixture.queue();
+            assert!(queue.push(finished.clone()));
+            queue.flush_next().expect("finished batch");
+            queue.mark_complete(channel);
+            assert!(queue.push(original.clone()));
+            queue.flush_next().expect("active batch");
+            assert!(queue.push(steer.clone()));
+            assert!(queue.mark_native_steer_pending(channel, &steer.event.id.to_hex()));
+            queue.remove_event(channel, &steer.event.id.to_hex());
+            assert!(queue.push(pending.clone()));
+            assert_eq!(pending_ids(&queue), expected);
+            // Drop without any result/mark_complete: process-death boundary.
+        }
+        let mut restored = fixture.restore();
+        assert_eq!(pending_ids(&restored), expected);
+        assert!(!restored.push(original)); // startup skew replay cannot duplicate
+        assert!(!restored.push(finished)); // known terminal request stays retired
+        let first = restored.flush_next().expect("first recovered batch");
+        let second = restored.flush_next().expect("second recovered batch");
+        let delivered: HashSet<_> = first
+            .events
+            .iter()
+            .chain(&second.events)
+            .map(|be| be.event.id.to_hex())
+            .collect();
+        assert_eq!(delivered, expected);
+        assert_eq!(first.events.len() + second.events.len(), 3);
+        restored.mark_complete(first.channel_id);
+        restored.mark_complete(second.channel_id);
+        drop(restored);
+        assert!(fixture.restore().recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn cancelled_and_retried_work_survives_until_terminal_result() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let original = request(channel, "cancel then continue");
+        let id = original.event.id.to_hex();
+        let mut queue = fixture.queue();
+        assert!(queue.push(original));
+        let batch = queue.flush_next().expect("batch");
+        queue.requeue_as_cancelled(batch, CancelReason::Steer);
+        queue.mark_complete(channel);
+        assert!(pending_ids(&queue).contains(&id));
+        let batch = queue.flush_next().expect("cancelled batch");
+        assert!(queue.requeue(batch).is_none());
+        queue.mark_complete(channel);
+        assert!(pending_ids(&queue).contains(&id));
+        drop(queue);
+        let mut restored = fixture.restore();
+        assert_eq!(
+            restored.flush_next().expect("resumed").events[0]
+                .event
+                .id
+                .to_hex(),
+            id
+        );
+        restored.mark_complete(channel);
+        assert!(restored.recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn dead_letter_and_removed_channel_do_not_resurrect() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "exhausted")));
+        let batch = queue.flush_next().expect("batch");
+        queue.set_retry_count_for_test(channel, MAX_RETRIES);
+        assert!(queue.requeue(batch).is_some());
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+        assert!(queue.push(request(channel, "membership revoked")));
+        queue.flush_next().expect("active");
+        let steer = request(channel, "withheld");
+        let id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &id));
+        queue.drain_channel(channel);
+        drop(queue);
+        assert!(fixture.restore().recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn failed_journal_write_stops_acceptance_and_dispatch() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "already durable")));
+        std::fs::remove_file(&fixture.path).expect("remove owned destination");
+        std::fs::create_dir(&fixture.path).expect("force rename failure");
+        assert!(!queue.push(request(channel, "must not execute")));
+        assert!(queue.check_recovery().is_err());
+        assert!(queue.flush_next().is_none());
+    }
+
+    #[test]
+    fn completion_preserves_new_queued_request_and_unacknowledged_steer() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "active")));
+        queue.flush_next().expect("active");
+        let pending = request(channel, "next request");
+        let pending_id = pending.event.id.to_hex();
+        let steer = request(channel, "steer awaiting ack");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(pending));
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        queue.mark_complete(channel);
+        assert_eq!(pending_ids(&queue), HashSet::from([pending_id, steer_id]));
+    }
+
+    #[test]
+    fn queue_capacity_retirement_is_durable() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        let oldest = request(channel, "evicted oldest");
+        let oldest_id = oldest.event.id.to_hex();
+        assert!(queue.push(oldest.clone()));
+        for index in 0..MAX_PENDING_PER_CHANNEL {
+            assert!(queue.push(request(channel, &format!("request {index}"))));
+        }
+        assert_eq!(queue.recovery_pending().len(), MAX_PENDING_PER_CHANNEL);
+        assert!(!pending_ids(&queue).contains(&oldest_id));
+        drop(queue);
+        let mut restarted = fixture.restore();
+        assert!(!restarted.push(oldest));
+    }
+    #[test]
+    fn late_successful_steer_ack_after_terminal_turn_requires_fresh_delivery() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "active original")));
+        queue.flush_next().expect("active batch");
+        let steer = request(channel, "late acknowledged steer");
+        let id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &id));
+        queue.mark_complete(channel);
+        assert_eq!(pending_ids(&queue), HashSet::from([id.clone()]));
+        queue.remove_event(channel, &id);
+        assert_eq!(pending_ids(&queue), HashSet::from([id.clone()]));
+        let next = queue.flush_next().expect("late steer actually dispatched");
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].event.id.to_hex(), id);
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+        assert!(queue.recovery_seen.is_empty());
+        drop(queue);
+        assert!(fixture.restore().recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn late_successful_steer_ack_during_retry_wait_stays_pending() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        let original = request(channel, "retry original");
+        let original_id = original.event.id.to_hex();
+        assert!(queue.push(original));
+        let batch = queue.flush_next().expect("active batch");
+        let steer = request(channel, "accepted while original failed");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        assert!(queue.requeue(batch).is_none());
+        queue.mark_complete(channel);
+        queue.remove_event(channel, &steer_id);
+        let expected = HashSet::from([original_id, steer_id]);
+        assert_eq!(pending_ids(&queue), expected);
+        queue.retry_after.remove(&channel);
+        let retry = queue.flush_next().expect("retry batch");
+        assert_eq!(
+            retry
+                .events
+                .iter()
+                .map(|event| event.event.id.to_hex())
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+        assert!(queue.recovery_seen.is_empty());
+    }
+
+    #[test]
+    fn expired_turn_stops_dispatch_and_preserves_every_accepted_request() {
+        for expiry_via_readiness in [false, true] {
+            let fixture = Fixture::new();
+            let channel = Uuid::new_v4();
+            let mut queue = fixture.queue();
+            let original = request(channel, "unknown original outcome");
+            let original_id = original.event.id.to_hex();
+            assert!(queue.push(original));
+            queue.flush_next().expect("original batch");
+            let steer = request(channel, "accepted in expired turn");
+            let steer_id = steer.event.id.to_hex();
+            assert!(queue.push(steer));
+            assert!(queue.mark_native_steer_pending(channel, &steer_id));
+            queue.remove_event(channel, &steer_id);
+            let unrelated = request(channel, "later queued request");
+            let unrelated_id = unrelated.event.id.to_hex();
+            assert!(queue.push(unrelated));
+            let expected = HashSet::from([original_id, steer_id.clone(), unrelated_id]);
+            queue
+                .in_flight_deadlines
+                .insert(channel, Instant::now() - Duration::from_secs(1));
+            if expiry_via_readiness {
+                assert!(!queue.has_flushable_work());
+            }
+            assert!(queue.flush_next().is_none());
+            assert!(queue.check_recovery().is_err());
+            assert!(!queue.has_flushable_work());
+            assert_eq!(pending_ids(&queue), expected);
+            // Neither a late native ACK nor a late result can retire any
+            // request after the recovery health guard has failed.
+            queue.remove_event(channel, &steer_id);
+            queue.mark_complete(channel);
+            assert_eq!(pending_ids(&queue), expected);
+            drop(queue);
+            let mut restored = fixture.restore();
+            let resumed = restored.flush_next().expect("fresh runtime recovery");
+            assert_eq!(
+                resumed
+                    .events
+                    .iter()
+                    .map(|event| event.event.id.to_hex())
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            restored.mark_complete(channel);
+            assert!(restored.recovery_pending().is_empty());
+        }
+    }
+
+    #[test]
+    fn expiry_preserves_unacknowledged_steer_for_a_fresh_runtime() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        let original = request(channel, "expired original");
+        let original_id = original.event.id.to_hex();
+        assert!(queue.push(original));
+        queue.flush_next().expect("original batch");
+        let steer = request(channel, "delivery not yet acknowledged");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        queue
+            .in_flight_deadlines
+            .insert(channel, Instant::now() - Duration::from_secs(1));
+        assert!(queue.flush_next().is_none());
+        assert!(queue.check_recovery().is_err());
+        assert_eq!(
+            pending_ids(&queue),
+            HashSet::from([original_id.clone(), steer_id.clone()])
+        );
+        drop(queue);
+        let mut restored = fixture.restore();
+        let resumed = restored.flush_next().expect("undelivered steer recovered");
+        assert_eq!(
+            resumed
+                .events
+                .iter()
+                .map(|event| event.event.id.to_hex())
+                .collect::<HashSet<_>>(),
+            HashSet::from([original_id, steer_id])
+        );
+        restored.mark_complete(channel);
+        assert!(restored.recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn membership_retirement_releases_seen_bookkeeping_after_expiry() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "expired then revoked")));
+        queue.flush_next().expect("active batch");
+        queue
+            .in_flight_deadlines
+            .insert(channel, Instant::now() - Duration::from_secs(1));
+        assert!(!queue.has_flushable_work());
+        assert!(queue.check_recovery().is_err());
+        assert_eq!(queue.recovery_seen.len(), 1);
+        queue.drain_channel(channel);
+        assert!(queue.recovery_seen.is_empty());
+        assert!(queue.recovery_pending().is_empty());
+        // Explicit retirement does not silently clear the failed guard.
+        assert!(queue.check_recovery().is_err());
+    }
+    #[test]
+    fn accepted_native_steer_payload_is_delivered_to_replacement_session() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        let original = request(channel, "original session will fail");
+        let original_id = original.event.id.to_hex();
+        assert!(queue.push(original));
+        let failed = queue.flush_next().expect("original batch");
+        let steer = request(channel, "accepted steer must reach replacement");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(steer.clone()));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        queue.remove_event(channel, &steer_id);
+        assert_eq!(queue.queued_event_count(&channel), 0);
+        assert!(queue.requeue(failed).is_none());
+        queue.mark_complete(channel);
+        assert!(queue.recovery_in_flight.is_empty());
+        queue.retry_after.remove(&channel);
+        let retry = queue.flush_next().expect("replacement prompt");
+        assert_eq!(retry.events.len(), 2);
+        assert_eq!(
+            retry
+                .events
+                .iter()
+                .map(|event| event.event.id.to_hex())
+                .collect::<HashSet<_>>(),
+            HashSet::from([original_id, steer_id.clone()])
+        );
+        let restored_steer = retry
+            .events
+            .iter()
+            .find(|event| event.event.id.to_hex() == steer_id)
+            .expect("steer payload");
+        assert_eq!(restored_steer.event, steer.event);
+        assert_eq!(restored_steer.prompt_tag, steer.prompt_tag);
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+        assert!(queue.recovery_redispatch.is_empty());
+        assert!(queue.recovery_steer_owner.is_empty());
+    }
+
+    #[test]
+    fn late_retry_ack_cannot_retire_a_steer_outside_the_current_capped_batch() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "original failure")));
+        let failed = queue.flush_next().expect("original batch");
+        let steer = request(channel, "awaiting old session ACK");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        for index in 0..MAX_BATCH_EVENTS {
+            assert!(queue.push(request(channel, &format!("later request {index}"))));
+        }
+        assert!(queue.requeue(failed).is_none());
+        queue.mark_complete(channel);
+        queue.retry_after.remove(&channel);
+        let first = queue.flush_next().expect("capped replacement batch");
+        assert_eq!(first.events.len(), MAX_BATCH_EVENTS);
+        assert!(!first
+            .events
+            .iter()
+            .any(|event| event.event.id.to_hex() == steer_id));
+        // Its old watcher can complete after the fresh session is running.
+        queue.remove_event(channel, &steer_id);
+        assert!(queue
+            .queues
+            .get(&channel)
+            .expect("remainder")
+            .iter()
+            .any(|event| event.event.id.to_hex() == steer_id));
+        queue.mark_complete(channel);
+        assert!(pending_ids(&queue).contains(&steer_id));
+        let second = queue.flush_next().expect("remaining replacement payload");
+        assert!(second
+            .events
+            .iter()
+            .any(|event| event.event.id.to_hex() == steer_id));
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn terminal_old_ack_is_not_owned_by_a_new_request_in_the_same_channel() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        assert!(queue.push(request(channel, "completed original")));
+        queue.flush_next().expect("original");
+        let steer = request(channel, "late terminal ACK");
+        let steer_id = steer.event.id.to_hex();
+        assert!(queue.push(steer));
+        assert!(queue.mark_native_steer_pending(channel, &steer_id));
+        queue.mark_complete(channel);
+        let next = request(channel, "independent subsequent request");
+        let next_id = next.event.id.to_hex();
+        assert!(queue.push(next));
+        queue.flush_next().expect("subsequent turn");
+        queue.remove_event(channel, &steer_id);
+        assert_eq!(
+            pending_ids(&queue),
+            HashSet::from([next_id, steer_id.clone()])
+        );
+        assert!(!queue.recovery_steers.contains_key(&channel));
+        queue.mark_complete(channel);
+        assert_eq!(pending_ids(&queue), HashSet::from([steer_id.clone()]));
+        let late_steer = queue.flush_next().expect("late steer actual payload");
+        assert_eq!(late_steer.events.len(), 1);
+        assert_eq!(late_steer.events[0].event.id.to_hex(), steer_id);
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
+    }
+
+    #[test]
+    fn both_retry_paths_preserve_cancelled_payload_and_framing() {
+        let fixture = Fixture::new();
+        let channel = Uuid::new_v4();
+        let mut queue = fixture.queue();
+        let original = request(channel, "previous request context");
+        let original_id = original.event.id.to_hex();
+        assert!(queue.push(original));
+        let original_batch = queue.flush_next().expect("original");
+        queue.requeue_as_cancelled(original_batch, CancelReason::Steer);
+        queue.mark_complete(channel);
+        let continuation = request(channel, "new steering request");
+        let continuation_id = continuation.event.id.to_hex();
+        assert!(queue.push(continuation));
+        let merged = queue.flush_next().expect("merged");
+        assert_eq!(merged.cancelled_events[0].event.id.to_hex(), original_id);
+        queue.requeue_preserve_timestamps(merged);
+        queue.mark_complete(channel);
+        let unavailable = queue.flush_next().expect("no-agent retry");
+        assert_eq!(unavailable.cancel_reason, Some(CancelReason::Steer));
+        assert_eq!(unavailable.cancelled_events.len(), 1);
+        assert_eq!(
+            unavailable.cancelled_events[0].event.id.to_hex(),
+            original_id
+        );
+        assert_eq!(unavailable.events[0].event.id.to_hex(), continuation_id);
+        assert!(queue.requeue(unavailable).is_none());
+        queue.mark_complete(channel);
+        // Cancelled context must respect the failed turn's backoff too.
+        assert!(!queue.has_flushable_work());
+        assert!(queue.has_undispatched_work());
+        assert!(queue.flush_next().is_none());
+        queue.retry_after.remove(&channel);
+        let retry = queue.flush_next().expect("failed-turn retry");
+        assert_eq!(retry.cancel_reason, Some(CancelReason::Steer));
+        assert_eq!(retry.cancelled_events.len(), 1);
+        assert_eq!(retry.cancelled_events[0].event.id.to_hex(), original_id);
+        assert_eq!(retry.events[0].event.id.to_hex(), continuation_id);
+        queue.mark_complete(channel);
+        assert!(queue.recovery_pending().is_empty());
     }
 }
