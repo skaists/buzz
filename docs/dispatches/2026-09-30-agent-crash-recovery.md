@@ -1,7 +1,8 @@
 # Accepted-request recovery after a Desktop crash — 2026-09-30
 
-Status: tested draft candidate; not deployed. Full CI is blocked at native
-Desktop compilation by missing WSL system libraries.
+Status: implementation committed and pushed; GitHub CI passed on c6c0e0c.
+Ready for review; not deployed. The local WSL prerequisite failure is retained
+as history below; hosted CI completed the native Desktop gates.
 
 ## Incident and pinned source
 
@@ -129,8 +130,9 @@ Hermit activated for Linux package/CI commands. Owned Linux build target:
 
 No installed Desktop/ACP binary was replaced; no production relay, store,
 workflow/B8/WF-08 gate, download lane or other agent runtime was changed.
-Full Tauri compile and real relay/Desktop restart smoke remain required before
-release. Native standalone source harnesses do not replace these gates.
+Hosted CI completed full Tauri compile, tests and Desktop builds. A real
+managed-agent crash/restart smoke with this candidate remains a release check;
+it must use an isolated seat rather than interrupt another seat's live work.
 
 Prescribed just hooks failed: WSL Git could not resolve this Windows-created
 worktree gitfile (fatal: not a git repository; recipe exit 128, command exit 1).
@@ -141,4 +143,26 @@ source corrections were still in progress (exit 1). Final completed attempts
 and the resolved Windows-Git bridge are recorded above. Checks after the
 native Clippy failure (full workspace unit sweep, Tauri tests, frontend builds,
 web/mobile gates) were not reached by just ci. Independent ACP/native-source
-receipts above remain passes; the full app/release gate remains open.
+receipts above remain passes. Hosted CI subsequently completed the app gates
+as recorded below; installation and live crash/restart proof remain open.
+
+## Hosted CI closeout and review decision
+
+Implementation commit: c6c0e0ced5e6be806b7532c867184b16c15b0807.
+GitHub CI run 36763096771 completed successfully on this exact head:
+https://github.com/skaists/buzz/actions/runs/36763096771.
+
+Passed: workspace unit tests and Rust lint; Desktop Core (frontend tests/build,
+Tauri Clippy/check/tests and compiled-flag verification); native Windows Rust;
+macOS Desktop build; all four Desktop smoke shards; Desktop relay and both
+relay-backed integration shards; relay/backend integration; both server
+cross-compiles; security and repository guards. Web and Mobile were skipped
+by the workflow's path rules. This resolves the full native-build uncertainty
+left by this laptop's missing WSL libraries; it does not erase that local
+failed command or prove an installed Desktop survived a real crash.
+
+PR: https://github.com/skaists/buzz/pull/16. Ready for review based on the
+completed source, regression/forced-kill evidence and successful hosted CI.
+No repeat test run is needed to make that decision. This closeout changes
+only this dispatch; the tested implementation source remains unchanged.
+No installation, merge, live restart or production deployment is claimed.
