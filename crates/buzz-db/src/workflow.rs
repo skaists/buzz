@@ -825,6 +825,59 @@ pub async fn create_workflow_run(
     Ok(id)
 }
 
+/// Insert a new workflow run only if the workflow is still runnable, deciding
+/// that in the same statement as the insert. Returns `None` when no run was
+/// created.
+///
+/// For the owner-authority paths (manual trigger, webhook): the caller checks
+/// a workflow snapshot, then awaits authority and persistence work before it
+/// reaches the insert. A disable committed in that window must not produce a
+/// run, so the insert re-reads the row under a share lock and requires that
+/// the `enabled` column is still TRUE, the status is still `active`, and the
+/// stored definition is still the one the caller checked (`definition_hash`).
+/// The lock makes a concurrent, uncommitted write to the row finish first;
+/// the predicates are then judged against what it committed.
+pub async fn create_workflow_run_if_runnable(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    definition_hash: &[u8],
+    trigger_event_id: Option<&[u8]>,
+    trigger_context: Option<&serde_json::Value>,
+) -> Result<Option<Uuid>> {
+    let id = Uuid::new_v4();
+
+    let row = sqlx::query(
+        r#"
+        WITH runnable AS (
+            SELECT id
+            FROM workflows
+            WHERE community_id = $1
+              AND id = $3
+              AND enabled = TRUE
+              AND status = 'active'
+              AND definition_hash = $6
+            FOR SHARE
+        )
+        INSERT INTO workflow_runs
+            (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
+        SELECT $1, $2, runnable.id, 'pending'::run_status, $4, 0, '[]'::jsonb, $5
+        FROM runnable
+        RETURNING id
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(workflow_id)
+    .bind(trigger_event_id)
+    .bind(trigger_context)
+    .bind(definition_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|_| id))
+}
+
 /// Fetch a single workflow run by ID, scoped to its community.
 pub async fn get_workflow_run(
     pool: &PgPool,

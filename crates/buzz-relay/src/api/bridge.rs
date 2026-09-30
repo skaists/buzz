@@ -1920,11 +1920,22 @@ pub async fn workflow_webhook(
         .await
         .map_err(|_| not_found("workflow not found"))?;
 
+    // The gate above judged a snapshot and the authority check was awaited
+    // since. The insert decides again, in its own statement: a workflow
+    // switched off (either switch) or re-saved in between gets no run, and
+    // the same generic 404.
     let run_id = state
         .db
-        .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
+        .create_workflow_run_if_runnable(
+            community_id,
+            id,
+            &workflow.definition_hash,
+            None,
+            trigger_ctx_json.as_ref(),
+        )
         .await
-        .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
+        .map_err(|e| super::internal_error(&format!("db error: {e}")))?
+        .ok_or_else(|| not_found("workflow not found"))?;
 
     // Spawn workflow execution asynchronously.
     let engine = Arc::clone(&state.workflow_engine);

@@ -941,16 +941,27 @@ async fn handle_workflow_trigger(
     let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
 
     let event_id_bytes = event.id.as_bytes().to_vec();
+    // The checks above judged a snapshot, and authority and persistence were
+    // awaited since. The insert decides again, in its own statement: no run
+    // if the workflow was switched off (either switch) or its definition was
+    // re-saved in between. Returning here drops `tx`, so the command event is
+    // not stored either.
     let run_id = state
         .db
-        .create_workflow_run(
+        .create_workflow_run_if_runnable(
             community_id,
             workflow_id,
+            &workflow.definition_hash,
             Some(&event_id_bytes),
             trigger_ctx_json.as_ref(),
         )
         .await
-        .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?;
+        .map_err(|e| IngestError::Internal(format!("error: db create_workflow_run: {e}")))?
+        .ok_or_else(|| {
+            IngestError::Rejected(
+                "forbidden: workflow was disabled or changed before the run was created".into(),
+            )
+        })?;
 
     // Commit: event + run creation succeeded atomically.
     tx.commit()
@@ -1417,19 +1428,33 @@ mod tests {
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
     const DISABLED: &str = "forbidden: workflow is disabled or inactive";
+    const DISABLED_BEFORE_INSERT: &str =
+        "forbidden: workflow was disabled or changed before the run was created";
+
+    /// Postgres keeps 63 bytes of an application name.
+    fn session_name(host: &str) -> String {
+        host.chars().take(63).collect()
+    }
+
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_string())
+    }
 
     /// Real `AppState` + tenant for a fresh community on `host`. Mirrors
     /// `handlers::relay_admin::tests::workspace_profile_test_state`.
     async fn trigger_gate_state(host: &str) -> (Arc<AppState>, TenantContext) {
         let mut config = crate::config::Config::from_env().expect("config from env");
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
+        let database_url = test_database_url();
         config.database_url = database_url.clone();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = format!("wss://{host}");
 
-        let pool = sqlx::PgPool::connect(&database_url)
+        // The pool carries the fixture's host as its application name, so a
+        // test can tell its own sessions apart in pg_stat_activity.
+        let options: sqlx::postgres::PgConnectOptions = database_url.parse().expect("database url");
+        let pool = sqlx::PgPool::connect_with(options.application_name(&session_name(host)))
             .await
             .expect("requires reachable Postgres");
         let db = buzz_db::Db::from_pool(pool.clone());
@@ -1611,6 +1636,20 @@ mod tests {
             }
         }
 
+        /// A second handle on the same workflow, so one task can trigger
+        /// while the test keeps saving.
+        fn twin(&self) -> Self {
+            Self {
+                state: Arc::clone(&self.state),
+                tenant: self.tenant.clone(),
+                host: self.host.clone(),
+                owner: self.owner.clone(),
+                channel_id: self.channel_id,
+                workflow_id: self.workflow_id,
+                clock: self.clock,
+            }
+        }
+
         async fn runs(&self) -> usize {
             self.state
                 .db
@@ -1718,5 +1757,139 @@ mod tests {
         assert_eq!(refusal(f.trigger().await), DISABLED);
         assert_eq!(f.webhook().await, StatusCode::NOT_FOUND);
         assert_eq!(f.runs().await, 1, "a refused trigger must not create a run");
+    }
+
+    /// Which switch is thrown while the run insert is held.
+    #[derive(Clone, Copy)]
+    enum SwitchOff {
+        /// The author re-saves the definition with `enabled: false`.
+        Definition,
+        /// Owner removal clears the `workflows.enabled` column.
+        Column,
+    }
+
+    /// What the held trigger answered once the insert was let go.
+    enum Held {
+        Manual(Result<IngestResult, IngestError>),
+        Webhook(StatusCode),
+    }
+
+    /// A disable committed after the gate's snapshot check but before the run
+    /// insert must leave no run. The ordering is forced with a real lock, not
+    /// a sleep: `workflow_runs` is held ACCESS EXCLUSIVE, the real trigger is
+    /// started and observed waiting on that lock at its run insert, the
+    /// workflow is switched off and that write is confirmed stored, and only
+    /// then is the lock released. The wait is read for this fixture's own
+    /// sessions only, since other tests insert runs into the same table.
+    /// (Arm from buzz-build's B8 review.)
+    async fn disable_while_the_run_insert_is_held(manual: bool, switch: SwitchOff, label: &str) {
+        let mut f = Fixture::new(label).await;
+        f.save(true).await;
+
+        let pool = sqlx::PgPool::connect(&test_database_url())
+            .await
+            .expect("requires reachable Postgres");
+        let mut lock = pool.begin().await.expect("lock transaction");
+        sqlx::query("LOCK TABLE workflow_runs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("hold run inserts");
+
+        let mut runner = f.twin();
+        let pending = tokio::spawn(async move {
+            if manual {
+                Held::Manual(runner.trigger().await)
+            } else {
+                Held::Webhook(runner.webhook().await)
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT count(*) FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND application_name = $1
+                      AND wait_event_type = 'Lock'
+                      AND query LIKE '%INSERT INTO workflow_runs%'
+                    "#,
+                )
+                .bind(session_name(&f.host))
+                .fetch_one(&pool)
+                .await
+                .expect("read pg_stat_activity");
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the trigger must pass its gates and reach the run insert");
+
+        match switch {
+            SwitchOff::Definition => {
+                // `save` asserts the stored definition now carries `false`.
+                tokio::time::timeout(std::time::Duration::from_secs(20), f.save(false))
+                    .await
+                    .expect("the disabling save must finish while the insert is held");
+            }
+            SwitchOff::Column => {
+                let owner_pk = f.owner.public_key().to_bytes().to_vec();
+                let disabled = f
+                    .state
+                    .db
+                    .disable_workflows_for_owner_in_channel(
+                        f.tenant.community(),
+                        f.channel_id,
+                        &owner_pk,
+                    )
+                    .await
+                    .expect("owner-removal disable");
+                assert_eq!(disabled, 1, "the removal write must hit this workflow");
+                assert!(!f.workflow().await.enabled, "the column must read FALSE");
+            }
+        }
+
+        lock.commit().await.expect("release run inserts");
+        let held = tokio::time::timeout(std::time::Duration::from_secs(20), pending)
+            .await
+            .expect("the held trigger must finish")
+            .expect("trigger task");
+
+        assert_eq!(
+            f.runs().await,
+            0,
+            "a disable committed before the run insert must leave no run"
+        );
+        match held {
+            Held::Manual(result) => assert_eq!(refusal(result), DISABLED_BEFORE_INSERT),
+            Held::Webhook(status) => assert_eq!(status, StatusCode::NOT_FOUND),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manual_trigger_makes_no_run_when_the_definition_is_disabled_before_the_insert() {
+        disable_while_the_run_insert_is_held(true, SwitchOff::Definition, "race-manual-def").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_makes_no_run_when_the_definition_is_disabled_before_the_insert() {
+        disable_while_the_run_insert_is_held(false, SwitchOff::Definition, "race-webhook-def")
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn manual_trigger_makes_no_run_when_the_owner_is_revoked_before_the_insert() {
+        disable_while_the_run_insert_is_held(true, SwitchOff::Column, "race-manual-col").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_makes_no_run_when_the_owner_is_revoked_before_the_insert() {
+        disable_while_the_run_insert_is_held(false, SwitchOff::Column, "race-webhook-col").await;
     }
 }
