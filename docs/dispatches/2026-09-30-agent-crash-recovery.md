@@ -166,3 +166,54 @@ completed source, regression/forced-kill evidence and successful hosted CI.
 No repeat test run is needed to make that decision. This closeout changes
 only this dispatch; the tested implementation source remains unchanged.
 No installation, merge, live restart or production deployment is claimed.
+
+## Real harness process follow-through
+
+The continuation added `crates/buzz-acp/tests/recovery_process.rs`, which
+launches the shipped `buzz-acp` binary and a deterministic Python ACP adapter
+against an isolated loopback HTTP/WebSocket protocol fixture. It uses fresh
+generated identities, a fresh journal, and an owned process group. No live
+relay, Desktop, managed seat, or shared application data participates.
+
+The first run failed: 0 passed, 1 failed, exit 101, at the 25-second wait for
+durable completion. Logs showed startup successfully reading the accepted
+request but not dispatching it. Source inspection identified the 30-second
+maintenance sweep as the next dispatch opportunity on an otherwise quiet
+relay. Startup now dispatches restored requests immediately when the eager
+pool is ready; lazy pools retain their existing wake path.
+
+The corrected real-process test passed: 1 passed, 0 failed, 0 ignored, 5.46s,
+exit 0. Four actual harness generations exercise:
+
+- A signed request reaches ACP and remains pending while its adapter holds
+  the turn; SIGKILL destroys the entire owned harness/adapter process group.
+- Restart with `respond-to=nobody` sends no prompt and preserves the request.
+- Restart with permission restored receives the journal request without any
+  relay replay, includes recovery guidance, and durably retires its event ID.
+- A subsequent relay replay of that completed signed event sends no ACP
+  prompt and leaves pending state empty.
+
+Command: `cargo test --offline -p buzz-acp --test recovery_process -- --nocapture`.
+Owned target: `/home/travi/codex-crash-recovery-target`.
+Log: `/home/travi/codex-recovery-process-20260930.log`.
+Scoped Clippy command: `cargo clippy --offline -p buzz-acp --test recovery_process
+-- -D warnings`; exit 0. Log:
+`/home/travi/codex-recovery-process-clippy-20260930.log`.
+
+Hermit was activated; its Windows-checkout cargo/cargo-fmt proxy initially
+failed with `hermit: error: expected one of ...`. The installed WSL Rustup
+tools were then placed first on PATH. An edition-2024 direct formatting
+attempt changed unrelated formatting; those owned changes were restored,
+and the new test was formatted with the workspace's edition 2021.
+No unrelated source formatting is included.
+
+This establishes actual Linux harness restart behavior with deterministic
+protocol peers. The test is Unix-only and requires Python 3. It does not
+establish installed Windows Desktop restart behavior or provider-side tool
+reconciliation. Earlier native Windows journal/queue receipts remain distinct.
+
+The dispatch-only head's Docker public-push-gateway jobs failed during registry
+cache export: `denied: permission_denied: The requested installation does not
+exist.` Its unchanged workflow points cache writes at `ghcr.io/block/...`.
+This is a registry publication failure, not an ACP compile/test failure;
+no registry access or production deployment change is included in this repair.

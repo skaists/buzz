@@ -2443,6 +2443,17 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
+    // Startup recovery can be the only work on a quiet relay. Do not wait for
+    // unrelated traffic or the 30-second maintenance sweep to dispatch it.
+    // Lazy pools take their existing wake path at the top of the loop below.
+    if pool_ready {
+        for (channel_id, thread_tags) in
+            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+        {
+            typing_channels.insert(channel_id, thread_tags);
+        }
+    }
+
     loop {
         if let Err(error) = queue.check_recovery() {
             tracing::error!(%error, "durable recovery failed; shutting down without dispatching more work");
