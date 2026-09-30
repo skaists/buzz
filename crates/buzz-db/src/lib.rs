@@ -4052,6 +4052,28 @@ impl Db {
         .await
     }
 
+    /// Create a new workflow run only if the workflow is still enabled, active
+    /// and unchanged since the caller checked it. `None` means no run.
+    #[datastore_span(name = "create_workflow_run_if_runnable", system = "postgresql")]
+    pub async fn create_workflow_run_if_runnable(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        definition_hash: &[u8],
+        trigger_event_id: Option<&[u8]>,
+        trigger_context: Option<&serde_json::Value>,
+    ) -> Result<Option<Uuid>> {
+        workflow::create_workflow_run_if_runnable(
+            &self.pool,
+            community_id,
+            workflow_id,
+            definition_hash,
+            trigger_event_id,
+            trigger_context,
+        )
+        .await
+    }
+
     /// Fetch a single workflow run, scoped to its community.
     #[datastore_span(name = "get_workflow_run", system = "postgresql")]
     pub async fn get_workflow_run(
