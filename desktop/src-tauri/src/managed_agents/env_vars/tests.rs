@@ -505,3 +505,12 @@ fn deploy_model_precedence_none_when_both_absent() {
     let effective = persona_model.clone().or(record_model.clone());
     assert_eq!(effective, None);
 }
+
+#[test]
+fn recovery_path_is_reserved_at_save_and_runtime_boundaries() {
+    let overrides = map(&[("BUZZ_ACP_RECOVERY_PATH", "foreign-journal.json")]);
+    assert!(validate_user_env_keys(&overrides).is_err());
+    assert!(is_reserved_env_key("buzz_acp_recovery_path"));
+    assert!(merged_user_env(&overrides, &BTreeMap::new()).is_empty());
+    assert!(merged_user_env(&BTreeMap::new(), &overrides).is_empty());
+}

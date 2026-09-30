@@ -58,6 +58,9 @@ hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Exclusive recovery-journal writer lock
+fs2 = "0.4"
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }

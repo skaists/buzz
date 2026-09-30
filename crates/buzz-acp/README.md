@@ -11,6 +11,34 @@ Buzz Relay ──WS──→ buzz-acp ──stdio──→ Your Agent
 
 Supports any agent that speaks [ACP](https://agentclientprotocol.com/) over stdio: **goose**, **codex** (via [codex-acp](https://github.com/agentclientprotocol/codex-acp)), and **claude code** (via [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp)).
 
+## Crash recovery for managed agents
+
+Desktop gives each locally managed agent a request journal scoped to its
+identity and canonical relay. Accepted requests are synced before dispatch. On the
+next launch, unfinished requests are checked against current memberships,
+author policy and subscription rules, then queued automatically. Completed or
+deliberately discarded requests are retired; a bounded terminal history also
+suppresses recent relay replays. A live second writer is refused, and a journal
+write error stops new acceptance and dispatch instead of proceeding silently.
+An expired turn with no terminal result also stops journal-enabled dispatch;
+its unfinished requests are retained for a fresh runtime to recover.
+
+This recovers accepted work; it does not keep local agents running while
+Desktop is closed, restore an adapter's private session transcript, or capture
+messages that arrived while the harness was offline. Recovery is not an
+exactly-once guarantee for tool side effects: an action can succeed before the
+turn's terminal record is saved. Recovered prompts explicitly require checking
+workspace and relay receipts before repeating actions.
+
+Standalone harnesses can opt in with `BUZZ_ACP_RECOVERY_PATH` set to a dedicated
+journal file. Do not share a journal between identities or communities. The
+journal contains signed inbound requests and event IDs. It does not separately
+store the configured private key or adapter transcript; original inbound
+request content is persisted, so protect the directory as local workspace data.
+Completed-ID retention is bounded to 4096. Existing queue policies still apply,
+including Drop mode, explicit cancellation, retry exhaustion and queue overflow. Desktop owns this
+environment setting and rejects custom overrides.
+
 ## Prerequisites
 
 - A running Buzz relay (`just relay` starts Docker services automatically, or use a hosted instance)
@@ -100,7 +128,8 @@ treats both Claude ACP command names as the same zero-arg runtime.
 
 ## Configuration
 
-All configuration is via environment variables (or CLI flags — every env var has a matching flag).
+Configuration uses environment variables and CLI flags. The recovery journal
+path, `BUZZ_ACP_RECOVERY_PATH`, is environment-only.
 
 ### Core
 
@@ -259,7 +288,7 @@ Forum event kinds:
 
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.
 
-> **Note:** On startup, the harness replays all unprocessed @mentions since the last run. Expect a burst of activity if there are stale events in the channel.
+> **Note:** With a recovery journal enabled, startup requeues accepted unfinished requests after checking current permissions and subscription rules. Without one, relay startup replay covers only the short subscription clock-skew window; older interrupted work is not retained.
 
 ## Bring Your Own Harness (BYOH)
 

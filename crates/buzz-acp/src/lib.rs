@@ -8,6 +8,7 @@ mod observer;
 mod pool;
 mod pool_lifecycle;
 mod queue;
+mod recovery;
 mod relay;
 mod setup_mode;
 mod usage;
@@ -284,6 +285,55 @@ pub(crate) async fn is_dm_channel(
             true
         }
     }
+}
+
+/// Re-enqueue unfinished requests only under the current authorization policy.
+/// Ineligible or temporarily unresolvable requests remain in the locked journal.
+async fn restore_pending_requests(
+    queue: &mut EventQueue,
+    config: &Config,
+    ctx: &PromptContext,
+    rules: &[SubscriptionRule],
+    subscribed_channel_ids: &HashSet<Uuid>,
+    owner_cache: &OwnerCache,
+) -> anyhow::Result<()> {
+    let pubkey_hex = config.keys.public_key().to_hex();
+    // A restored request carries its original signature, not fresh authority.
+    // Re-check current membership, author policy and subscription rules. Leave
+    // ineligible records durable: an unavailable metadata lookup is not a
+    // terminal denial and must not silently erase accepted work.
+    for entry in queue.recovery_pending() {
+        if !subscribed_channel_ids.contains(&entry.channel_id)
+            || (config.ignore_self && entry.event.pubkey.to_hex() == pubkey_hex)
+        {
+            continue;
+        }
+        let is_dm = is_dm_channel(entry.channel_id, &ctx.channel_info).await;
+        if !author_allowed(
+            &config.respond_to,
+            &config.respond_to_allowlist,
+            &entry.event.pubkey.to_hex(),
+            is_dm,
+            owner_cache,
+            &ctx.rest_client,
+        )
+        .await
+        {
+            continue;
+        }
+        if let Some(matched) =
+            filter::match_event(&entry.event, entry.channel_id, rules, &pubkey_hex).await
+        {
+            tracing::info!(channel_id = %entry.channel_id, event_id = %entry.event.id, "recovering unfinished request after harness restart");
+            queue.push(QueuedEvent {
+                channel_id: entry.channel_id, event: entry.event,
+                received_at: std::time::Instant::now(),
+                prompt_tag: format!("{}; recovered after runtime interruption: inspect current workspace and relay receipts before continuing; prior actions may already have succeeded, so do not blindly repeat them", matched.prompt_tag),
+            });
+            queue.check_recovery()?;
+        }
+    }
+    Ok(())
 }
 
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
@@ -1947,6 +1997,21 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Validate and exclusively lock recovery state before spawning any eager
+    // adapter. A corrupt or already-owned journal must fail without starting
+    // an LLM child or announcing readiness.
+    let pubkey_hex = config.keys.public_key().to_hex();
+    let dedup_mode = config.dedup_mode;
+    let mut queue =
+        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    if let Some(path) = std::env::var_os("BUZZ_ACP_RECOVERY_PATH").filter(|path| !path.is_empty()) {
+        queue = queue.with_recovery(recovery::RecoveryJournal::open(
+            std::path::Path::new(&path),
+            &config.relay_url,
+            &pubkey_hex,
+        )?);
+    }
+
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
@@ -1964,8 +2029,6 @@ async fn tokio_main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -2134,9 +2197,6 @@ async fn tokio_main() -> Result<()> {
     }
 
     let runtime_start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
-    let dedup_mode = config.dedup_mode;
-    let mut queue =
-        EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -2196,6 +2256,15 @@ async fn tokio_main() -> Result<()> {
         relay_url: config.relay_url.clone(),
     });
 
+    restore_pending_requests(
+        &mut queue,
+        &config,
+        &ctx,
+        &rules,
+        &subscribed_channel_ids,
+        &owner_cache,
+    )
+    .await?;
     if !config.memory_enabled {
         tracing::info!(
             target: "engram::core",
@@ -2375,6 +2444,10 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        if let Err(error) = queue.check_recovery() {
+            tracing::error!(%error, "durable recovery failed; shutting down without dispatching more work");
+            break;
+        }
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3426,6 +3499,7 @@ async fn tokio_main() -> Result<()> {
                 }
                 maybe_result = rx_ref.recv() => {
                     if let Some(mut pr) = maybe_result {
+                        settle_shutdown_recovery(&mut queue, &pr);
                         let idx = pr.agent.index;
                         pr.agent.acp.shutdown().await;
                         tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
@@ -3443,6 +3517,7 @@ async fn tokio_main() -> Result<()> {
     // Drain any remaining results that arrived after join_set drained but
     // before tasks were aborted.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
+        settle_shutdown_recovery(&mut queue, &pr);
         let idx = pr.agent.index;
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
@@ -3501,9 +3576,374 @@ async fn tokio_main() -> Result<()> {
     relay.shutdown().await;
 
     tracing::info!("buzz-acp stopped");
-    Ok(())
+    queue.check_recovery()
 }
 
+/// Successful results drained during graceful shutdown are terminal too.
+/// Failed results remain journaled even in Drop mode, where a missing retry
+/// batch does not imply success. Deliberate control-signal discards retire the
+/// batch just as in the normal result handler.
+fn settle_shutdown_recovery(queue: &mut EventQueue, result: &PromptResult) {
+    if shutdown_result_is_terminal(&result.outcome, result.batch.is_some()) {
+        if let PromptSource::Channel(channel) = result.source {
+            queue.mark_complete(channel);
+        }
+    }
+}
+
+fn shutdown_result_is_terminal(outcome: &PromptOutcome, has_retry_batch: bool) -> bool {
+    match outcome {
+        PromptOutcome::Ok(_) => true,
+        PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_) => !has_retry_batch,
+        PromptOutcome::Error(_) | PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod recovery_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_retires_known_completion_and_explicit_discard_only() {
+        assert!(shutdown_result_is_terminal(
+            &PromptOutcome::Ok(acp::StopReason::EndTurn),
+            false
+        ));
+        // In Queue mode, Cancel/Rotate discards; Steer/Interrupt keeps a retry batch.
+        assert!(shutdown_result_is_terminal(
+            &PromptOutcome::Cancelled,
+            false
+        ));
+        assert!(!shutdown_result_is_terminal(
+            &PromptOutcome::Cancelled,
+            true
+        ));
+        assert!(shutdown_result_is_terminal(
+            &PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            false
+        ));
+        assert!(!shutdown_result_is_terminal(
+            &PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            true
+        ));
+        // Drop mode omits retry payloads on every failure; those originals
+        // remain unfinished and must survive shutdown.
+        for has_retry_batch in [false, true] {
+            assert!(!shutdown_result_is_terminal(
+                &PromptOutcome::AgentExited,
+                has_retry_batch
+            ));
+            assert!(!shutdown_result_is_terminal(
+                &PromptOutcome::Timeout(pool::TimeoutKind::Idle),
+                has_retry_batch
+            ));
+            assert!(!shutdown_result_is_terminal(
+                &PromptOutcome::Error(acp::AcpError::Protocol("interrupted".into())),
+                has_retry_batch
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_authorization_tests {
+    use super::*;
+    use nostr::{Event, EventBuilder, Keys, Kind, Tag};
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("buzz-replay-auth-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create owned test directory");
+            Self(path)
+        }
+
+        fn journal_path(&self) -> PathBuf {
+            self.0.join("requests.json")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        config: Config,
+        ctx: PromptContext,
+        rules: Vec<SubscriptionRule>,
+        subscribed: HashSet<Uuid>,
+        owner_cache: OwnerCache,
+        channel_id: Uuid,
+        event: Event,
+        queue: EventQueue,
+        receipt_bytes: Vec<u8>,
+        // Drops after the queue, releasing its writer lock before cleanup.
+        directory: TestDirectory,
+    }
+
+    impl Fixture {
+        fn new(
+            owner_is_author: bool,
+            mentioned: bool,
+            channel_type: Option<&str>,
+            respond_to: RespondTo,
+        ) -> Self {
+            let owner = Keys::generate();
+            let external = Keys::generate();
+            let keys = Keys::generate();
+            let config = Config {
+                keys: keys.clone(),
+                relay_url: "wss://relay.example".into(),
+                agent_command: "unused-test-agent".into(),
+                agent_args: vec![],
+                mcp_command: "".into(),
+                idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
+                max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+                agents: 1,
+                heartbeat_interval_secs: 0,
+                turn_liveness_secs: 0,
+                heartbeat_prompt: None,
+                system_prompt: None,
+                team_instructions: None,
+                initial_message: None,
+                subscribe_mode: config::SubscribeMode::Mentions,
+                dedup_mode: config::DedupMode::Queue,
+                multiple_event_handling: config::MultipleEventHandling::Queue,
+                ignore_self: true,
+                kinds_override: None,
+                channels_override: None,
+                no_mention_filter: false,
+                config_path: PathBuf::from("unused-test-config"),
+                context_message_limit: 0,
+                max_turns_per_session: 0,
+                presence_enabled: false,
+                typing_enabled: false,
+                memory_enabled: false,
+                model: None,
+                session_title: None,
+                permission_mode: config::PermissionMode::Default,
+                respond_to,
+                respond_to_allowlist: HashSet::new(),
+                allowed_respond_to: vec![],
+                persona_env_vars: vec![],
+                has_generated_codex_config: false,
+                relay_observer: false,
+                exit_after_inactivity_secs: 0,
+                lazy_pool: true,
+                idle_pool_sleep_secs: 0,
+                agent_owner: Some(owner.public_key().to_hex()),
+                no_base_prompt: true,
+                base_prompt_content: None,
+            };
+            // Cached streams need no HTTP. Unknown metadata fails URL parsing
+            // before any network call, exercising the real fail-closed path.
+            let rest = relay::RestClient {
+                http: reqwest::Client::new(),
+                base_url: "invalid-url".into(),
+                keys: keys.clone(),
+                auth_tag_json: None,
+            };
+            let channel_id = Uuid::new_v4();
+            let startup = channel_type.map_or_else(HashMap::new, |channel_type| {
+                HashMap::from([(
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "recovery-test".into(),
+                        channel_type: channel_type.into(),
+                        description: None,
+                    },
+                )])
+            });
+            let ctx = PromptContext {
+                mcp_servers: vec![],
+                initial_message: None,
+                idle_timeout: Duration::from_secs(config.idle_timeout_secs),
+                max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
+                turn_liveness_interval: Duration::ZERO,
+                dedup_mode: config::DedupMode::Queue,
+                system_prompt: None,
+                session_title: None,
+                team_instructions: None,
+                heartbeat_prompt: None,
+                base_prompt: None,
+                cwd: ".".into(),
+                rest_client: rest.clone(),
+                channel_info: pool::ChannelInfoResolver::new(startup, rest),
+                context_message_limit: 0,
+                max_turns_per_session: 0,
+                permission_mode: config::PermissionMode::Default,
+                agent_keys: keys.clone(),
+                agent_owner_pubkey: Some(owner.public_key()),
+                memory_enabled: false,
+                harness_name: "unused-test-agent".into(),
+                relay_url: config.relay_url.clone(),
+            };
+            let owner_cache = OwnerCache::new(config.agent_owner.clone());
+            owner_cache.cache_sibling(external.public_key().to_hex(), false);
+            let mut tags =
+                vec![Tag::parse(["h".to_owned(), channel_id.to_string()]).expect("channel tag")];
+            if mentioned {
+                tags.push(
+                    Tag::parse(["p".to_owned(), keys.public_key().to_hex()]).expect("mention tag"),
+                );
+            }
+            let author = if owner_is_author { &owner } else { &external };
+            let event = EventBuilder::new(
+                Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "continue interrupted work",
+            )
+            .tags(tags)
+            .sign_with_keys(author)
+            .expect("signed recovered request");
+            let directory = TestDirectory::new();
+            let path = directory.journal_path();
+            let pubkey = keys.public_key().to_hex();
+            {
+                let mut journal =
+                    recovery::RecoveryJournal::open(&path, &config.relay_url, &pubkey)
+                        .expect("open original writer");
+                assert!(journal
+                    .record(channel_id, &event, "old-rule")
+                    .expect("persist original request"));
+            }
+            // The new queue and new journal lock represent a fresh harness.
+            let journal = recovery::RecoveryJournal::open(&path, &config.relay_url, &pubkey)
+                .expect("reopen after crash");
+            let queue = EventQueue::new(config::DedupMode::Queue).with_recovery(journal);
+            let receipt_bytes = fs::read(&path).expect("original receipt bytes");
+            Self {
+                config,
+                ctx,
+                rules: vec![SubscriptionRule {
+                    name: "current-mention".into(),
+                    require_mention: true,
+                    kinds: vec![KIND_STREAM_MESSAGE],
+                    ..Default::default()
+                }],
+                subscribed: HashSet::from([channel_id]),
+                owner_cache,
+                channel_id,
+                event,
+                queue,
+                receipt_bytes,
+                directory,
+            }
+        }
+
+        async fn restore(&mut self) {
+            restore_pending_requests(
+                &mut self.queue,
+                &self.config,
+                &self.ctx,
+                &self.rules,
+                &self.subscribed,
+                &self.owner_cache,
+            )
+            .await
+            .expect("authorized replay check");
+        }
+
+        fn assert_denied_request_remains_durable(self) {
+            assert_eq!(self.queue.queued_event_count(&self.channel_id), 0);
+            assert_eq!(self.queue.recovery_pending().len(), 1);
+            let path = self.directory.journal_path();
+            assert_eq!(
+                fs::read(&path).expect("unchanged receipt"),
+                self.receipt_bytes
+            );
+            drop(self.queue);
+            let reopened = recovery::RecoveryJournal::open(
+                &path,
+                &self.config.relay_url,
+                &self.config.keys.public_key().to_hex(),
+            )
+            .expect("reopen retained denied request");
+            assert_eq!(reopened.pending().len(), 1);
+            assert_eq!(reopened.pending()[0].event.id, self.event.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_a_request_from_a_removed_channel_without_dispatch() {
+        let mut fixture = Fixture::new(true, true, Some("stream"), RespondTo::OwnerOnly);
+        fixture.subscribed.clear();
+        fixture.restore().await;
+        fixture.assert_denied_request_remains_durable();
+    }
+
+    #[tokio::test]
+    async fn replay_rechecks_owner_only_author_policy() {
+        let mut fixture = Fixture::new(false, true, Some("stream"), RespondTo::OwnerOnly);
+        fixture.restore().await;
+        fixture.assert_denied_request_remains_durable();
+    }
+
+    #[tokio::test]
+    async fn replay_rechecks_current_mention_rule() {
+        let mut fixture = Fixture::new(true, false, Some("stream"), RespondTo::OwnerOnly);
+        fixture.restore().await;
+        fixture.assert_denied_request_remains_durable();
+    }
+
+    #[tokio::test]
+    async fn replay_admits_the_current_owner_and_adds_reconciliation_guidance() {
+        let mut fixture = Fixture::new(true, true, Some("stream"), RespondTo::OwnerOnly);
+        fixture.restore().await;
+        assert_eq!(fixture.queue.queued_event_count(&fixture.channel_id), 1);
+        let batch = fixture.queue.flush_next().expect("recovered batch");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id, fixture.event.id);
+        assert!(batch.events[0].prompt_tag.starts_with("current-mention;"));
+        assert!(batch.events[0]
+            .prompt_tag
+            .contains("prior actions may already have succeeded"));
+        assert_eq!(
+            fixture.queue.recovery_pending().len(),
+            1,
+            "dispatch alone is not completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_deduplicates_startup_and_live_delivery_of_the_same_request() {
+        let mut fixture = Fixture::new(true, true, Some("stream"), RespondTo::OwnerOnly);
+        fixture.restore().await;
+        fixture.restore().await;
+        assert!(!fixture.queue.push(QueuedEvent {
+            channel_id: fixture.channel_id,
+            event: fixture.event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "live-mention".into(),
+        }));
+        assert_eq!(fixture.queue.queued_event_count(&fixture.channel_id), 1);
+        let batch = fixture.queue.flush_next().expect("one recovered batch");
+        assert_eq!(batch.events.len(), 1);
+        fixture.queue.mark_complete(fixture.channel_id);
+        fixture
+            .queue
+            .check_recovery()
+            .expect("terminal receipt written");
+        assert!(fixture.queue.recovery_pending().is_empty());
+        assert!(!fixture.queue.push(QueuedEvent {
+            channel_id: fixture.channel_id,
+            event: fixture.event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "completed-live-replay".into(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_unknown_metadata_and_fails_closed_for_external_authors() {
+        let mut fixture = Fixture::new(false, true, None, RespondTo::Anyone);
+        fixture.restore().await;
+        fixture.assert_denied_request_remains_durable();
+    }
+}
 #[derive(PartialEq)]
 enum LoopAction {
     Continue,
