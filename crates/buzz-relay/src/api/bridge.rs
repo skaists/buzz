@@ -1902,12 +1902,7 @@ pub async fn workflow_webhook(
     // membership (and role, for exfiltration-capable definitions). Fail
     // closed with the same generic 404 as the lookups above so a
     // revoked-owner workflow is indistinguishable from a nonexistent one.
-    // Both switches count: the column (cleared by owner removal) and the
-    // definition's own `enabled`, which the author sets and re-saves.
-    if !workflow.enabled
-        || !def.enabled
-        || workflow.status != buzz_db::workflow::WorkflowStatus::Active
-    {
+    if !workflow.enabled || workflow.status != buzz_db::workflow::WorkflowStatus::Active {
         return Err(not_found("workflow not found"));
     }
     let Some(wf_channel_id) = workflow.channel_id else {

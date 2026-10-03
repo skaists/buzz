@@ -880,16 +880,6 @@ async fn handle_workflow_trigger(
     }
     let def: buzz_workflow::WorkflowDef = serde_json::from_value(workflow.definition.clone())
         .map_err(|e| IngestError::Internal(format!("error: corrupt workflow definition: {e}")))?;
-    // The column above is the revocation switch (owner removal clears it);
-    // `upsert_workflow` writes TRUE on create and never touches it on update.
-    // The definition's own `enabled: false` is the author's switch, so it must
-    // stop a manual trigger too — the automatic event and cron paths already
-    // honor it.
-    if !def.enabled {
-        return Err(IngestError::Rejected(
-            "forbidden: workflow is disabled or inactive".into(),
-        ));
-    }
     let Some(wf_channel_id) = workflow.channel_id else {
         // No channel scope means no channel authority to verify — fail closed.
         return Err(IngestError::Rejected(
