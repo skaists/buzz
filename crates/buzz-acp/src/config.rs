@@ -13,6 +13,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::acp::AgentEnvPolicy;
 use crate::filter::SubscriptionRule;
 
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
@@ -489,6 +490,25 @@ pub struct CliArgs {
     /// Requires `--lazy-pool`; ignored otherwise. 0 disables idle re-sleep.
     #[arg(long, env = "BUZZ_ACP_IDLE_POOL_SLEEP", default_value_t = 0)]
     pub idle_pool_sleep: u64,
+
+    /// Start agent subprocesses from an empty environment instead of
+    /// inheriting the harness's. Only process essentials, the agent's own Buzz
+    /// identity, and `--agent-env-passthrough` names are forwarded. This limits
+    /// the environment only; it is not a filesystem or network sandbox.
+    #[arg(long, env = "BUZZ_ACP_AGENT_ENV_ISOLATION", default_value_t = false)]
+    pub agent_env_isolation: bool,
+
+    /// Comma-separated parent env var names to forward to isolated agents
+    /// (e.g. `ANTHROPIC_API_KEY,HTTPS_PROXY`). Requires `--agent-env-isolation`.
+    #[arg(long, env = "BUZZ_ACP_AGENT_ENV_PASSTHROUGH", value_delimiter = ',')]
+    pub agent_env_passthrough: Vec<String>,
+
+    /// Absolute path of a credential-free `CARGO_HOME` for isolated agents, so
+    /// agent cargo invocations never pick up the host's registry tokens.
+    /// Created if missing; startup fails if it holds Cargo credentials.
+    /// Requires `--agent-env-isolation`.
+    #[arg(long, env = "BUZZ_ACP_AGENT_CARGO_HOME")]
+    pub agent_cargo_home: Option<PathBuf>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -579,6 +599,8 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Which harness env vars agent subprocesses inherit.
+    pub agent_env_policy: AgentEnvPolicy,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -838,6 +860,52 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+/// Validate the agent-env flags into an [`AgentEnvPolicy`].
+fn agent_env_policy_from_args(
+    isolation: bool,
+    passthrough: Vec<String>,
+    cargo_home: Option<PathBuf>,
+) -> Result<AgentEnvPolicy, ConfigError> {
+    let passthrough: Vec<String> = passthrough
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !isolation {
+        // Fail loud: these flags silently doing nothing would read as a
+        // narrower agent environment than the one actually running.
+        if !passthrough.is_empty() || cargo_home.is_some() {
+            return Err(ConfigError::ConfigFile(
+                "--agent-env-passthrough and --agent-cargo-home require --agent-env-isolation"
+                    .into(),
+            ));
+        }
+        return Ok(AgentEnvPolicy::Inherit);
+    }
+    if let Some(dir) = &cargo_home {
+        if !dir.is_absolute() {
+            return Err(ConfigError::ConfigFile(format!(
+                "--agent-cargo-home must be an absolute path: {}",
+                dir.display()
+            )));
+        }
+        std::fs::create_dir_all(dir)?;
+        // Cargo reads registry tokens from either file name.
+        for name in ["credentials.toml", "credentials"] {
+            if dir.join(name).exists() {
+                return Err(ConfigError::ConfigFile(format!(
+                    "--agent-cargo-home {} contains {name}; it must be credential-free",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Ok(AgentEnvPolicy::Isolated {
+        passthrough,
+        cargo_home,
+    })
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
@@ -1070,6 +1138,11 @@ impl Config {
             };
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
+        let agent_env_policy = agent_env_policy_from_args(
+            args.agent_env_isolation,
+            args.agent_env_passthrough,
+            args.agent_cargo_home,
+        )?;
 
         let config = Config {
             keys,
@@ -1122,6 +1195,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            agent_env_policy,
         };
 
         Ok(config)
@@ -1494,6 +1568,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            agent_env_policy: AgentEnvPolicy::Inherit,
         }
     }
 
@@ -2770,6 +2845,96 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    fn parse_agent_env(extra: &[&str]) -> Result<Config, ConfigError> {
+        let mut argv = vec!["buzz-acp", "--private-key", TEST_PRIVATE_KEY];
+        argv.extend_from_slice(extra);
+        Config::from_args(CliArgs::try_parse_from(argv).expect("clap should parse args"))
+    }
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "buzz-acp-cfg-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn agent_env_defaults_to_inherit() {
+        // Existing deployments rely on agents inheriting provider keys and
+        // user env; isolation must stay opt-in.
+        let config = parse_agent_env(&[]).expect("default config");
+        assert_eq!(config.agent_env_policy, AgentEnvPolicy::Inherit);
+    }
+
+    #[test]
+    fn agent_env_isolation_flags_build_isolated_policy() {
+        let dir = unique_temp_dir("ok");
+        let config = parse_agent_env(&[
+            "--agent-env-isolation",
+            "--agent-env-passthrough",
+            "ANTHROPIC_API_KEY, HTTPS_PROXY,",
+            "--agent-cargo-home",
+            dir.to_str().unwrap(),
+        ])
+        .expect("isolated config");
+        assert_eq!(
+            config.agent_env_policy,
+            AgentEnvPolicy::Isolated {
+                passthrough: vec!["ANTHROPIC_API_KEY".into(), "HTTPS_PROXY".into()],
+                cargo_home: Some(dir.clone()),
+            }
+        );
+        assert!(dir.is_dir(), "agent cargo home is created at startup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_env_passthrough_without_isolation_is_rejected() {
+        // Silently ignoring these would let an operator believe the agent
+        // environment is narrowed when it is not.
+        for extra in [
+            &["--agent-env-passthrough", "ANTHROPIC_API_KEY"][..],
+            &["--agent-cargo-home", "/tmp/buzz-acp-unused"][..],
+        ] {
+            let err = parse_agent_env(extra).expect_err("must require isolation");
+            assert!(err.to_string().contains("--agent-env-isolation"), "{err}");
+        }
+    }
+
+    #[test]
+    fn agent_cargo_home_holding_credentials_is_rejected() {
+        // Pointing the agent at a Cargo home that already holds registry
+        // tokens would defeat the purpose of the flag.
+        for name in ["credentials.toml", "credentials"] {
+            let dir = unique_temp_dir(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "[registry]\ntoken = \"x\"\n").unwrap();
+            let err = parse_agent_env(&[
+                "--agent-env-isolation",
+                "--agent-cargo-home",
+                dir.to_str().unwrap(),
+            ])
+            .expect_err("credential-bearing cargo home must be rejected");
+            assert!(err.to_string().contains("credential-free"), "{err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn agent_cargo_home_must_be_absolute() {
+        let err = parse_agent_env(&[
+            "--agent-env-isolation",
+            "--agent-cargo-home",
+            "relative/cargo",
+        ])
+        .expect_err("relative cargo home must be rejected");
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
