@@ -101,7 +101,7 @@ pub fn relay_api_base_url() -> String {
 /// Canonical signing bases resolved from GET /info, keyed by transport base
 /// (the alias road). Caches only successfully resolved decisions — a relay
 /// that later changes its advertisement is picked up on the next app start.
-static CANONICAL_SIGNING_BASES: std::sync::LazyLock<
+pub(crate) static CANONICAL_SIGNING_BASES: std::sync::LazyLock<
     std::sync::RwLock<std::collections::HashMap<String, String>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
@@ -314,7 +314,7 @@ async fn fetch_info_document(
     serde_json::from_str(&text).map_err(|_| "relay /info returned a malformed document".to_string())
 }
 
-async fn canonical_signing_base_with_client(
+pub(crate) async fn canonical_signing_base_with_client(
     client: &reqwest::Client,
     transport_base: &str,
 ) -> Result<String, String> {

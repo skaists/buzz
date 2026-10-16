@@ -503,7 +503,11 @@ pub async fn send_channel_message(
     let emoji = emoji_tags.unwrap_or_default();
     let mention_refs_only = mention_tags.unwrap_or_default();
     let link_previews = link_preview_tags.unwrap_or_default();
-    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    // Link-preview media must sit on the relay's media origin (canonical on alias roads).
+    let mut relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    if !link_previews.is_empty() {
+        relay_base = crate::media_proxy::origin::media_identity_base(&state, &relay_base).await;
+    }
     let kind_num = kind.unwrap_or(buzz_core_pkg::kind::KIND_STREAM_MESSAGE);
     if sent_from_thread_tag.is_some() && kind_num != buzz_core_pkg::kind::KIND_STREAM_MESSAGE {
         return Err("sent-from-thread provenance requires a stream message".into());

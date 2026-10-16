@@ -11,8 +11,9 @@ use tauri::{http, Manager};
 use tokio::net::TcpListener;
 
 use crate::app_state::AppState;
-use crate::commands::media::mint_media_get_auth;
 use crate::relay;
+
+pub(crate) mod origin;
 
 /// Defense-in-depth cap: refuse to buffer responses larger than this into RAM.
 /// Range requests (≤16 MiB from server) always fit. Full GETs for huge videos
@@ -59,7 +60,8 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).
-    if let Some(auth) = mint_media_get_auth(&app_state, &base_url) {
+    if let Some(auth) = origin::mint_media_get_auth_for(&app_state, &base_url, path_and_query).await
+    {
         upstream = upstream.header("authorization", auth);
     }
 
@@ -187,7 +189,7 @@ pub async fn handle_buzz_media(
 
     // `upstream_url` is always `{relay base}{path}`, so the token can't reach
     // a third-party origin (mint_media_get_auth safety contract).
-    if let Some(auth) = mint_media_get_auth(&state, &base) {
+    if let Some(auth) = origin::mint_media_get_auth_for(&state, &base, path_and_query).await {
         upstream = upstream.header("authorization", auth);
     }
 

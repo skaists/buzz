@@ -1,7 +1,10 @@
 import * as React from "react";
 
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
-import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
+import {
+  useRelayCanonicalOrigin,
+  useRelayOrigin,
+} from "@/shared/lib/useRelayOrigin";
 
 import { VideoPlayer, type VideoReviewContext } from "../VideoPlayer";
 import { isRelayDownloadable } from "./mediaEntry";
@@ -41,8 +44,12 @@ export function MarkdownVideoPlayer({
   // eligibility (Download stays hidden even for a genuine relay URL). The
   // subscription re-renders when the origin resolves and on workspace switch.
   const relayOrigin = useRelayOrigin();
+  const relayCanonicalOrigin = useRelayCanonicalOrigin();
   const downloadUrl =
-    src && isRelayDownloadable(src, relayOrigin ?? undefined) ? src : undefined;
+    src &&
+    isRelayDownloadable(src, relayOrigin ?? undefined, relayCanonicalOrigin)
+      ? src
+      : undefined;
   // Look up poster frame from imeta tags (NIP-71 `image` field).
   // Fall back to `thumb` for compatibility with older events.
   const posterUrl = entry?.image ?? entry?.thumb;

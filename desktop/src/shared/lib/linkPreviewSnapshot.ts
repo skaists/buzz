@@ -68,13 +68,18 @@ function isRelayMediaPair(
   url: string,
   sha256: string,
   relayOrigin: string,
+  relayCanonicalOrigin: string | null,
 ): boolean {
   if (!url && !sha256) return true;
   if (!url || !SHA256_RE.test(sha256)) return false;
   try {
     const parsed = new URL(url);
+    // On an alias road the relay stamps media with its canonical origin.
+    const ownOrigin =
+      parsed.origin === relayOrigin ||
+      (!!relayCanonicalOrigin && parsed.origin === relayCanonicalOrigin);
     if (
-      parsed.origin !== relayOrigin ||
+      !ownOrigin ||
       parsed.username ||
       parsed.password ||
       parsed.search ||
@@ -96,6 +101,7 @@ export function parseLinkPreviewSnapshots(
   tags: readonly (readonly string[])[] | undefined,
   content: string,
   relayOrigin: string | null,
+  relayCanonicalOrigin: string | null = null,
 ): ResolvedLinkPreview[] {
   if (!relayOrigin || !tags) return [];
   const contentUrls = new Set(
@@ -139,8 +145,18 @@ export function parseLinkPreviewSnapshots(
     )
       continue;
     if (
-      !isRelayMediaPair(imageUrl, imageSha256, relayOrigin) ||
-      !isRelayMediaPair(faviconUrl, faviconSha256, relayOrigin)
+      !isRelayMediaPair(
+        imageUrl,
+        imageSha256,
+        relayOrigin,
+        relayCanonicalOrigin,
+      ) ||
+      !isRelayMediaPair(
+        faviconUrl,
+        faviconSha256,
+        relayOrigin,
+        relayCanonicalOrigin,
+      )
     )
       continue;
     seen.add(canonicalUrl);

@@ -64,6 +64,7 @@ export function isVideoMedia(src: string, imetaMime?: string): boolean {
 export function isRelayDownloadable(
   src: string,
   relayOrigin?: string,
+  relayCanonicalOrigin?: string | null,
 ): boolean {
   if (!relayOrigin) return false;
   let parsed: URL;
@@ -73,5 +74,10 @@ export function isRelayDownloadable(
     return false;
   }
   if (!parsed.pathname.startsWith("/media/")) return false;
-  return parsed.origin === relayOrigin;
+  // The relay's canonical origin (alias roads) is the same relay; the Rust
+  // gate re-bases such URLs onto the transport before fetching.
+  return (
+    parsed.origin === relayOrigin ||
+    (!!relayCanonicalOrigin && parsed.origin === relayCanonicalOrigin)
+  );
 }

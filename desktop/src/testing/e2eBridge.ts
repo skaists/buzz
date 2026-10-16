@@ -12126,6 +12126,10 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_relay_http_url":
         return getRelayHttpUrl(activeConfig);
+      case "get_relay_canonical_http_url": {
+        const url = getRelayHttpUrl(activeConfig);
+        return { transport: url, canonical: url };
+      }
       case "relay_requires_membership":
         return activeConfig?.mock?.relayRequiresMembership ?? false;
       case "discover_acp_providers":

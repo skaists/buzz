@@ -674,6 +674,7 @@ pub fn run() {
             is_shared_identity,
             get_relay_ws_url,
             get_relay_http_url,
+            media_proxy::origin::get_relay_canonical_http_url,
             get_media_proxy_port,
             fetch_link_preview_metadata,
             discover_acp_auth_methods,
