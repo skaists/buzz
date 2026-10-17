@@ -47,6 +47,11 @@ fn forget(transport: &str) {
     if let Ok(mut failures) = FAILED_LOOKUPS.write() {
         failures.remove(transport);
     }
+    if let Ok(mut pins) = PINS.write() {
+        if let Some(pins) = pins.as_mut() {
+            pins.remove(transport);
+        }
+    }
 }
 
 fn decode_event(header: &str) -> Event {
@@ -76,6 +81,7 @@ async fn identity_base_uses_the_advertised_origin_on_an_alias_road() {
         "200 OK",
         r#"{"name":"Buzz Relay","push":{"origin":"wss://canonical.example"}}"#,
     );
+    pin_alias(&transport, CANONICAL_BASE).unwrap();
     let client = reqwest::Client::new();
     assert_eq!(
         media_identity_base_with_client(&client, &transport).await,
@@ -128,6 +134,7 @@ async fn unreadable_info_falls_back_once_and_is_remembered() {
 async fn concurrent_cold_lookups_make_one_request() {
     let (transport, hits) =
         serve_info("200 OK", r#"{"push":{"origin":"wss://canonical.example"}}"#);
+    pin_alias(&transport, CANONICAL_BASE).unwrap();
     let client = reqwest::Client::new();
     let lookups = (0..8).map(|_| media_identity_base_with_client(&client, &transport));
     let results = futures_util::future::join_all(lookups).await;
@@ -328,4 +335,184 @@ fn map_without_an_alias_is_the_plain_gate() {
         "https://RELAY.example.com/"
     )
     .is_err());
+}
+
+// ── trusted aliases (bFUzZ gate 1) ───────────────────────────────────────────
+
+#[tokio::test]
+async fn unpinned_alias_advertisement_is_not_trusted() {
+    // A relay may advertise any canonical name; without an explicit pin for
+    // this transport the advertisement is ignored (transport only).
+    let (transport, _) = serve_info("200 OK", r#"{"push":{"origin":"wss://canonical.example"}}"#);
+    let client = reqwest::Client::new();
+    assert_eq!(
+        media_identity_base_with_client(&client, &transport).await,
+        transport
+    );
+    assert_eq!(
+        resolve_canonical_base(&client, &transport).await.unwrap(),
+        transport
+    );
+    forget(&transport);
+}
+
+// ── token confinement (bFUzZ gate 2) ─────────────────────────────────────────
+
+#[test]
+fn lookalike_and_smuggled_origins_are_never_relay_media() {
+    for url in [
+        format!("https://canonical.example.evil.example/media/{HASH}.png"),
+        format!("https://evil.example/media/{HASH}.png?u=https://canonical.example"),
+        format!("https://canonical.example@evil.example/media/{HASH}.png"),
+        format!("https://canonical.example./media/{HASH}.png"),
+        format!("https://xn--canonical-example.evil/media/{HASH}.png"),
+        format!("http://canonical.example/media/{HASH}.png"),
+        format!("https://canonical.example:8443/media/{HASH}.png"),
+    ] {
+        assert!(
+            map_relay_media_url(&url, ALIAS_BASE, CANONICAL_BASE).is_err(),
+            "{url} must not be treated as relay media"
+        );
+    }
+    // Case differences in the trusted host itself are the same origin.
+    assert!(map_relay_media_url(
+        &format!("https://CANONICAL.example/media/{HASH}.png"),
+        ALIAS_BASE,
+        CANONICAL_BASE
+    )
+    .is_ok());
+}
+
+#[test]
+fn alias_road_never_mints_a_server_scoped_token() {
+    for path in [
+        format!("/media/{HASH}.png"),
+        format!("/media/{HASH}.thumb.jpg"),
+        format!("/media/{HASH}.mp4?range=1"),
+        "/media/upload".to_string(),
+        "/media/".to_string(),
+        "/media/../admin".to_string(),
+    ] {
+        assert!(
+            !matches!(
+                media_get_scope(ALIAS_BASE, CANONICAL_BASE, &path),
+                Some(MediaGetScope::Server(_))
+            ),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_client_never_carries_media_auth_across_a_redirect() {
+    // The media proxy uses the app-wide client, which follows redirects. A
+    // relay 3xx to another origin must not receive the minted token.
+    use std::sync::atomic::AtomicBool;
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let saw_auth = Arc::new(AtomicBool::new(false));
+    let saw_request = Arc::new(AtomicBool::new(false));
+    let (auth_flag, request_flag) = (Arc::clone(&saw_auth), Arc::clone(&saw_request));
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = target.accept() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            request_flag.store(true, Ordering::SeqCst);
+            auth_flag.store(request.contains("\r\nauthorization:"), Ordering::SeqCst);
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = relay.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/media/{HASH}.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    // Same construction as AppState::http_client (default redirect policy).
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let keys = Keys::generate();
+    let auth = sign_blob_get_auth_header(&keys, HASH, 600).unwrap();
+    let response = client
+        .get(format!("http://{relay_addr}/media/{HASH}.png"))
+        .header("authorization", auth)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert!(saw_request.load(Ordering::SeqCst), "redirect was followed");
+    assert!(
+        !saw_auth.load(Ordering::SeqCst),
+        "the media token must not cross to the redirect target"
+    );
+}
+
+#[tokio::test]
+async fn pinned_alias_ignores_a_different_advertisement() {
+    let (transport, _) = serve_info("200 OK", r#"{"push":{"origin":"wss://impostor.example"}}"#);
+    pin_alias(&transport, CANONICAL_BASE).unwrap();
+    let client = reqwest::Client::new();
+    assert_eq!(
+        media_identity_base_with_client(&client, &transport).await,
+        transport
+    );
+    forget(&transport);
+}
+
+#[test]
+fn trusted_identity_requires_a_matching_pin() {
+    let mut pins = HashMap::new();
+    assert_eq!(
+        trusted_identity(ALIAS_BASE, CANONICAL_BASE, &pins),
+        ALIAS_BASE
+    );
+    assert_eq!(
+        trusted_identity(ALIAS_BASE, &format!("{ALIAS_BASE}/"), &pins),
+        ALIAS_BASE
+    );
+    pins.insert(ALIAS_BASE.to_string(), CANONICAL_BASE.to_string());
+    assert_eq!(
+        trusted_identity(ALIAS_BASE, CANONICAL_BASE, &pins),
+        CANONICAL_BASE
+    );
+    assert_eq!(
+        trusted_identity(
+            "https://RELAY.alias.example/",
+            "https://Canonical.Example",
+            &pins
+        ),
+        CANONICAL_BASE
+    );
+    assert_eq!(
+        trusted_identity(ALIAS_BASE, "https://impostor.example", &pins),
+        ALIAS_BASE
+    );
+}
+
+#[test]
+fn pin_file_entries_are_normalised_and_malformed_ones_dropped() {
+    let pins = parse_pins(
+        r#"{"https://Relay.Alias.Example/":"https://canonical.example/",
+            "not a url":"https://x.example",
+            "https://self.example":"https://self.example",
+            "ftp://files.example":"https://canonical.example"}"#,
+    );
+    assert_eq!(pins.len(), 1);
+    assert_eq!(
+        pins.get(ALIAS_BASE).map(String::as_str),
+        Some(CANONICAL_BASE)
+    );
+    assert!(parse_pins("not json").is_empty());
+    assert!(pin_alias("https://self.example", "https://self.example").is_err());
 }

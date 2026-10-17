@@ -130,6 +130,7 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
 /// Tauri protocol handler's requirement to buffer the entire response into
 /// `Vec<u8>`. Returns the OS-assigned port.
 pub async fn spawn_media_proxy(http_client: reqwest::Client, app_handle: tauri::AppHandle) -> u16 {
+    origin::set_pin_dir(app_handle.path().app_data_dir().ok());
     let proxy_state = ProxyState {
         client: http_client,
         app_handle,

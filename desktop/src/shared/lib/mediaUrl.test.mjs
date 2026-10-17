@@ -779,3 +779,103 @@ test("canonical lookup: an answer that lands before the relay origin is remember
     globalThis.window = previousWindow;
   }
 });
+
+test("cold start on a fresh alias: canonical media never renders raw at any stage", async () => {
+  // Clean profile (nothing remembered), alias road, slow relay origin and a
+  // slower canonical lookup. Every render decision before, during and after
+  // both lookups must route canonical-origin media through the app (proxy or
+  // buzz-media://), never to the raw canonical URL — so no remount or channel
+  // switch is needed for pictures to load.
+  const previousWindow = globalThis.window;
+  let releaseOrigin;
+  let releaseCanonical;
+  const originGate = new Promise((resolve) => {
+    releaseOrigin = resolve;
+  });
+  const canonicalGate = new Promise((resolve) => {
+    releaseCanonical = resolve;
+  });
+  globalThis.window = {
+    localStorage: memoryStorage(),
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return originGate.then(() => "https://relay.alias.example");
+        }
+        if (command === "get_relay_canonical_http_url") {
+          return canonicalGate.then(() => ({
+            transport: "https://relay.alias.example",
+            canonical: "https://canonical.example",
+          }));
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+  const canonicalUrl = `https://canonical.example/media/${HASH}.png`;
+  const routed = (rewritten) =>
+    rewritten === `http://127.0.0.1:54321/media/${HASH}.png` ||
+    rewritten === `buzz-media://localhost/media/${HASH}.png`;
+
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?coldStart=${Date.now()}`);
+    mediaUrl.resetMediaCaches();
+    mediaUrl.ensureRelayOriginFetch();
+    mediaUrl.ensureCanonicalOriginFetch();
+    assert.ok(
+      routed(mediaUrl.rewriteRelayUrl(canonicalUrl)),
+      "before the relay origin",
+    );
+
+    releaseOrigin();
+    await waitFor(() => mediaUrl.getCachedRelayOrigin() !== null);
+    assert.ok(
+      routed(mediaUrl.rewriteRelayUrl(canonicalUrl)),
+      "before the canonical origin",
+    );
+
+    releaseCanonical();
+    await waitFor(() => mediaUrl.getCachedRelayCanonicalOrigin() !== null);
+    assert.ok(
+      routed(mediaUrl.rewriteRelayUrl(canonicalUrl)),
+      "after both lookups",
+    );
+    mediaUrl.resetMediaCaches();
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test("unpinned alias: once the relay disowns the canonical name, its media is external", async () => {
+  // The backend honours a canonical name only when it is pinned; unpinned it
+  // answers with the transport itself, and foreign media stays external.
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke(command) {
+        if (command === "get_media_proxy_port") return Promise.resolve(54321);
+        if (command === "get_relay_http_url") {
+          return Promise.resolve("https://relay.alias.example");
+        }
+        if (command === "get_relay_canonical_http_url") {
+          return Promise.resolve({
+            transport: "https://relay.alias.example",
+            canonical: "https://relay.alias.example",
+          });
+        }
+        return Promise.reject(new Error(`Unexpected command: ${command}`));
+      },
+    },
+  };
+  try {
+    const mediaUrl = await import(`./mediaUrl.ts?unpinned=${Date.now()}`);
+    await applyCommunity(mediaUrl);
+    await waitFor(() => mediaUrl.getCachedRelayCanonicalOrigin() !== null);
+    const url = `https://canonical.example/media/${HASH}.png`;
+    assert.equal(mediaUrl.rewriteRelayUrl(url), url);
+    mediaUrl.resetMediaCaches();
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
