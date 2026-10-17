@@ -18,9 +18,10 @@
 //!
 //! Trusted aliases: an advertised canonical origin is honoured only when it
 //! matches an explicit pin for that transport in `relay-alias-pins.json` in
-//! the app data directory (outside the agents' nest, so agent sessions cannot
-//! extend it). An unpinned or mismatched advertisement is ignored and the
-//! road behaves as a canonical road: transport only, as before alias support.
+//! the app data directory. The file is owner-edited; any process running as
+//! the same Windows user can write it (as it can the app itself). An
+//! unpinned or mismatched advertisement is ignored and the road behaves as a
+//! canonical road: transport only, as before alias support.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -70,13 +71,29 @@ fn is_web_origin(origin: &str) -> bool {
 /// Parse a pin file: `{ "<transport>": "<canonical>" }`. Entries are
 /// normalised to origins; malformed entries and self-pins are dropped.
 pub(crate) fn parse_pins(text: &str) -> HashMap<String, String> {
-    let raw: HashMap<String, String> = serde_json::from_str(text).unwrap_or_default();
-    raw.into_iter()
+    let text = text.trim_start_matches('\u{feff}');
+    let raw: HashMap<String, String> = match serde_json::from_str(text) {
+        Ok(raw) => raw,
+        Err(error) => {
+            eprintln!("buzz-desktop: {PIN_FILE} unreadable, no aliases trusted: {error}");
+            return HashMap::new();
+        }
+    };
+    let total = raw.len();
+    let pins: HashMap<String, String> = raw
+        .into_iter()
         .map(|(transport, canonical)| (origin_of(&transport), origin_of(&canonical)))
         .filter(|(transport, canonical)| {
             is_web_origin(transport) && is_web_origin(canonical) && transport != canonical
         })
-        .collect()
+        .collect();
+    if pins.len() != total {
+        eprintln!(
+            "buzz-desktop: {PIN_FILE}: ignored {} malformed entr(y/ies)",
+            total - pins.len()
+        );
+    }
+    pins
 }
 
 fn load_pins() -> HashMap<String, String> {
@@ -91,13 +108,20 @@ fn pins() -> HashMap<String, String> {
     if let Some(loaded) = PINS.read().ok().and_then(|pins| pins.clone()) {
         return loaded;
     }
+    // Before the app data directory is known nothing is cached, so an early
+    // read cannot pin "no aliases" for the rest of the session.
+    if PIN_DIR.get().is_none() {
+        return HashMap::new();
+    }
     let Ok(mut guard) = PINS.write() else {
         return load_pins();
     };
     guard.get_or_insert_with(load_pins).clone()
 }
 
-/// Explicitly trust `canonical` as the identity of `transport`: kept in
+#[cfg(test)]
+/// Explicitly trust `canonical` as the identity of `transport` (tests only; pins
+/// are edited by hand in the file): kept in
 /// memory and, when the app data directory is known, written to the pin file.
 pub(crate) fn pin_alias(transport: &str, canonical: &str) -> Result<(), String> {
     let (transport, canonical) = (origin_of(transport), origin_of(canonical));
