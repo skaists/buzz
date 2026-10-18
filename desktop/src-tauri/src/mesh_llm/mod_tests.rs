@@ -35,7 +35,33 @@ async fn pending_client_status_does_not_wait_for_management_timeout() {
     let task = tokio::spawn(async {
         std::future::pending::<anyhow::Result<mesh_llm_sdk::EmbeddedNodeHandle>>().await
     });
-    let runtime = pending_client_runtime(task);
+    let mut runtime = pending_client_runtime(task);
+    // status() for a Starting client probes the ingress (HTTP GET, then a TCP
+    // connect). On Windows a refused loopback connect takes ~2 s (the stack
+    // retries the SYN after RST; measured 2.03-2.11 s), so the default unbound
+    // 127.0.0.1:1 made this 1 s check fail there on every run. A local stub
+    // that answers 503 at once makes the probe report "bound, not live"
+    // immediately on every platform; the 1 s bound still proves status() does
+    // not wait on the SDK management task.
+    let stub = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ingress stub");
+    let stub_port = stub.local_addr().expect("ingress stub address").port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut socket, _)) = stub.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    runtime.api_base_url = format!("http://127.0.0.1:{stub_port}/v1");
 
     let status = tokio::time::timeout(std::time::Duration::from_secs(1), runtime.status())
         .await
