@@ -437,7 +437,8 @@ async fn proxy_client_never_carries_media_auth_across_a_redirect() {
         }
     });
 
-    // Same construction as AppState::http_client (default redirect policy).
+    // Same redirect policy as AppState::http_client (reqwest default); the app
+    // client also sets resolve/pool options, which do not affect redirects.
     let client = reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -515,4 +516,14 @@ fn pin_file_entries_are_normalised_and_malformed_ones_dropped() {
     );
     assert!(parse_pins("not json").is_empty());
     assert!(pin_alias("https://self.example", "https://self.example").is_err());
+}
+
+#[test]
+fn pin_file_with_a_bom_still_parses() {
+    let pins =
+        parse_pins("\u{feff}{\"https://relay.alias.example\":\"https://canonical.example\"}");
+    assert_eq!(
+        pins.get(ALIAS_BASE).map(String::as_str),
+        Some(CANONICAL_BASE)
+    );
 }
