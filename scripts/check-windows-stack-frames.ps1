@@ -31,7 +31,10 @@ $Allowed = @(
   # 1 MiB read buffer while hashing a model file; runs on a blocking worker.
   'mesh_llm_host_runtime6models17artifact_transfer15file_sha256_hex',
   # Package inspection during model staging; runs on a mesh worker.
-  'skippy_runtime7package21inspect_layer_package'
+  'skippy_runtime7package21inspect_layer_package',
+  # Audio decode for voice import; the only production caller is
+  # buzz-voice import_path inside spawn_blocking (huddle/tts_voice_import.rs).
+  'symphonia_core3dsp3fft3Fft3fft'
 )
 $NeverAllowed = @('5tauri', '5tokio4task5spawn', '5tokio7runtime4task')
 
