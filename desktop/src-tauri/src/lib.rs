@@ -36,6 +36,8 @@ mod relay_admission;
 mod reset;
 mod secret_store;
 mod shutdown;
+#[cfg(all(test, feature = "mesh-llm"))]
+mod stack_budget_tests;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
