@@ -163,7 +163,12 @@ if ($chk -lt 0) { Write-Output 'REFUSE: __chkstk not found in the PDB'; exit 2 }
 $failures = @()
 Write-Output "main-thread stack reserve $reserve bytes, commit $commit bytes"
 if ($reserve -lt $MinReserve) { $failures += "stack reserve $reserve < required $MinReserve" }
-$frames = [StackGate]::Frames($b, $text.Va, $text.Raw, $text.Size, [uint32]$chk) | Sort-Object -Descending
+$frames = @([StackGate]::Frames($b, $text.Va, $text.Raw, $text.Size, [uint32]$chk) | Sort-Object -Descending)
+# Empty evidence is a broken scan, never a clean binary: a Rust/Tauri release
+# exe has thousands of __chkstk prologues and hundreds of thousands of unwind
+# entries. Refuse rather than report PASS on zero frames.
+if ($fnCount -lt 1000) { Write-Output "REFUSE: only $fnCount unwind entries parsed; the .pdata scan is broken"; exit 2 }
+if ($frames.Count -lt 100) { Write-Output "REFUSE: only $($frames.Count) __chkstk prologues found; the scan is broken"; exit 2 }
 Write-Output ("{0} __chkstk prologues, {1} unwind entries; largest prologue {2} bytes" -f $frames.Count, $fnCount, ($frames[0] -shr 32))
 # Columns: verdict, prologue allocation (the __chkstk argument), unwind-data
 # allocation for the same function, symbol. The two readings come from
