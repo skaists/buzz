@@ -981,8 +981,10 @@ jobs:
     name: Windows Rust (x86_64-pc-windows-msvc)
     runs-on: windows-latest
     # Windows runners are slow and this compiles the workspace + Tauri crate
-    # cold across four steps; budget generously.
-    timeout-minutes: 45
+    # cold across four steps, plus the Tauri crate again with mesh-llm for the
+    # mesh-feature tests; budget generously. 75 is not yet calibrated by a
+    # hosted run.
+    timeout-minutes: 75
     needs: [changes]
     if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
@@ -1061,6 +1063,121 @@ jobs:
         run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --target $env:TARGET
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      # The default-feature run above never compiles mesh-llm, so the desktop
+      # mesh code and the main-thread stack-budget regressions
+      # (src/stack_budget_tests.rs, cfg(all(test, feature = "mesh-llm"))) only
+      # run here. Each required test must be listed AND pass; an absent,
+      # ignored or filtered-out test fails the step.
+      - name: Test desktop mesh feature with execution evidence
+        shell: bash
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/buzz-desktop-mesh-ci"
+          mkdir -p "$evidence"
+          cargo_test_args=(
+            --locked
+            --manifest-path desktop/src-tauri/Cargo.toml
+            -p buzz-desktop
+            --features mesh-llm
+            --lib
+            --target "$TARGET"
+          )
+          required_tests=(
+            stack_budget_tests::constructed_mesh_runtime_start_future_fits_main_thread_budget
+            stack_budget_tests::mesh_runtime_start_future_fits_main_thread_budget
+            stack_budget_tests::mesh_start_node_command_future_fits_main_thread_budget
+            stack_budget_tests::start_managed_agent_command_future_fits_main_thread_budget
+            stack_budget_tests::ensure_relay_mesh_for_record_future_fits_main_thread_budget
+            stack_budget_tests::restore_mesh_sharing_future_fits_main_thread_budget
+          )
+          require_line() {
+            local expected="$1" file="$2"
+            if ! tr -d '\r' < "$file" | grep -Fx -- "$expected" > /dev/null; then
+              printf '::error::Required mesh test evidence missing: %s\n' "$expected" >&2
+              exit 1
+            fi
+          }
+
+          cargo test "${cargo_test_args[@]}" -- --list --color never 2>&1 |
+            tee "$evidence/inventory.log"
+          for t in "${required_tests[@]}"; do require_line "$t: test" "$evidence/inventory.log"; done
+
+          # Run the whole library suite, so future regressions need no filter
+          # rename. Hardware tests keep their existing ignored state.
+          cargo test "${cargo_test_args[@]}" -- --format pretty --color never --show-output 2>&1 |
+            tee "$evidence/results.log"
+          for t in "${required_tests[@]}"; do require_line "test $t ... ok" "$evidence/results.log"; done
+      - name: Upload desktop mesh test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-mesh-tests-${{ github.sha }}
+          path: ${{ runner.temp }}/buzz-desktop-mesh-ci
+          if-no-files-found: warn
+
+  # Release-binary stack gate. Tauri release builds move each command future by
+  # value on the Windows main thread before tokio boxes it; buzz-desktop 0.5.21
+  # with mesh-llm overflowed its 1 MiB stack there (0xc00000fd in __chkstk).
+  # This builds the mesh-enabled release app binary and checks the produced
+  # exe: 8 MiB PE stack reserve, and no unallowed frame over 256 KiB
+  # (scripts/check-windows-stack-frames.ps1, prologue sizes cross-checked
+  # against the x64 unwind data, named through the PDB). Frame sizes come from
+  # Rust code only, so a placeholder frontend dist is enough to link.
+  windows-stack-gate:
+    name: Windows release stack gate (mesh-llm)
+    runs-on: windows-latest
+    # Cold mesh-enabled release build; not yet calibrated by a hosted run.
+    timeout-minutes: 90
+    needs: [changes]
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: desktop/src-tauri
+          key: windows-msvc-release-mesh
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Create sidecar and frontend placeholders
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/binaries desktop/dist
+          for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+            touch "desktop/src-tauri/binaries/${bin}-${TARGET}.exe"
+          done
+          [ -e desktop/dist/index.html ] || printf '<!doctype html><title>stack gate</title>\n' > desktop/dist/index.html
+      - name: Build release app binary (mesh-llm)
+        run: cargo build --locked --release --manifest-path desktop/src-tauri/Cargo.toml -p buzz-desktop --bin buzz-desktop --features "mesh-llm tauri/custom-protocol" --target $env:TARGET
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      - name: Stack gate on the produced exe
+        shell: pwsh
+        run: |
+          # The 32 KiB inventory run below exits 1 by design; only the real
+          # gate's exit code decides the step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          $exe = "desktop/src-tauri/target/$env:TARGET/release/buzz-desktop.exe"
+          $out = "$env:RUNNER_TEMP/buzz-stack-gate"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          "exe sha256 $((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash)" | Tee-Object -FilePath "$out/gate.log"
+          "pdb sha256 $((Get-FileHash -LiteralPath (Join-Path (Split-Path $exe) 'buzz_desktop.pdb') -Algorithm SHA256).Hash)" | Tee-Object -FilePath "$out/gate.log" -Append
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-windows-stack-frames.ps1 $exe -MaxFrame 32768 | Out-File -FilePath "$out/dispatch-frames-over-32k.log" -Encoding utf8
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-windows-stack-frames.ps1 $exe | Tee-Object -FilePath "$out/gate.log" -Append
+          $rc = $LASTEXITCODE
+          "gate exit $rc" | Tee-Object -FilePath "$out/gate.log" -Append
+          exit $rc
+      - name: Upload stack gate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-stack-gate-${{ github.sha }}
+          path: ${{ runner.temp }}/buzz-stack-gate
+          if-no-files-found: warn
 
   desktop-build-macos:
     name: Desktop Build (macOS)
