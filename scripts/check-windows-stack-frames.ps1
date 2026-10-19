@@ -20,7 +20,9 @@ Exit code 0 = PASS, 1 = FAIL, 2 = cannot check (refuses rather than passing).
 param(
   [Parameter(Mandatory = $true)][string]$Exe,
   [int]$MaxFrame = 256KB,
-  [long]$MinReserve = 8MB
+  [long]$MinReserve = 8MB,
+  # Dispatch functions the scan must resolve (substrings of mangled names).
+  [string[]]$RequireDispatch = @('respond_async_serialized', '5tokio4task5spawn')
 )
 $ErrorActionPreference = 'Stop'
 trap { Write-Output "REFUSE: $_"; exit 2 }
@@ -169,6 +171,19 @@ $frames = @([StackGate]::Frames($b, $text.Va, $text.Raw, $text.Size, [uint32]$ch
 # entries. Refuse rather than report PASS on zero frames.
 if ($fnCount -lt 1000) { Write-Output "REFUSE: only $fnCount unwind entries parsed; the .pdata scan is broken"; exit 2 }
 if ($frames.Count -lt 100) { Write-Output "REFUSE: only $($frames.Count) __chkstk prologues found; the scan is broken"; exit 2 }
+# Coverage, not just volume: the scan must reach the dispatch path that
+# overflowed (Tauri's respond_async_serialized and the tokio spawn it calls).
+# Unrelated functions can satisfy the counts above; these names cannot.
+$requiredDispatch = [ordered]@{}
+foreach ($r in $RequireDispatch) { $requiredDispatch[$r] = $false }
+foreach ($f in $frames) {
+  $n = [StackGate]::NameAt([uint32]($f % 4294967296))
+  if ($n) { foreach ($k in @($requiredDispatch.Keys)) { if (-not $requiredDispatch[$k] -and $n.Contains($k)) { $requiredDispatch[$k] = $true } } }
+  if ($requiredDispatch.Values -notcontains $false) { break }
+}
+$missingDispatch = @($requiredDispatch.Keys | Where-Object { -not $requiredDispatch[$_] })
+if ($missingDispatch) { Write-Output "REFUSE: no __chkstk prologue resolves to $($missingDispatch -join ', '); the scan does not cover the dispatch path"; exit 2 }
+Write-Output "dispatch coverage: prologues resolved for $($RequireDispatch -join ', ')"
 Write-Output ("{0} __chkstk prologues, {1} unwind entries; largest prologue {2} bytes" -f $frames.Count, $fnCount, ($frames[0] -shr 32))
 # Columns: verdict, prologue allocation (the __chkstk argument), unwind-data
 # allocation for the same function, symbol. The two readings come from
