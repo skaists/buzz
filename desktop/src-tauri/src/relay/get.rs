@@ -22,7 +22,8 @@ pub async fn get_relay_json<T: DeserializeOwned>(
         relay_api_base_url_with_override(state),
         path_with_query
     );
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
+    let sign_url = super::canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header(&Method::GET, &sign_url, &[], state)?;
     let response = state
         .http_client
         .get(&url)

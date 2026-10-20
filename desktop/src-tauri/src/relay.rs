@@ -98,6 +98,267 @@ pub fn relay_api_base_url() -> String {
 
 // ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
 
+/// Canonical signing bases resolved from GET /info, keyed by transport base
+/// (the alias road). Caches only successfully resolved decisions — a relay
+/// that later changes its advertisement is picked up on the next app start.
+pub(crate) static CANONICAL_SIGNING_BASES: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Canonical NIP-42 WebSocket signing identities resolved from GET /info.
+/// Keyed by the supplied WS connection URL (the transport). The value is
+/// the canonical `wss://` identity to put in the AUTH event's relay tag.
+static CANONICAL_WS_IDENTITIES: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Resolve the canonical NIP-42 WebSocket signing identity for a supplied
+/// connection URL. Behind the Caddy Host rewrite, the relay expects the
+/// canonical community URL (`wss://beehivenature.buzz`) in the AUTH
+/// event's relay tag even when the socket connects to the alias
+/// (`wss://relay2.skaists.dev`). The supplied URL is parsed structurally:
+/// `/info` is fetched from the origin (scheme + host + port) only, so a
+/// transport path or query can never leak into the metadata request
+/// target. The decision reuses the same strict validation as the HTTP
+/// resolver: fail-closed on unreadable/malformed metadata; a well-formed
+/// document with no advertised origin retains transport compatibility
+/// (the ENTIRE supplied URL, components intact); an advertised origin —
+/// including one equal to the transport origin, which is an advertisement,
+/// not an absence — is validated and returned as the WS-form signing
+/// identity. The WebSocket transport itself is never rewritten.
+pub async fn canonical_ws_signing_url(
+    client: &reqwest::Client,
+    ws_url: &str,
+) -> Result<String, String> {
+    let cached = CANONICAL_WS_IDENTITIES
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(ws_url).cloned());
+    if let Some(hit) = cached {
+        return Ok(hit);
+    }
+
+    // Structural parse of the supplied URL: the metadata road is derived
+    // from the parsed origin, never from prefix surgery on the raw string
+    // (text concatenation let a query consume the `/info` suffix).
+    let parsed = url::Url::parse(ws_url.trim())
+        .map_err(|_| format!("supplied relay URL is not a valid ws/wss URL: {ws_url}"))?;
+    let http_scheme = match parsed.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return Err(format!("supplied relay URL is not ws/wss: {ws_url}")),
+    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("supplied relay URL has no host: {ws_url}"))?;
+    // Metadata origin base: path/query/fragment of the transport are
+    // deliberately excluded — `/info` lives at the origin root.
+    let metadata_base = match parsed.port() {
+        Some(port) => format!("{http_scheme}://{host}:{port}"),
+        None => format!("{http_scheme}://{host}"),
+    };
+
+    let doc = fetch_info_document(client, &metadata_base).await?;
+
+    // Advertised vs absent must be decided by key presence, never by
+    // comparing the resolved base to the transport origin — an explicit
+    // advertisement equal to the transport origin is still an advertisement.
+    let canonical_ws = match advertised_origin_from_info(&doc)? {
+        Some(advertised_http_base) => http_base_to_ws_form(&advertised_http_base)?,
+        None => ws_url.to_string(),
+    };
+
+    if let Ok(mut cache) = CANONICAL_WS_IDENTITIES.write() {
+        cache.insert(ws_url.to_string(), canonical_ws.clone());
+    }
+    Ok(canonical_ws)
+}
+
+/// Convert a validated canonical HTTP base (`http(s)://host[:port]`) back to
+/// its WS form (`ws(s)://host[:port]`). The inverse of the scheme mapping
+/// `validate_advertised_origin` applies.
+fn http_base_to_ws_form(http_base: &str) -> Result<String, String> {
+    if let Some(rest) = http_base.strip_prefix("https://") {
+        Ok(format!("wss://{rest}"))
+    } else if let Some(rest) = http_base.strip_prefix("http://") {
+        Ok(format!("ws://{rest}"))
+    } else {
+        Err(format!(
+            "canonical resolver returned a non-HTTP base: {http_base}"
+        ))
+    }
+}
+
+/// Strictly validate an advertised ws/wss ORIGIN and construct its HTTP base
+/// (mirror of the desktop TS law in shared/api/invites.ts): no userinfo,
+/// query, fragment, or non-root path; ports and IPv6 literals are valid; the
+/// HTTP base is constructed from the PARSED url, never the raw string.
+pub fn validate_advertised_origin(advertised: &str) -> Option<String> {
+    let url = url::Url::parse(advertised).ok()?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return None,
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let path = url.path();
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// Resolve the canonical SIGNING base for a transport base: GET /info on the
+/// transport road and honor `push.origin` (the advertised canonical
+/// identity). Fail-closed rules mirror the TS law: an unreadable document
+/// (HTTP error, invalid JSON, non-object root, malformed push descriptor, or
+/// malformed/invalid advertisement) is an ERROR — it proves nothing about
+/// what the relay advertises, and silently signing the transport host is the
+/// alias-host auth bug itself. Only a well-formed document with NO
+/// advertisement means "the road IS the identity" (base returned unchanged).
+/// Pure decision function: given a successfully-decoded `/info` JSON value
+/// and the transport base, produce the canonical signing base or refuse.
+/// Only an actually ABSENT key receives the compatibility fallback; an
+/// explicit JSON `null` is malformed and refuses (both `push` and
+/// `push.origin`). Extracted so the decision is unit-testable without HTTP.
+pub fn canonical_decision_from_info(
+    doc: &serde_json::Value,
+    transport_base: &str,
+) -> Result<String, String> {
+    match advertised_origin_from_info(doc)? {
+        Some(advertised) => Ok(advertised),
+        None => Ok(transport_base.to_string()),
+    }
+}
+
+/// The advertisement-existence core of [`canonical_decision_from_info`]:
+/// `Ok(Some(validated_http_base))` when `/info` explicitly advertises a
+/// canonical origin, `Ok(None)` when the well-formed document carries no
+/// advertisement at all, `Err` on every malformed shape. The WS resolver
+/// needs the three-way distinction — an advertisement EQUAL to the
+/// transport origin must resolve to the advertised identity, not fall
+/// through to transport compatibility — which a base-string equality
+/// against the transport cannot express.
+pub fn advertised_origin_from_info(doc: &serde_json::Value) -> Result<Option<String>, String> {
+    let obj = doc
+        .as_object()
+        .ok_or("relay /info returned a malformed document")?;
+    match obj.get("push") {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => {
+            Err("relay /info returned a malformed push descriptor".to_string())
+        }
+        Some(push) => {
+            let push_obj = push
+                .as_object()
+                .ok_or("relay /info returned a malformed push descriptor")?;
+            match push_obj.get("origin") {
+                None => Ok(None),
+                Some(serde_json::Value::Null) => {
+                    Err("relay /info advertises a malformed canonical origin".to_string())
+                }
+                Some(origin) => {
+                    let advertised = origin
+                        .as_str()
+                        .ok_or("relay /info advertises a malformed canonical origin")?;
+                    validate_advertised_origin(advertised)
+                        .map(Some)
+                        .ok_or("relay /info canonical origin failed URL verification".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// GET `{origin_base}/info` and decode the body as JSON. `origin_base` is a
+/// bare scheme + authority (no path/query): both the HTTP resolver and the
+/// WS resolver construct it structurally, so the metadata request target is
+/// always exactly `/info` at the origin root regardless of the transport
+/// URL's own path or query. Fail-closed on transport errors, non-2xx
+/// statuses, and bodies that are not valid JSON.
+async fn fetch_info_document(
+    client: &reqwest::Client,
+    origin_base: &str,
+) -> Result<serde_json::Value, String> {
+    let info_url = format!("{origin_base}/info");
+    let response = client
+        .get(&info_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "relay /info unreachable: {}",
+                classify_request_error(&error)
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(format!("relay /info HTTP {}", response.status().as_u16()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|_| "relay /info returned a malformed document".to_string())?;
+    serde_json::from_str(&text).map_err(|_| "relay /info returned a malformed document".to_string())
+}
+
+pub(crate) async fn canonical_signing_base_with_client(
+    client: &reqwest::Client,
+    transport_base: &str,
+) -> Result<String, String> {
+    let transport_base = transport_base.trim_end_matches('/');
+    if let Some(hit) = CANONICAL_SIGNING_BASES
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(transport_base).cloned())
+    {
+        return Ok(hit);
+    }
+    let doc = fetch_info_document(client, transport_base).await?;
+    let decision = canonical_decision_from_info(&doc, transport_base)?;
+    if let Ok(mut cache) = CANONICAL_SIGNING_BASES.write() {
+        cache.insert(transport_base.to_string(), decision.clone());
+    }
+    Ok(decision)
+}
+
+/// The URL a NIP-98 event must SIGN: the canonical origin (per /info) with
+/// the transport URL's path appended. The HTTP request itself keeps riding
+/// the transport URL — sign the identity, ride the road.
+pub async fn canonical_sign_url(state: &AppState, transport_url: &str) -> Result<String, String> {
+    canonical_sign_url_with_client(&state.http_client, transport_url).await
+}
+
+/// Client-only variant for tasks that own a cloned `reqwest::Client` instead
+/// of the `AppState` reference (e.g. 'static spawned pipelines).
+pub async fn canonical_sign_url_with_client(
+    client: &reqwest::Client,
+    transport_url: &str,
+) -> Result<String, String> {
+    let (scheme, after_scheme) = transport_url
+        .split_once("://")
+        .ok_or("relay transport URL has no scheme")?;
+    let (authority, path) = match after_scheme.find('/') {
+        Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+        None => (after_scheme, ""),
+    };
+    let canonical_base =
+        canonical_signing_base_with_client(client, &format!("{scheme}://{authority}")).await?;
+    Ok(format!("{canonical_base}{path}"))
+}
+
 pub fn build_nip98_auth_header(
     method: &Method,
     url: &str,
@@ -321,7 +582,8 @@ pub async fn query_relay_at(
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header(&Method::POST, &sign_url, &body_bytes, state)?;
 
     let response = state
         .http_client
@@ -351,7 +613,8 @@ pub async fn query_relay_at_with_keys(
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
-    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header_for_keys(keys, &Method::POST, &sign_url, &body_bytes)?;
     let mut request = state
         .http_client
         .post(&url)
@@ -453,7 +716,8 @@ pub async fn sync_managed_agent_profile(
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "agent profile sync")?;
 
     let url = format!("{}/events", relay_http_base_url(relay_url));
-    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &sign_url, &body_bytes)?;
 
     let mut request = state
         .http_client
@@ -571,7 +835,9 @@ pub async fn submit_signed_event_with_keys(
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
-    let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;
+    let sign_url = canonical_sign_url(state, &url).await?;
+    let auth_header =
+        build_nip98_auth_header_for_keys(keys, &Method::POST, &sign_url, &body_bytes)?;
 
     let mut request = state
         .http_client
@@ -606,11 +872,120 @@ pub async fn submit_signed_event_with_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_profile_event, classify_intercepted_response, effective_agent_relay_url,
-        extract_retry_in_hint, parse_command_response, relay_http_base_url,
-        MALFORMED_RESPONSE_MESSAGE,
+        build_profile_event, canonical_decision_from_info, classify_intercepted_response,
+        effective_agent_relay_url, extract_retry_in_hint, parse_command_response,
+        relay_http_base_url, validate_advertised_origin, MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
+
+    #[test]
+    fn advertised_origin_accepts_valid_origins_and_constructs_http_base() {
+        assert_eq!(
+            validate_advertised_origin("wss://beehivenature.buzz").as_deref(),
+            Some("https://beehivenature.buzz")
+        );
+        // ports and IPv6 literals are valid origins
+        assert_eq!(
+            validate_advertised_origin("ws://[::1]:3000").as_deref(),
+            Some("http://[::1]:3000")
+        );
+        assert_eq!(
+            validate_advertised_origin("wss://relay.example:8443/").as_deref(),
+            Some("https://relay.example:8443")
+        );
+    }
+
+    #[test]
+    fn advertised_origin_rejects_non_origin_components() {
+        for bad in [
+            "not a url",
+            "ftp://relay.example",
+            "wss://relay.example#section",
+            "wss://relay.example?x=1",
+            "wss://relay.example/nested",
+            "wss://synthetic:synthetic@relay.example",
+        ] {
+            assert!(
+                validate_advertised_origin(bad).is_none(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    // ── canonical decision regressions (review round 1) ─────────────────
+
+    #[test]
+    fn canonical_decision_rejects_explicit_null_push() {
+        let doc = serde_json::json!({"push": null});
+        assert!(
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
+            "explicit null push is a malformed descriptor, not an absent key"
+        );
+    }
+
+    #[test]
+    fn canonical_decision_rejects_explicit_null_origin() {
+        let doc = serde_json::json!({"push": {"origin": null}});
+        assert!(
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").is_err(),
+            "explicit null origin is a malformed advertisement, not an absent key"
+        );
+    }
+
+    #[test]
+    fn canonical_decision_compat_absent_key_is_road_is_identity() {
+        // well-formed object with NO push key — the road IS the identity
+        let doc = serde_json::json!({"name": "Buzz Relay", "version": "0.2.1"});
+        assert_eq!(
+            canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
+            "https://relay.example"
+        );
+        // push present as a valid object with NO origin key
+        let doc = serde_json::json!({"push": {"keys": []}});
+        assert_eq!(
+            canonical_decision_from_info(&doc, "https://relay.example").unwrap(),
+            "https://relay.example"
+        );
+    }
+
+    #[test]
+    fn canonical_decision_valid_origin_signs_canonical() {
+        let doc = serde_json::json!({
+            "push": {"origin": "wss://beehivenature.buzz"}
+        });
+        assert_eq!(
+            canonical_decision_from_info(&doc, "https://relay2.skaists.dev").unwrap(),
+            "https://beehivenature.buzz"
+        );
+    }
+
+    #[test]
+    fn canonical_decision_rejects_non_object_root() {
+        for doc in [
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+            serde_json::json!("a string"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                canonical_decision_from_info(&doc, "https://relay.example").is_err(),
+                "non-object root must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_decision_rejects_malformed_push_shape() {
+        let cases = vec![
+            serde_json::json!("not-an-object"),
+            serde_json::json!(42),
+            serde_json::json!([1]),
+        ];
+        for push in cases {
+            let doc = serde_json::json!({"push": push});
+            assert!(canonical_decision_from_info(&doc, "https://relay.example").is_err());
+        }
+    }
 
     // ── extract_retry_in_hint ────────────────────────────────────────────────
 

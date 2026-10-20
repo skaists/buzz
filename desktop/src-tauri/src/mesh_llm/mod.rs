@@ -40,6 +40,8 @@ use transport_policy::{iroh_relay_mode, validate_advertised_endpoint, IrohRelayM
 
 use mesh_llm_sdk::{client, serve, EmbeddedNodeHandle, MeshDiscoveryMode, TrustPolicy};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 const DEFAULT_MESH_API_PORT: u16 = 9337;
@@ -307,7 +309,9 @@ async fn initialize_mesh_native_runtime() -> anyhow::Result<()> {
 /// 8 MiB worker stacks for exactly this reason (mesh-llm `main.rs`,
 /// `DEFAULT_WORKER_STACK_SIZE`), as does mesh-console. `lib.rs` installs a
 /// runtime with this stack size via `tauri::async_runtime::set` before the
-/// app starts, so every command future gets the same headroom.
+/// app starts, so futures get this headroom once a worker polls them. It does
+/// not cover the main thread, where Tauri moves each command future before
+/// spawning it; see `DesktopMeshRuntime::start`.
 pub const MESH_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Pre-download the model (with byte progress through the output sink)
@@ -337,7 +341,18 @@ async fn ensure_model_downloaded(model: &str) -> anyhow::Result<()> {
 }
 
 impl DesktopMeshRuntime {
-    pub async fn start(mut request: StartMeshNodeRequest) -> anyhow::Result<Self> {
+    /// Start a node. Boxed so every caller holds a pointer, not the start
+    /// chain: Tauri release builds move command futures by value on the
+    /// Windows main thread (1 MiB stack) before spawning them, and embedding
+    /// this chain made those copies overflow it (`0xc00000fd` in `__chkstk`).
+    /// `stack_budget_tests` keeps the callers' futures small.
+    pub fn start(
+        request: StartMeshNodeRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self>> + Send>> {
+        Box::pin(Self::start_unboxed(request))
+    }
+
+    async fn start_unboxed(mut request: StartMeshNodeRequest) -> anyhow::Result<Self> {
         sanitize_no_leak_request(&mut request)?;
         initialize_mesh_native_runtime().await?;
         let model_id = request

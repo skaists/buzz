@@ -33,6 +33,75 @@ let portPromise: Promise<number | null> | null = null;
 let cachedRelayOrigin: string | null = null;
 
 /**
+ * The relay's canonical origin: the community identity it advertises in
+ * GET /info (`push.origin`, e.g. "https://example.buzz"), canonicalized like
+ * {@link cachedRelayOrigin}. On an alias road (the app connects through
+ * `relay.example.dev` while the relay's identity is `example.buzz`) the relay
+ * stamps every stored media URL with this origin, so those URLs are the
+ * relay's own media and must ride the authenticated proxy. Equals the relay
+ * origin when the relay advertises nothing; `null` until resolved.
+ */
+let cachedRelayCanonicalOrigin: string | null = null;
+
+/** The relay origin the backend resolved {@link cachedRelayCanonicalOrigin} for. */
+let cachedCanonicalTransport: string | null = null;
+
+/** In-memory copy of the remembered canonical for one relay origin. */
+let canonicalMemoCache: { relay: string; canonical: string | null } | null =
+  null;
+
+/** Set once the canonical lookup gave up for the current community. */
+let canonicalLookupExhausted = false;
+
+/** The in-flight canonical lookup for the current community, if any. */
+let canonicalPromise: Promise<void> | null = null;
+
+const CANONICAL_MEMO_PREFIX = "buzz:relay-canonical-origin:";
+
+function canonicalMemoStorage(): Storage | null {
+  try {
+    return typeof window !== "undefined" ? (window.localStorage ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The canonical origin last resolved for the current relay origin, so that
+ * decisions made before this session's lookup lands are already right on a
+ * known alias road. Unknown relays have none (unknown origins stay external).
+ */
+function rememberedCanonicalOrigin(): string | null {
+  if (!cachedRelayOrigin) return null;
+  if (canonicalMemoCache?.relay === cachedRelayOrigin) {
+    return canonicalMemoCache.canonical;
+  }
+  let canonical: string | null = null;
+  try {
+    canonical =
+      canonicalMemoStorage()?.getItem(
+        CANONICAL_MEMO_PREFIX + cachedRelayOrigin,
+      ) ?? null;
+  } catch {
+    canonical = null;
+  }
+  canonicalMemoCache = { relay: cachedRelayOrigin, canonical };
+  return canonical;
+}
+
+function rememberCanonicalOrigin(relayOrigin: string, canonical: string): void {
+  canonicalMemoCache = { relay: relayOrigin, canonical };
+  try {
+    canonicalMemoStorage()?.setItem(
+      CANONICAL_MEMO_PREFIX + relayOrigin,
+      canonical,
+    );
+  } catch {
+    // Storage unavailable — the in-memory value still serves this session.
+  }
+}
+
+/**
  * Canonicalize a URL to its origin with a lowercased scheme/host.
  *
  * The relay always emits media URLs with a lowercased tenant host
@@ -88,6 +157,18 @@ function setRelayOrigin(origin: string | null, generation: number): void {
   const canonical = origin === null ? null : canonicalOrigin(origin);
   if (cachedRelayOrigin === canonical) return;
   cachedRelayOrigin = canonical;
+  // A canonical answer that landed before the relay origin is settled now:
+  // remembered when it was resolved for this relay, otherwise discarded so
+  // the lookup can run again for the relay actually published.
+  if (canonical !== null && cachedRelayCanonicalOrigin !== null) {
+    if (cachedCanonicalTransport === canonical) {
+      rememberCanonicalOrigin(canonical, cachedRelayCanonicalOrigin);
+    } else {
+      cachedRelayCanonicalOrigin = null;
+      cachedCanonicalTransport = null;
+      canonicalPromise = null;
+    }
+  }
   notifyRelayOriginListeners();
 }
 
@@ -129,6 +210,11 @@ export function subscribeMediaProxyPort(listener: () => void): () => void {
 
 const POLL_INTERVAL_MS = 100;
 const POLL_TIMEOUT_MS = 5000;
+
+const CANONICAL_RETRY_BASE_MS = 250;
+const CANONICAL_RETRY_MAX_MS = 8000;
+const CANONICAL_BUDGET_MS = 60_000;
+const CANONICAL_ATTEMPT_TIMEOUT_MS = 12_000;
 
 /**
  * Race `promise` against the remaining time until `deadline`, resolving to
@@ -232,6 +318,69 @@ async function fetchProxyPort(): Promise<number | null> {
 }
 
 /**
+ * Resolve the canonical origin in its own task, independent of the proxy port
+ * and relay origin (local IPC with no network dependency). The backend errors
+ * while the relay's /info is unreadable, so this retries with backoff inside
+ * a bounded budget; a workspace switch abandons it. On success subscribers
+ * are notified so canonical-aware consumers re-render.
+ */
+async function fetchCanonicalOrigin(): Promise<void> {
+  const generation = cacheGeneration;
+  const deadline = Date.now() + CANONICAL_BUDGET_MS;
+  let delay = CANONICAL_RETRY_BASE_MS;
+  while (generation === cacheGeneration && Date.now() < deadline) {
+    try {
+      const answer = await withDeadline(
+        invoke<{ transport: string; canonical: string }>(
+          "get_relay_canonical_http_url",
+        ),
+        Math.min(deadline, Date.now() + CANONICAL_ATTEMPT_TIMEOUT_MS),
+      );
+      const transport = answer ? canonicalOrigin(answer.transport) : null;
+      const canonical = answer ? canonicalOrigin(answer.canonical) : null;
+      if (generation !== cacheGeneration) return;
+      // An answer for another relay (a lookup racing a workspace switch) is
+      // neither published nor remembered; the next attempt or reset settles it.
+      if (
+        transport !== null &&
+        canonical !== null &&
+        (cachedRelayOrigin === null || transport === cachedRelayOrigin)
+      ) {
+        if (cachedRelayOrigin) rememberCanonicalOrigin(transport, canonical);
+        if (
+          cachedRelayCanonicalOrigin !== canonical ||
+          cachedCanonicalTransport !== transport
+        ) {
+          cachedRelayCanonicalOrigin = canonical;
+          cachedCanonicalTransport = transport;
+          notifyRelayOriginListeners();
+        }
+        return;
+      }
+    } catch {
+      // Lookup failed or IPC not ready — retry after backoff.
+    }
+    await new Promise((r) => setTimeout(r, delay));
+    delay = Math.min(delay * 2, CANONICAL_RETRY_MAX_MS);
+  }
+  if (generation === cacheGeneration) canonicalLookupExhausted = true;
+}
+
+/**
+ * Start the canonical-origin lookup for the current community if none is in
+ * flight. Safe to call from render paths and effects.
+ */
+export function ensureCanonicalOriginFetch(): void {
+  // Generation 0 is the cold-launch default relay, before the active
+  // community's relay override is installed (useCommunityInit resets the
+  // caches after applyCommunity): never contact it for /info.
+  if (cacheGeneration === 0) return;
+  if (!canonicalPromise && typeof window !== "undefined") {
+    canonicalPromise = fetchCanonicalOrigin();
+  }
+}
+
+/**
  * Ensure the relay-origin lookup is active after a community cache reset.
  *
  * Consumers that classify relay-owned URLs may render before any media URL
@@ -268,7 +417,13 @@ export function resetMediaCaches(): void {
   if (hadCachedPort) {
     notifyMediaProxyPortListeners();
   }
-  if (cachedRelayOrigin !== null) {
+  const hadCanonical = cachedRelayCanonicalOrigin !== null;
+  cachedRelayCanonicalOrigin = null;
+  cachedCanonicalTransport = null;
+  canonicalMemoCache = null;
+  canonicalLookupExhausted = false;
+  canonicalPromise = null;
+  if (cachedRelayOrigin !== null || hadCanonical) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
   }
@@ -283,6 +438,51 @@ export function resetMediaCaches(): void {
  */
 export function getCachedRelayOrigin(): string | null {
   return cachedRelayOrigin;
+}
+
+/**
+ * The relay's canonical origin (see {@link cachedRelayCanonicalOrigin}): this
+ * session's resolved value, else the one last resolved for this relay origin,
+ * else `null`. Subscribe via `subscribeRelayOrigin`.
+ */
+export function getCachedRelayCanonicalOrigin(): string | null {
+  return resolvedCanonicalOrigin() ?? rememberedCanonicalOrigin();
+}
+
+/** This session's canonical answer, when it belongs to the current relay. */
+function resolvedCanonicalOrigin(): string | null {
+  if (cachedRelayCanonicalOrigin === null) return null;
+  if (
+    cachedRelayOrigin !== null &&
+    cachedCanonicalTransport !== cachedRelayOrigin
+  ) {
+    return null;
+  }
+  return cachedRelayCanonicalOrigin;
+}
+
+/**
+ * Whether a relay-shaped media URL is our relay's own media: on the relay
+ * origin, or on its canonical origin (alias roads). An unresolved relay
+ * origin keeps the existing safe default ("ours"). While this session's
+ * canonical lookup is pending, the canonical last resolved for this relay is
+ * used; with none remembered, relay-shaped media stays on the proxy until the
+ * lookup lands or gives up, after which unknown origins are external.
+ */
+function isRelayOwnedMediaUrl(url: string): boolean {
+  if (!cachedRelayOrigin) return true;
+  const urlOrigin = canonicalOrigin(url);
+  if (urlOrigin === null) return false;
+  if (urlOrigin === cachedRelayOrigin) return true;
+  const resolved = resolvedCanonicalOrigin();
+  if (resolved !== null) return urlOrigin === resolved;
+  if (!canonicalLookupExhausted) ensureCanonicalOriginFetch();
+  const remembered = rememberedCanonicalOrigin();
+  if (remembered !== null) return urlOrigin === remembered;
+  // No answer yet for this relay: while a lookup can still land, keep
+  // relay-shaped media on the proxy — the same safe default as an unresolved
+  // relay origin. Generation 0 (cold-launch default relay) never looks up.
+  return cacheGeneration > 0 && !canonicalLookupExhausted;
 }
 
 /**
@@ -320,11 +520,8 @@ export function rewriteRelayUrl(url: string): string {
   // Compare canonicalized origins: hosts are case-insensitive, and the relay
   // always returns lowercased media URLs even when the saved community URL
   // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
-  if (cachedRelayOrigin) {
-    const urlOrigin = canonicalOrigin(url);
-    if (urlOrigin !== cachedRelayOrigin) {
-      return url;
-    }
+  if (!isRelayOwnedMediaUrl(url)) {
+    return url;
   }
 
   if (cachedPort && cachedPort > 0) {

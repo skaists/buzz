@@ -293,36 +293,28 @@ fn locked_manifest_keeps_data_url_only_avatar() {
 }
 
 #[test]
-fn media_get_auth_gate_is_same_origin_only() {
+fn media_get_auth_gate_is_relay_media_only() {
     // The minted Blossom get-auth header may only travel to the relay's own
-    // origin — scheme, host, and port all count (same contract as
-    // `validate_download_url` in `media_download.rs`).
+    // /media/ URLs — scheme, host, and port all count. The avatar fetch goes
+    // through `resolve_relay_media_url`, whose gate is `map_relay_media_url`.
+    use crate::media_proxy::origin::map_relay_media_url;
     let relay = "https://relay.example.com";
-    assert!(is_same_origin(
-        "https://relay.example.com/media/abc.png",
-        relay
-    ));
+    let gate = |url: &str, base: &str| map_relay_media_url(url, base, base).is_ok();
+    assert!(gate("https://relay.example.com/media/abc.png", relay));
     // Different host, scheme, or port: no auth.
-    assert!(!is_same_origin(
-        "https://evil.example.com/media/abc.png",
-        relay
-    ));
-    assert!(!is_same_origin(
-        "http://relay.example.com/media/abc.png",
-        relay
-    ));
-    assert!(!is_same_origin(
-        "https://relay.example.com:8443/media/abc.png",
-        relay
-    ));
+    assert!(!gate("https://evil.example.com/media/abc.png", relay));
+    assert!(!gate("http://relay.example.com/media/abc.png", relay));
+    assert!(!gate("https://relay.example.com:8443/media/abc.png", relay));
+    // Off the /media/ path: no auth.
+    assert!(!gate("https://relay.example.com/x", relay));
     // Unparseable inputs fail closed.
-    assert!(!is_same_origin("not a url", relay));
-    assert!(!is_same_origin(
-        "https://relay.example.com/x",
+    assert!(!gate("not a url", relay));
+    assert!(!gate(
+        "https://relay.example.com/media/x.png",
         "also not a url"
     ));
-    // Explicit port on both sides matches.
-    assert!(is_same_origin(
+    // Explicit port on both sides matches (localhost dev relay).
+    assert!(gate(
         "http://localhost:3100/media/abc.png",
         "http://localhost:3100"
     ));

@@ -437,9 +437,10 @@ async fn do_upload(
         300
     };
     let base_url = relay_api_base_url_with_override(state);
+    let server_base = crate::media_proxy::origin::media_identity_base(state, &base_url).await;
     let auth_event = {
         let keys = state.signing_keys()?;
-        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?
+        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &server_base)?
     };
 
     let auth_header = format!(

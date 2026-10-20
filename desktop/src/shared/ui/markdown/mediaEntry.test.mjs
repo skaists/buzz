@@ -109,3 +109,23 @@ test("isRelayDownloadable: unresolved → off-relay origin keeps an external URL
   // Origin resolves to a different (relay) origin → still hidden.
   assert.equal(isRelayDownloadable(src, RELAY), false);
 });
+
+test("isRelayDownloadable: canonical-origin /media/ URL is eligible on an alias road", () => {
+  const CANONICAL = "https://canonical.example";
+  assert.equal(
+    isRelayDownloadable(`${CANONICAL}/media/abc.mp4`, RELAY, CANONICAL),
+    true,
+  );
+  assert.equal(
+    isRelayDownloadable(`${CANONICAL}/other/abc.mp4`, RELAY, CANONICAL),
+    false,
+  );
+  assert.equal(
+    isRelayDownloadable(`${CANONICAL}/media/abc.mp4`, RELAY, null),
+    false,
+  );
+  assert.equal(
+    isRelayDownloadable(`${CANONICAL}/media/abc.mp4`, undefined, CANONICAL),
+    false,
+  );
+});

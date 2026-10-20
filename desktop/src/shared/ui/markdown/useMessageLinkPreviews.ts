@@ -5,6 +5,7 @@ import {
   type SupportedLinkPreview,
 } from "@/shared/lib/linkPreview";
 import { parseLinkPreviewSnapshots } from "@/shared/lib/linkPreviewSnapshot";
+import { useRelayCanonicalOrigin } from "@/shared/lib/useRelayOrigin";
 import {
   isBuzzEntityPreview,
   type ResolvedLinkPreview,
@@ -62,6 +63,7 @@ export function useMessageLinkPreviews({
   linkPreviewsSuppressed: boolean;
   relayOrigin: string | null;
 }): ResolvedLinkPreview[] {
+  const relayCanonicalOrigin = useRelayCanonicalOrigin();
   const linkPreviewCandidates = React.useMemo(
     () =>
       interactive && !linkPreviewsSuppressed
@@ -83,7 +85,12 @@ export function useMessageLinkPreviews({
   return React.useMemo(() => {
     const snapshots =
       interactive && !linkPreviewsSuppressed
-        ? parseLinkPreviewSnapshots(linkPreviewTags, content, relayOrigin)
+        ? parseLinkPreviewSnapshots(
+            linkPreviewTags,
+            content,
+            relayOrigin,
+            relayCanonicalOrigin,
+          )
         : [];
     return mergeMessageLinkPreviews(
       linkPreviewCandidates,
@@ -96,6 +103,7 @@ export function useMessageLinkPreviews({
     linkPreviewCandidates,
     linkPreviewTags,
     linkPreviewsSuppressed,
+    relayCanonicalOrigin,
     relayOrigin,
     resolvedEntityLinkPreviews,
   ]);

@@ -133,7 +133,15 @@ export class ReadOnlyRelayClient {
   private async openConnection(): Promise<void> {
     const generation = ++this.generation;
     this.onMessageChannel = new Channel<unknown>((message) => {
-      void this.handleWsMessage(message, generation);
+      void this.handleWsMessage(message, generation).catch(() => {
+        // NIP-42 fail-closed: a signer refusal (malformed /info metadata,
+        // unreachable relay) must tear the observer session down cleanly so
+        // the pending auth request and histories reject immediately — the
+        // same law the main client's Channel handler already follows.
+        // Without this the rejection goes unhandled and the session only
+        // dies via the auth timeout.
+        if (generation === this.generation) this.disconnect();
+      });
     });
 
     this.wsId = await invoke<number>("plugin:websocket|connect", {

@@ -114,3 +114,22 @@ test("messages without authored snapshots never create recipient previews", () =
   assert.deepEqual(parseLinkPreviewSnapshots([], CONTENT, ORIGIN), []);
   assert.deepEqual(parseLinkPreviewSnapshots(undefined, CONTENT, ORIGIN), []);
 });
+
+test("authored snapshots accept media on the relay canonical origin (alias roads)", () => {
+  const CANONICAL = "https://canonical.example";
+  const canonicalTag = [...valid];
+  canonicalTag[7] = `${CANONICAL}/media/${HASH}.png`;
+  assert.equal(
+    parseLinkPreviewSnapshots([canonicalTag], CONTENT, ORIGIN).length,
+    0,
+  );
+  assert.equal(
+    parseLinkPreviewSnapshots([canonicalTag], CONTENT, ORIGIN, CANONICAL)
+      .length,
+    1,
+  );
+  assert.equal(
+    parseLinkPreviewSnapshots([canonicalTag], CONTENT, null, CANONICAL).length,
+    0,
+  );
+});

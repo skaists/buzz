@@ -127,6 +127,12 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
     {
+        // Tauri moves each command future on the main thread before spawning
+        // it; the Windows default 1 MiB main-thread reserve is far below the
+        // 8 MiB main stacks on macOS and Linux. Reserve 8 MiB for the app
+        // binary only (sidecars keep their defaults); the commit size stays
+        // the linker default, so pages are committed on demand.
+        println!("cargo:rustc-link-arg-bin=buzz-desktop=/STACK:8388608");
         println!(
             "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
         );

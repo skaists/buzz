@@ -671,11 +671,8 @@ pub async fn mint_agent_card(
             // require Blossom get-auth. Mint the header ONLY for same-origin URLs
             // so the token never leaves the relay (same contract as
             // `media_download.rs`).
-            let relay_base = crate::relay::relay_api_base_url_with_override(&state);
-            let auth = is_same_origin(url, &relay_base)
-                .then(|| crate::commands::media::mint_media_get_auth(&state, &relay_base))
-                .flatten();
-            fetch_avatar(url, auth.as_deref()).await?
+            let (url, auth) = crate::media_proxy::origin::avatar_fetch(&state, url).await;
+            fetch_avatar(&url, auth.as_deref()).await?
         }
         _ => {
             return Err(
@@ -889,19 +886,6 @@ fn manifest_avatar_bytes(
     png_bytes_resized(avatar_bytes, MANIFEST_AVATAR_MAX_DIM)
         .map(Some)
         .map_err(|e| format!("Failed to inline the agent avatar into the card manifest: {e}"))
-}
-
-/// True when `url` shares an origin (scheme, host, port) with `relay_base`.
-///
-/// Gate for attaching the minted media get-auth header — the token must never
-/// be sent to a non-relay origin (same contract as `validate_download_url` in
-/// `media_download.rs`, but non-fatal: a foreign origin just fetches
-/// unauthenticated instead of failing the mint).
-fn is_same_origin(url: &str, relay_base: &str) -> bool {
-    match (url::Url::parse(url), url::Url::parse(relay_base)) {
-        (Ok(u), Ok(b)) => u.origin() == b.origin(),
-        _ => false,
-    }
 }
 
 /// Fetch an avatar over HTTP with a hard size cap.

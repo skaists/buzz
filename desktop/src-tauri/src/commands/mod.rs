@@ -28,7 +28,7 @@ mod link_preview;
 mod managed_agent_definition;
 pub(crate) mod media;
 mod media_animated;
-mod media_download;
+pub(crate) mod media_download;
 mod media_gif;
 mod media_raw;
 mod media_snapshot_png;

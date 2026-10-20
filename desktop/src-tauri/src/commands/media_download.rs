@@ -5,7 +5,7 @@ use tauri::State;
 use crate::app_state::AppState;
 use crate::commands::clipboard::with_clipboard;
 use crate::commands::export_util::save_bytes_with_dialog;
-use crate::commands::media::{detect_and_validate_mime, mint_media_get_auth, sanitize_filename};
+use crate::commands::media::{detect_and_validate_mime, sanitize_filename};
 use crate::commands::{
     personas::{
         parse_snapshot_payload_from_bytes, MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOT_PNG_BYTES,
@@ -15,7 +15,8 @@ use crate::commands::{
         decode_team_snapshot_from_bytes, MAX_TEAM_SNAPSHOT_JSON_BYTES, MAX_TEAM_SNAPSHOT_PNG_BYTES,
     },
 };
-use crate::relay::{classify_request_error, relay_api_base_url_with_override, relay_error_message};
+use crate::media_proxy::origin::{mint_media_get_auth_for_url, resolve_relay_media_url};
+use crate::relay::{classify_request_error, relay_error_message};
 
 /// Maximum download size: 50 MiB. Prevents OOM from oversized responses.
 const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
@@ -29,7 +30,7 @@ const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// - URL scheme is `https` (or `http` for localhost dev)
 /// - URL origin matches the relay base URL
 /// - URL path matches `/media/{hash}.{ext}`
-fn validate_download_url(url: &str, relay_base: &str) -> Result<(), String> {
+pub(crate) fn validate_download_url(url: &str, relay_base: &str) -> Result<(), String> {
     let parsed = url::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
     let base = url::Url::parse(relay_base).map_err(|_| "invalid relay base URL".to_string())?;
 
@@ -67,8 +68,7 @@ pub async fn download_image(
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     // SSRF protection: only allow downloads from the relay's /media/ path.
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
+    let url = resolve_relay_media_url(&url, &state).await?;
 
     // Infer filename from the URL path (e.g. "abcdef123.jpg" from a Blossom URL).
     let filename = url::Url::parse(&url)
@@ -114,8 +114,7 @@ pub async fn download_file(
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     // SSRF protection: only allow downloads from the relay's /media/ path.
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
+    let url = resolve_relay_media_url(&url, &state).await?;
 
     // The imeta filename is the only human-readable name we have; sanitize it
     // so directory traversal / control characters can never reach the dialog.
@@ -157,8 +156,7 @@ pub async fn fetch_media_bytes(
     url: String,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
+    let url = resolve_relay_media_url(&url, &state).await?;
 
     let bytes = fetch_blob_bytes(&url, &state).await?;
     detect_and_validate_mime(&bytes)?;
@@ -180,8 +178,7 @@ pub async fn copy_image_to_clipboard(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
+    let url = resolve_relay_media_url(&url, &state).await?;
 
     let bytes = fetch_blob_bytes(&url, &state).await?;
     detect_and_validate_mime(&bytes)?;
@@ -291,8 +288,7 @@ async fn fetch_blob_bytes_with_cap(
     // Every caller pre-validates `url` against the relay origin via
     // `validate_download_url`, satisfying the mint_media_get_auth safety
     // contract (the token never leaves the relay origin).
-    let relay_base = relay_api_base_url_with_override(state);
-    if let Some(auth) = mint_media_get_auth(state, &relay_base) {
+    if let Some(auth) = mint_media_get_auth_for_url(state, url).await {
         req = req.header("authorization", auth);
     }
 
@@ -460,8 +456,7 @@ pub async fn fetch_snapshot_bytes(
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
     // ── Pre-fetch validation ──────────────────────────────────────────────
-    let relay_base = relay_api_base_url_with_override(&state);
-    validate_download_url(&url, &relay_base)?;
+    let url = resolve_relay_media_url(&url, &state).await?;
 
     // Sanitize the filename and verify it is a recognised snapshot extension.
     let filename = sanitize_filename(&filename);
