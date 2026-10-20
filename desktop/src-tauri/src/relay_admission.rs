@@ -270,7 +270,9 @@ mod tests {
         let _serial = TEST_SERIAL.lock().await;
         reset_rate_limit_gate();
 
-        // The loopback server answers every request with 200 [].
+        // The loopback server answers metadata probes with a well-formed
+        // advertisement-free /info document (the road IS the identity) and
+        // every other request with 200 [].
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || loop {
@@ -278,9 +280,21 @@ mod tests {
                 break;
             };
             let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
+            let n = stream.read(&mut buf).unwrap_or(0);
+            // Canonical-identity probes fetch GET /info before signing; the
+            // fake answers with an empty (advertisement-free) document.
+            let body = if buf[..n].starts_with(b"GET /info ") {
+                "{}"
+            } else {
+                "[]"
+            };
             let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
             );
             let _ = stream.flush();
         });
@@ -444,27 +458,37 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // First request → 429 with a 1s retry hint; every later request → 200 [].
+        // Metadata probes (GET /info) always answer with an
+        // advertisement-free document; the first event POST answers 429 with
+        // a 1s retry hint and every later POST answers 200 []. Exactly three
+        // requests arrive: /info (command 1 populates the signing-base cache),
+        // POST → 429, then POST → 200 after the admission wait.
         let server = std::thread::spawn(move || {
-            let responses = [
-                "HTTP/1.1 429 Too Many Requests\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: 53\r\n\
-                 Connection: close\r\n\r\n\
-                 {\"error\":\"rate-limited: quota exceeded; retry in 1s\"}",
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: 2\r\n\
-                 Connection: close\r\n\r\n\
-                 []",
-            ];
-            for i in 0..2 {
+            let mut served_429 = false;
+            for _ in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(responses[i.min(1)].as_bytes());
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let (status, body) = if buf[..n].starts_with(b"GET /info ") {
+                    ("200 OK", "{}")
+                } else if !served_429 {
+                    served_429 = true;
+                    (
+                        "429 Too Many Requests",
+                        r#"{"error":"rate-limited: quota exceeded; retry in 1s"}"#,
+                    )
+                } else {
+                    ("200 OK", "[]")
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .as_bytes(),
+                );
                 let _ = stream.flush();
             }
         });

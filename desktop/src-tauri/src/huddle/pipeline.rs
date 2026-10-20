@@ -1053,4 +1053,20 @@ mod huddle_publish_boundary_tests {
             publish_transcript_event(&client, &keys, &format!("http://{addr}/events"), b"{}").await;
         assert!(result.is_err(), "transport failure must refuse");
     }
+
+    /// Boundary-5 injection: an STT body carrying NIP-49 key-backup material
+    /// must be refused by the sign-and-guard seam before any network I/O.
+    #[test]
+    fn huddle_stt_body_guard_blocks_ncryptsec() {
+        let keys = nostr::Keys::generate();
+        let builder = nostr::EventBuilder::new(
+            nostr::Kind::Custom(9),
+            "transcript backup: ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p",
+        );
+        let err = super::sign_and_guard_stt_body(builder, &keys).unwrap_err();
+        assert!(
+            err.contains("key-backup material"),
+            "boundary-5 seam must refuse key-backup bytes, got: {err}"
+        );
+    }
 }

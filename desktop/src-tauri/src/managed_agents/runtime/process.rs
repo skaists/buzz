@@ -61,8 +61,31 @@ pub(crate) fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn process_is_running(_pid: u32) -> bool {
-    false
+pub(crate) fn process_is_running(pid: u32) -> bool {
+    // Windows has no kill(pid, 0): open the PID with the minimum right that
+    // proves existence, then read its exit code. A live process reports
+    // STILL_ACTIVE; an exited-but-unreaped one reports its real code.
+    // Matches the unix branch contract: true only if the process exists AND
+    // we can open it (another user's PID fails the open → false).
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle uphold their
+    // documented contracts here — the handle is null-checked, the exit-code
+    // out-pointer is a valid local, and the handle is always closed.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let alive =
+            GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        CloseHandle(handle);
+        alive
+    }
 }
 
 /// Check if a PID belongs to a known agent process we spawned.

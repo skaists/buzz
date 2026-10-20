@@ -264,9 +264,9 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
     ("src/relay.rs", 2, 2),                             // boundaries 2, 4
     ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
-    ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
-    ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6
-    ("src/commands/personas/snapshot/import.rs", 2, 1), // boundary 7 + its in-file injection-test fixture URL
+    ("src/huddle/pipeline.rs", 6, 1), // boundary 5 + 5 in-file canonical-signing fixtures/assertions
+    ("src/commands/team_snapshot.rs", 1, 1), // boundary 6
+    ("src/commands/personas/snapshot/import.rs", 4, 1), // boundary 7 + 3 in-file fixtures (guard injection test + 2 canonical-signing)
     ("src/native_websocket.rs", 0, 2),                  // boundary 8 (WS frames; no events URL)
     // Test-only fixtures — no production egress, no guard:
     ("src/relay_admission.rs", 1, 0),
